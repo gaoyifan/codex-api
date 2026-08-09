@@ -1,0 +1,1296 @@
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::ws::{Message as AxumMessage, WebSocket};
+use axum::extract::{Request, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::{SinkExt, StreamExt};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use tempfile::TempDir;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep, timeout};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+
+const CLIENT_KEY: &str = "sk-local-client";
+const API_KEY_ID: &str = "client-a";
+const ACCOUNT_ID: &str = "account-test";
+const MODEL: &str = "gpt-5.6-luna";
+const WS_BETA: &str = "responses_websockets=2026-02-06";
+const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const TEST_TIMEOUT: Duration = Duration::from_secs(4);
+
+type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug)]
+enum UpstreamCommand {
+    Text(String),
+    Abort,
+}
+
+#[derive(Debug)]
+struct UpstreamConnection {
+    id: usize,
+    commands: mpsc::UnboundedSender<UpstreamCommand>,
+}
+
+impl UpstreamConnection {
+    fn send_json(&self, event: Value) {
+        self.commands
+            .send(UpstreamCommand::Text(event.to_string()))
+            .expect("fake upstream connection should still be open");
+    }
+
+    fn abort(&self) {
+        self.commands
+            .send(UpstreamCommand::Abort)
+            .expect("fake upstream connection should still be open");
+    }
+}
+
+#[derive(Debug)]
+enum UpstreamEvent {
+    Handshake {
+        headers: HeaderMap,
+        accepted: bool,
+    },
+    Connected(UpstreamConnection),
+    Text {
+        connection_id: usize,
+        text: String,
+    },
+    Close {
+        connection_id: usize,
+        code: Option<u16>,
+    },
+    OAuth {
+        headers: HeaderMap,
+        body: Value,
+    },
+}
+
+#[derive(Clone)]
+struct FakeUpstreamState {
+    required_authorization: Option<String>,
+    refreshed_access_token: String,
+    events: mpsc::UnboundedSender<UpstreamEvent>,
+    handshake_count: Arc<AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
+}
+
+struct FakeUpstream {
+    addr: SocketAddr,
+    events: mpsc::UnboundedReceiver<UpstreamEvent>,
+    handshake_count: Arc<AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl FakeUpstream {
+    async fn start(required_access_token: Option<&str>, refreshed_access_token: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let addr = listener.local_addr().expect("fake upstream address");
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let handshake_count = Arc::new(AtomicUsize::new(0));
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let state = FakeUpstreamState {
+            required_authorization: required_access_token.map(|token| format!("Bearer {token}")),
+            refreshed_access_token: refreshed_access_token.to_string(),
+            events: events_tx,
+            handshake_count: Arc::clone(&handshake_count),
+            connection_count: Arc::clone(&connection_count),
+        };
+        let app = Router::new()
+            .route("/responses", get(fake_responses_websocket))
+            .route("/oauth/token", post(fake_oauth_token))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+
+        Self {
+            addr,
+            events: events_rx,
+            handshake_count,
+            connection_count,
+            task,
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn oauth_url(&self) -> String {
+        format!("http://{}/oauth/token", self.addr)
+    }
+
+    fn handshake_count(&self) -> usize {
+        self.handshake_count.load(Ordering::SeqCst)
+    }
+
+    fn connection_count(&self) -> usize {
+        self.connection_count.load(Ordering::SeqCst)
+    }
+
+    async fn next_event(&mut self) -> UpstreamEvent {
+        timeout(TEST_TIMEOUT, self.events.recv())
+            .await
+            .expect("timed out waiting for fake upstream event")
+            .expect("fake upstream event channel closed")
+    }
+
+    async fn expect_handshake(&mut self) -> (HeaderMap, bool) {
+        match self.next_event().await {
+            UpstreamEvent::Handshake { headers, accepted } => (headers, accepted),
+            event => panic!("expected upstream handshake, got {event:?}"),
+        }
+    }
+
+    async fn expect_connection(&mut self) -> UpstreamConnection {
+        match self.next_event().await {
+            UpstreamEvent::Connected(connection) => connection,
+            event => panic!("expected upstream connection, got {event:?}"),
+        }
+    }
+
+    async fn expect_text(&mut self, connection_id: usize) -> Value {
+        match self.next_event().await {
+            UpstreamEvent::Text {
+                connection_id: observed_id,
+                text,
+            } => {
+                assert_eq!(observed_id, connection_id);
+                serde_json::from_str(&text).expect("upstream request should be JSON")
+            }
+            event => panic!("expected upstream text frame, got {event:?}"),
+        }
+    }
+
+    async fn expect_close(&mut self, connection_id: usize) -> Option<u16> {
+        match self.next_event().await {
+            UpstreamEvent::Close {
+                connection_id: observed_id,
+                code,
+            } => {
+                assert_eq!(observed_id, connection_id);
+                code
+            }
+            event => panic!("expected upstream close, got {event:?}"),
+        }
+    }
+}
+
+impl Drop for FakeUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn fake_responses_websocket(
+    State(state): State<FakeUpstreamState>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    state.handshake_count.fetch_add(1, Ordering::SeqCst);
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    let accepted = state
+        .required_authorization
+        .as_deref()
+        .is_none_or(|required| authorization == Some(required));
+    state
+        .events
+        .send(UpstreamEvent::Handshake {
+            headers: headers.clone(),
+            accepted,
+        })
+        .expect("fake upstream observer should be alive");
+
+    if !accepted {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "type": "authentication_error",
+                    "code": "token_expired",
+                    "message": "the scripted access token was rejected"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let connection_id = state.connection_count.fetch_add(1, Ordering::SeqCst);
+    websocket
+        .on_upgrade(move |socket| run_fake_upstream(socket, state, connection_id))
+        .into_response()
+}
+
+async fn run_fake_upstream(mut socket: WebSocket, state: FakeUpstreamState, connection_id: usize) {
+    let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+    if state
+        .events
+        .send(UpstreamEvent::Connected(UpstreamConnection {
+            id: connection_id,
+            commands: commands_tx,
+        }))
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(AxumMessage::Text(text))) => {
+                        if state.events.send(UpstreamEvent::Text {
+                            connection_id,
+                            text: text.to_string(),
+                        }).is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(AxumMessage::Close(frame))) => {
+                        let code = frame.map(|frame| frame.code);
+                        let _ = state.events.send(UpstreamEvent::Close { connection_id, code });
+                        return;
+                    }
+                    Some(Ok(AxumMessage::Ping(payload))) => {
+                        if socket.send(AxumMessage::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(AxumMessage::Pong(_))) => {}
+                    Some(Ok(AxumMessage::Binary(_))) | Some(Err(_)) | None => return,
+                }
+            }
+            command = commands_rx.recv() => {
+                match command {
+                    Some(UpstreamCommand::Text(text)) => {
+                        if socket.send(AxumMessage::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(UpstreamCommand::Abort) | None => return,
+                }
+            }
+        }
+    }
+}
+
+async fn fake_oauth_token(
+    State(state): State<FakeUpstreamState>,
+    request: Request<Body>,
+) -> Response {
+    let headers = request.headers().clone();
+    let bytes = match request.into_body().collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let body = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if state
+        .events
+        .send(UpstreamEvent::OAuth { headers, body })
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    Json(json!({
+        "access_token": state.refreshed_access_token,
+        "refresh_token": "rotated-refresh-token"
+    }))
+    .into_response()
+}
+
+#[derive(Clone)]
+struct RelayOptions {
+    enable_websockets: bool,
+    supports_websockets: bool,
+    weekly_limit_usd: Option<&'static str>,
+    access_token: String,
+    refresh_token: &'static str,
+}
+
+impl RelayOptions {
+    fn enabled() -> Self {
+        Self {
+            enable_websockets: true,
+            supports_websockets: true,
+            weekly_limit_usd: None,
+            access_token: jwt(json!({"exp": 4_102_444_800_u64})),
+            refresh_token: "upstream-refresh-token",
+        }
+    }
+}
+
+struct RelayFiles {
+    _temp_dir: TempDir,
+    config_path: PathBuf,
+    database_path: PathBuf,
+    listen_addr: SocketAddr,
+}
+
+struct RelayProcess {
+    child: Child,
+    addr: SocketAddr,
+    database_path: PathBuf,
+    _temp_dir: TempDir,
+}
+
+impl RelayProcess {
+    async fn start(upstream: &FakeUpstream, options: RelayOptions) -> Self {
+        let files = write_relay_files(upstream, &options);
+        let RelayFiles {
+            _temp_dir,
+            config_path,
+            database_path,
+            listen_addr,
+        } = files;
+        let mut child = relay_command(&config_path)
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn codex-api binary");
+        wait_until_listening(&mut child, listen_addr).await;
+        Self {
+            child,
+            addr: listen_addr,
+            database_path,
+            _temp_dir,
+        }
+    }
+
+    fn websocket_url(&self) -> String {
+        format!("ws://{}/v1/responses", self.addr)
+    }
+
+    async fn stop(mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+}
+
+impl Drop for RelayProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+fn write_relay_files(upstream: &FakeUpstream, options: &RelayOptions) -> RelayFiles {
+    let temp_dir = tempfile::tempdir().expect("create relay temp directory");
+    let auth_path = temp_dir.path().join("auth.json");
+    let config_path = temp_dir.path().join("config.toml");
+    let database_path = temp_dir.path().join("state.sqlite3");
+    let listen_addr = unused_loopback_addr();
+    let id_token = jwt(json!({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": ACCOUNT_ID,
+            "chatgpt_plan_type": "pro"
+        }
+    }));
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec_pretty(&json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": options.access_token,
+                "refresh_token": options.refresh_token,
+                "account_id": ACCOUNT_ID
+            },
+            "last_refresh": "2099-12-31T00:00:00Z"
+        }))
+        .expect("serialize auth seed"),
+    )
+    .expect("write auth seed");
+    let weekly_limit = options
+        .weekly_limit_usd
+        .map(|limit| format!("weekly_limit_usd = \"{limit}\"\n"))
+        .unwrap_or_default();
+    let config = format!(
+        r#"[server]
+listen = "{listen_addr}"
+enable_websockets = {enable_websockets}
+
+[state]
+path = "{database_path}"
+
+[upstream]
+base_url = "{base_url}"
+oauth_token_url = "{oauth_url}"
+auth_file = "{auth_path}"
+supports_websockets = {supports_websockets}
+
+[[api_keys]]
+id = "{api_key_id}"
+secret = "{client_key}"
+{weekly_limit}
+[model_prices."{model}"]
+input_usd_per_million = "1.00"
+cached_input_usd_per_million = "0.10"
+output_usd_per_million = "6.00"
+"#,
+        enable_websockets = options.enable_websockets,
+        database_path = database_path.display(),
+        base_url = upstream.base_url(),
+        oauth_url = upstream.oauth_url(),
+        auth_path = auth_path.display(),
+        supports_websockets = options.supports_websockets,
+        api_key_id = API_KEY_ID,
+        client_key = CLIENT_KEY,
+        model = MODEL,
+    );
+    std::fs::write(&config_path, config).expect("write relay configuration");
+
+    RelayFiles {
+        _temp_dir: temp_dir,
+        config_path,
+        database_path,
+        listen_addr,
+    }
+}
+
+fn relay_command(config_path: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-api"));
+    command.arg("--config").arg(config_path);
+    command
+}
+
+fn unused_loopback_addr() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
+    listener.local_addr().expect("reserved relay address")
+}
+
+async fn wait_until_listening(child: &mut Child, addr: SocketAddr) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().expect("inspect relay process") {
+            panic!("codex-api exited before listening: {status}");
+        }
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "codex-api did not start listening"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn jwt(payload: Value) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
+    format!("{header}.{payload}.test-signature")
+}
+
+async fn connect_downstream(
+    url: &str,
+    authorization: Option<&str>,
+) -> Result<ClientSocket, WsError> {
+    let mut request = url
+        .into_client_request()
+        .expect("build downstream WebSocket request");
+    if let Some(authorization) = authorization {
+        request.headers_mut().insert(
+            "authorization",
+            authorization
+                .parse()
+                .expect("valid downstream authorization header"),
+        );
+    }
+    timeout(TEST_TIMEOUT, connect_async(request))
+        .await
+        .expect("timed out waiting for downstream WebSocket handshake")
+        .map(|(socket, _)| socket)
+}
+
+fn assert_handshake_status(result: Result<ClientSocket, WsError>, expected: StatusCode) {
+    match result {
+        Err(WsError::Http(response)) => assert_eq!(response.status(), expected),
+        Err(error) => panic!("expected HTTP {expected} handshake response, got {error}"),
+        Ok(_) => panic!("expected HTTP {expected} handshake response, upgrade succeeded"),
+    }
+}
+
+fn response_create(input: &str, previous_response_id: Option<&str>) -> Value {
+    let mut request = json!({
+        "type": "response.create",
+        "model": MODEL,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": input}]
+        }],
+        "reasoning": {"effort": "low"}
+    });
+    if let Some(previous_response_id) = previous_response_id {
+        request["previous_response_id"] = json!(previous_response_id);
+    }
+    request
+}
+
+fn response_completed(
+    id: &str,
+    input_tokens: u64,
+    cached_tokens: u64,
+    output_tokens: u64,
+) -> Value {
+    json!({
+        "type": "response.completed",
+        "sequence_number": 20,
+        "response": {
+            "id": id,
+            "object": "response",
+            "created_at": 1_700_000_000,
+            "status": "completed",
+            "background": false,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "model": MODEL,
+            "output": [],
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "prompt_cache_key": null,
+            "reasoning": {"effort": "low", "summary": null},
+            "safety_identifier": null,
+            "service_tier": "default",
+            "store": false,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_logprobs": 0,
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": {
+                "input_tokens": input_tokens,
+                "input_tokens_details": {"cached_tokens": cached_tokens},
+                "output_tokens": output_tokens,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": input_tokens + output_tokens
+            },
+            "user": null,
+            "metadata": {}
+        }
+    })
+}
+
+async fn send_json(socket: &mut ClientSocket, value: &Value) {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .expect("send downstream WebSocket JSON");
+}
+
+async fn receive_json(socket: &mut ClientSocket) -> Value {
+    loop {
+        let message = timeout(TEST_TIMEOUT, socket.next())
+            .await
+            .expect("timed out waiting for downstream WebSocket event")
+            .expect("downstream WebSocket ended before an event")
+            .expect("read downstream WebSocket event");
+        match message {
+            Message::Text(text) => {
+                return serde_json::from_str(text.as_str())
+                    .expect("downstream text event should be JSON");
+            }
+            Message::Ping(payload) => socket
+                .send(Message::Pong(payload))
+                .await
+                .expect("reply to downstream ping"),
+            Message::Pong(_) => {}
+            Message::Close(frame) => panic!("downstream closed before JSON event: {frame:?}"),
+            Message::Binary(_) | Message::Frame(_) => {
+                panic!("unexpected non-text downstream WebSocket frame")
+            }
+        }
+    }
+}
+
+async fn receive_close(socket: &mut ClientSocket) -> CloseFrame {
+    loop {
+        let message = timeout(TEST_TIMEOUT, socket.next())
+            .await
+            .expect("timed out waiting for downstream WebSocket close")
+            .expect("downstream WebSocket ended without a close frame")
+            .expect("read downstream WebSocket close");
+        match message {
+            Message::Close(Some(frame)) => return frame,
+            Message::Close(None) => panic!("downstream close omitted its status code"),
+            Message::Ping(payload) => socket
+                .send(Message::Pong(payload))
+                .await
+                .expect("reply to downstream ping"),
+            Message::Text(_) | Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+}
+
+fn assert_responses_error(event: &Value, code: &str, param: Option<&str>) {
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["code"], code);
+    match param {
+        Some(param) => assert_eq!(event["param"], param),
+        None => assert!(event.get("param").is_none_or(Value::is_null)),
+    }
+    assert!(
+        event["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "Responses error event must include a message: {event}"
+    );
+}
+
+async fn request_log_rows(
+    database_path: &Path,
+    minimum_rows: usize,
+) -> Vec<(String, String, bool)> {
+    let options = SqliteConnectOptions::new()
+        .filename(database_path)
+        .read_only(true);
+    let pool = timeout(
+        TEST_TIMEOUT,
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options),
+    )
+    .await
+    .expect("timed out opening request log database")
+    .expect("open request log database");
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let rows =
+            sqlx::query("SELECT status, transport, http_status FROM request_logs ORDER BY id ASC")
+                .fetch_all(&pool)
+                .await
+                .expect("query public request_logs view");
+        if rows.len() >= minimum_rows {
+            return rows
+                .into_iter()
+                .map(|row| {
+                    let status = row.get::<String, _>("status");
+                    let transport = row.get::<String, _>("transport");
+                    let http_status_is_null = row.try_get::<i64, _>("http_status").is_err();
+                    (status, transport, http_status_is_null)
+                })
+                .collect();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "request_logs did not reach {minimum_rows} rows"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_upgrade_authenticates_before_contacting_upstream() {
+    let access_token = jwt(json!({"exp": 4_102_444_800_u64}));
+    let mut upstream = FakeUpstream::start(Some(&access_token), "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            access_token,
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+
+    for authorization in [None, Some("Basic abc"), Some("Bearer wrong-key")] {
+        let result = connect_downstream(&relay.websocket_url(), authorization).await;
+        assert_handshake_status(result, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(upstream.handshake_count(), 0);
+
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("valid downstream key should upgrade");
+    let (_, accepted) = upstream.expect_handshake().await;
+    assert!(accepted);
+    let connection = upstream.expect_connection().await;
+    assert_eq!(connection.id, 0);
+    assert_eq!(upstream.connection_count(), 1);
+
+    socket
+        .close(None)
+        .await
+        .expect("close authenticated downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_configuration_gate_is_enforced() {
+    let upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let disabled = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            enable_websockets: false,
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let result = connect_downstream(
+        &disabled.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await;
+    assert_handshake_status(result, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(upstream.handshake_count(), 0);
+    disabled.stop().await;
+
+    let files = write_relay_files(
+        &upstream,
+        &RelayOptions {
+            enable_websockets: true,
+            supports_websockets: false,
+            ..RelayOptions::enabled()
+        },
+    );
+    let output = timeout(
+        TEST_TIMEOUT,
+        relay_command(&files.config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .expect("invalid WebSocket configuration should exit")
+    .expect("run codex-api with invalid WebSocket configuration");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("supports_websockets"),
+        "stderr was: {stderr}"
+    );
+    assert!(!stderr.contains(CLIENT_KEY));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normalizes_create() {
+    let access_token = jwt(json!({"exp": 4_102_444_800_u64}));
+    let mut upstream = FakeUpstream::start(Some(&access_token), "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            access_token: access_token.clone(),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let (headers, accepted) = upstream.expect_handshake().await;
+    assert!(accepted);
+    assert_eq!(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {access_token}").as_str())
+    );
+    assert_eq!(
+        headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(ACCOUNT_ID)
+    );
+    assert_eq!(
+        headers
+            .get("openai-beta")
+            .and_then(|value| value.to_str().ok()),
+        Some(WS_BETA)
+    );
+    assert_eq!(
+        headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok()),
+        Some("codex_cli_rs")
+    );
+    assert!(
+        headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("codex_cli_rs/0.147.0 "))
+    );
+    assert_ne!(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {CLIENT_KEY}").as_str())
+    );
+    let connection = upstream.expect_connection().await;
+
+    let create = response_create("preserve this input", None);
+    send_json(&mut socket, &create).await;
+    let upstream_create = upstream.expect_text(connection.id).await;
+    assert_eq!(upstream_create["type"], "response.create");
+    assert_eq!(upstream_create["model"], MODEL);
+    assert_eq!(upstream_create["input"], create["input"]);
+    assert_eq!(upstream_create["reasoning"], create["reasoning"]);
+    assert_eq!(upstream_create["store"], false);
+    assert_eq!(upstream_create["stream"], true);
+    assert!(upstream_create.get("background").is_none());
+    assert_eq!(upstream.handshake_count(), 1);
+    assert_eq!(upstream.connection_count(), 1);
+
+    let terminal = response_completed("resp-normalized", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_text_events_are_forwarded_unchanged_and_in_order() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let (_, accepted) = upstream.expect_handshake().await;
+    assert!(accepted);
+    let connection = upstream.expect_connection().await;
+    send_json(&mut socket, &response_create("ordered events", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    let events = vec![
+        json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {"id": "resp-order", "status": "in_progress"}
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg-1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "first"
+        }),
+        json!({
+            "type": "codex.opaque_informational_event",
+            "sequence_number": 2,
+            "opaque": {"preserved": true}
+        }),
+        response_completed("resp-order", 3, 1, 2),
+    ];
+    for event in &events {
+        connection.send_json(event.clone());
+    }
+    for expected in events {
+        assert_eq!(receive_json(&mut socket).await, expected);
+    }
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequential_turns_and_previous_response_id_reuse_the_same_upstream_connection() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    send_json(&mut socket, &response_create("first turn", None)).await;
+    let first = upstream.expect_text(connection.id).await;
+    assert!(first.get("previous_response_id").is_none());
+    let first_terminal = response_completed("resp-first", 1, 0, 1);
+    connection.send_json(first_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, first_terminal);
+
+    send_json(
+        &mut socket,
+        &response_create("second turn", Some("resp-first")),
+    )
+    .await;
+    let second = upstream.expect_text(connection.id).await;
+    assert_eq!(second["previous_response_id"], "resp-first");
+    assert_eq!(second["input"][0]["content"][0]["text"], "second turn");
+    let second_terminal = response_completed("resp-second", 2, 0, 1);
+    connection.send_json(second_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, second_terminal);
+    assert_eq!(upstream.handshake_count(), 1);
+    assert_eq!(upstream.connection_count(), 1);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_in_flight_create_is_rejected_locally_then_a_later_turn_is_allowed() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    send_json(&mut socket, &response_create("still running", None)).await;
+    let first = upstream.expect_text(connection.id).await;
+    assert_eq!(first["input"][0]["content"][0]["text"], "still running");
+    send_json(&mut socket, &response_create("must be rejected", None)).await;
+    let error = receive_json(&mut socket).await;
+    assert_responses_error(&error, "response_in_progress", None);
+
+    let first_terminal = response_completed("resp-running", 1, 0, 1);
+    connection.send_json(first_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, first_terminal);
+    send_json(
+        &mut socket,
+        &response_create("now allowed", Some("resp-running")),
+    )
+    .await;
+    let later = upstream.expect_text(connection.id).await;
+    assert_eq!(later["input"][0]["content"][0]["text"], "now allowed");
+    assert_eq!(later["previous_response_id"], "resp-running");
+    let later_terminal = response_completed("resp-later", 1, 0, 1);
+    connection.send_json(later_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, later_terminal);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validation_errors_are_not_forwarded_and_leave_the_connection_usable() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    let invalid_requests = [
+        (json!({"type": "session.update", "model": MODEL}), "type"),
+        (
+            json!({"type": "response.create", "model": "not-allowed", "input": []}),
+            "model",
+        ),
+        (
+            json!({"type": "response.create", "model": MODEL, "input": [], "stream": true}),
+            "stream",
+        ),
+        (
+            json!({"type": "response.create", "model": MODEL, "input": [], "background": true}),
+            "background",
+        ),
+        (
+            json!({"type": "response.create", "model": MODEL, "input": [], "store": true}),
+            "store",
+        ),
+    ];
+    for (request, param) in invalid_requests {
+        send_json(&mut socket, &request).await;
+        let error = receive_json(&mut socket).await;
+        assert_responses_error(&error, "invalid_request_error", Some(param));
+    }
+
+    let valid = response_create("connection survived validation", None);
+    send_json(&mut socket, &valid).await;
+    let forwarded = upstream.expect_text(connection.id).await;
+    assert_eq!(
+        forwarded["input"][0]["content"][0]["text"],
+        "connection survived validation"
+    );
+    let terminal = response_completed("resp-after-validation", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_is_checked_per_operation_and_rejections_keep_the_socket_open() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            weekly_limit_usd: Some("0.000001"),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    send_json(&mut socket, &response_create("cross quota", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+    let terminal = response_completed("resp-costly", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+
+    for prompt in ["over quota", "still connected"] {
+        send_json(&mut socket, &response_create(prompt, Some("resp-costly"))).await;
+        let error = receive_json(&mut socket).await;
+        assert_responses_error(&error, "weekly_quota_exceeded", None);
+    }
+
+    let rows = request_log_rows(&relay.database_path, 3).await;
+    assert_eq!(
+        rows,
+        vec![
+            ("completed".to_string(), "websocket".to_string(), true),
+            ("rejected".to_string(), "websocket".to_string(), true),
+            ("rejected".to_string(), "websocket".to_string(), true),
+        ]
+    );
+    assert_eq!(upstream.connection_count(), 1);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_text_and_binary_application_frames_close_with_1003() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+
+    let mut malformed = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade malformed-text socket");
+    let _ = upstream.expect_handshake().await;
+    let malformed_upstream = upstream.expect_connection().await;
+    malformed
+        .send(Message::Text("{not-json".into()))
+        .await
+        .expect("send malformed text frame");
+    let close = receive_close(&mut malformed).await;
+    assert_eq!(close.code, CloseCode::Unsupported);
+    let _ = upstream.expect_close(malformed_upstream.id).await;
+
+    let mut binary = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade binary socket");
+    let _ = upstream.expect_handshake().await;
+    let binary_upstream = upstream.expect_connection().await;
+    binary
+        .send(Message::Binary(vec![0, 159, 146, 150].into()))
+        .await
+        .expect("send binary application frame");
+    let close = receive_close(&mut binary).await;
+    assert_eq!(close.code, CloseCode::Unsupported);
+    let _ = upstream.expect_close(binary_upstream.id).await;
+    assert_eq!(upstream.connection_count(), 2);
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_downstream_cancels_the_in_flight_upstream_operation() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(&mut socket, &response_create("cancel me", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+    connection.send_json(json!({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": "resp-cancel", "status": "in_progress"}
+    }));
+    let _ = receive_json(&mut socket).await;
+
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "client cancellation".into(),
+        })))
+        .await
+        .expect("send downstream cancellation close");
+    let _ = upstream.expect_close(connection.id).await;
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("canceled".to_string(), "websocket".to_string(), true)]
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abnormal_upstream_disconnect_closes_downstream_with_1011() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(&mut socket, &response_create("upstream disappears", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    connection.abort();
+    let close = receive_close(&mut socket).await;
+    assert_eq!(close.code, CloseCode::Error);
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_handshake_401_refreshes_credentials_and_retries_once() {
+    let stale_access_token = jwt(json!({"exp": 4_102_444_800_u64, "token": "stale"}));
+    let fresh_access_token = jwt(json!({"exp": 4_102_444_800_u64, "token": "fresh"}));
+    let mut upstream = FakeUpstream::start(Some(&fresh_access_token), &fresh_access_token).await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            access_token: stale_access_token.clone(),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("downstream upgrade should survive one upstream 401");
+
+    let (first_headers, accepted) = upstream.expect_handshake().await;
+    assert!(!accepted);
+    assert_eq!(
+        first_headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {stale_access_token}").as_str())
+    );
+    match upstream.next_event().await {
+        UpstreamEvent::OAuth { headers, body } => {
+            assert_eq!(
+                headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json")
+            );
+            assert_eq!(body["client_id"], OAUTH_CLIENT_ID);
+            assert_eq!(body["grant_type"], "refresh_token");
+            assert_eq!(body["refresh_token"], "upstream-refresh-token");
+        }
+        event => panic!("expected OAuth refresh after upstream 401, got {event:?}"),
+    }
+    let (second_headers, accepted) = upstream.expect_handshake().await;
+    assert!(accepted);
+    assert_eq!(
+        second_headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {fresh_access_token}").as_str())
+    );
+    let connection = upstream.expect_connection().await;
+    assert_eq!(upstream.handshake_count(), 2);
+    assert_eq!(upstream.connection_count(), 1);
+
+    send_json(&mut socket, &response_create("after refresh", None)).await;
+    let forwarded = upstream.expect_text(connection.id).await;
+    assert_eq!(forwarded["model"], MODEL);
+    let terminal = response_completed("resp-refreshed", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}

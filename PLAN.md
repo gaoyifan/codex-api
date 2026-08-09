@@ -309,7 +309,7 @@ Forward upstream text event frames in order. Inspect terminal frames before forw
 Handle control and failure behavior as follows:
 
 - Forward or respond correctly to ping, pong, and close frames.
-- Reject binary application messages with close code 1003.
+- Reject malformed JSON text and binary application messages with close code 1003.
 - On downstream cancellation, close the upstream socket and mark an in-flight operation canceled.
 - On an abnormal upstream close or protocol failure, complete the ledger row as an upstream error and close downstream with 1011.
 - On validation or quota rejection after upgrade, send a standard Responses `error` event and keep the socket open for a later valid operation.
@@ -323,7 +323,8 @@ The test seams are fixed as follows:
 - a local scripted Axum server for ChatGPT HTTP/SSE, WebSocket, and OAuth boundaries
 - real temporary file-backed SQLite databases
 - restart-based observation for internal credential state
-- a controlled clock for expiry, duration, and week-boundary behavior
+- a controlled clock injected through the library `run_with_clock` boundary for
+  expiry, duration, and week-boundary behavior; the binary uses the system clock
 - direct read-only SQL only against the public `request_logs` view
 
 Do not mock internal modules, inspect private credential tables from tests, or make routers, middleware, converters, and SQL queries public merely for testing.
