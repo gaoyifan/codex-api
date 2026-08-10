@@ -38,6 +38,18 @@ cp config.example.toml config.toml
 ./target/release/codex-api --config ./config.toml
 ```
 
+With Nix flakes enabled, the equivalent package and development workflows are:
+
+```bash
+nix build
+nix run . -- --config ./config.toml
+nix develop
+```
+
+`nix flake check` builds the package and validates the flake outputs. The
+integration suite uses loopback TCP sockets, which the Nix build sandbox
+blocks; run `cargo test --all-targets` from `nix develop` instead.
+
 Configuration is loaded once at startup. Restart the process after changing
 it. TLS is intentionally outside the service; put it behind a trusted reverse
 proxy when exposing it beyond a private network.

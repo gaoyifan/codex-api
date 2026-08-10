@@ -1,4 +1,6 @@
 /target/
+/result
+/result-*
 /config.toml
 auth.json
 *.sqlite3
