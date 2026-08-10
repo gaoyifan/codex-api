@@ -9,6 +9,8 @@ use std::{error::Error, fmt};
 
 use serde_json::{Map, Value, json};
 
+use crate::responses_terminal::{TerminalEvent, TerminalKind, Usage};
+
 /// Identifies whether an error belongs to the downstream request or to the
 /// upstream Responses protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,16 +61,6 @@ pub struct ConvertedRequest {
     pub reasoning_effort: Option<String>,
 }
 
-/// Token counts extracted from a complete upstream terminal response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub total_tokens: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalStatus {
     Completed,
@@ -80,7 +72,7 @@ pub enum TerminalStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConvertedTerminal {
     pub chat_completion: Value,
-    pub usage: TokenUsage,
+    pub usage: Usage,
     pub status: TerminalStatus,
 }
 
@@ -163,27 +155,23 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
     })
 }
 
-/// Converts a complete `response.completed` or `response.incomplete` SSE data
-/// object into one non-streaming Chat Completion.
-pub fn convert_terminal_event(event: &Value) -> Result<ConvertedTerminal, ChatError> {
-    let event = event
-        .as_object()
-        .ok_or_else(|| ChatError::upstream("terminal Responses event must be an object"))?;
-    let event_type = upstream_string(event, "type", "terminal event")?;
-    let terminal_status = match event_type {
-        "response.completed" => TerminalStatus::Completed,
-        "response.incomplete" => TerminalStatus::Incomplete,
-        "response.failed" | "error" => {
+/// Converts a validated completed or incomplete Responses terminal into one
+/// non-streaming Chat Completion.
+pub fn convert_terminal_event(terminal: &TerminalEvent) -> Result<ConvertedTerminal, ChatError> {
+    let terminal_status = match terminal.kind {
+        TerminalKind::Completed => TerminalStatus::Completed,
+        TerminalKind::Incomplete => TerminalStatus::Incomplete,
+        TerminalKind::Failed | TerminalKind::Error => {
             return Err(ChatError::upstream(format!(
-                "upstream emitted {event_type} instead of a completion"
-            )));
-        }
-        _ => {
-            return Err(ChatError::upstream(format!(
-                "expected a terminal Responses event, got {event_type}"
+                "upstream emitted {} instead of a completion",
+                terminal.kind.event_name()
             )));
         }
     };
+    let event = terminal
+        .payload
+        .as_object()
+        .ok_or_else(|| ChatError::upstream("terminal Responses event must be an object"))?;
 
     let response = event
         .get("response")
@@ -193,16 +181,6 @@ pub fn convert_terminal_event(event: &Value) -> Result<ConvertedTerminal, ChatEr
         return Err(ChatError::upstream(
             "terminal response has an invalid object type",
         ));
-    }
-
-    let expected_status = match terminal_status {
-        TerminalStatus::Completed => "completed",
-        TerminalStatus::Incomplete => "incomplete",
-    };
-    if upstream_string(response, "status", "terminal response")? != expected_status {
-        return Err(ChatError::upstream(format!(
-            "terminal event and response status do not agree: expected {expected_status}"
-        )));
     }
 
     let id = upstream_string(response, "id", "terminal response")?;
@@ -218,7 +196,9 @@ pub fn convert_terminal_event(event: &Value) -> Result<ConvertedTerminal, ChatEr
         ));
     }
     let created = upstream_integer(response, "created_at", "terminal response")?;
-    let usage = parse_usage(response.get("usage"))?;
+    let usage = terminal
+        .usage
+        .ok_or_else(|| ChatError::upstream("terminal response is missing usage"))?;
     let output = response
         .get("output")
         .and_then(Value::as_array)
@@ -235,19 +215,11 @@ pub fn convert_terminal_event(event: &Value) -> Result<ConvertedTerminal, ChatEr
     message.insert("role".into(), Value::String("assistant".into()));
     message.insert(
         "content".into(),
-        if converted_output.saw_text {
-            Value::String(converted_output.text)
-        } else {
-            Value::Null
-        },
+        converted_output.text.map_or(Value::Null, Value::String),
     );
     message.insert(
         "refusal".into(),
-        if converted_output.saw_refusal {
-            Value::String(converted_output.refusal)
-        } else {
-            Value::Null
-        },
+        converted_output.refusal.map_or(Value::Null, Value::String),
     );
     if !converted_output.tool_calls.is_empty() {
         message.insert(
@@ -672,19 +644,15 @@ fn convert_tool_choice(value: Value) -> Result<Value, ChatError> {
 }
 
 struct ConvertedOutput {
-    text: String,
-    saw_text: bool,
-    refusal: String,
-    saw_refusal: bool,
+    text: Option<String>,
+    refusal: Option<String>,
     tool_calls: Vec<Value>,
 }
 
 fn convert_output(output: &[Value]) -> Result<ConvertedOutput, ChatError> {
     let mut converted = ConvertedOutput {
-        text: String::new(),
-        saw_text: false,
-        refusal: String::new(),
-        saw_refusal: false,
+        text: None,
+        refusal: None,
         tool_calls: Vec::new(),
     };
 
@@ -743,16 +711,14 @@ fn convert_output_message(
             "output_text" => {
                 converted
                     .text
+                    .get_or_insert_with(String::new)
                     .push_str(upstream_string(part, "text", "output_text content part")?);
-                converted.saw_text = true;
             }
             "refusal" => {
-                converted.refusal.push_str(upstream_string(
-                    part,
-                    "refusal",
-                    "refusal content part",
-                )?);
-                converted.saw_refusal = true;
+                converted
+                    .refusal
+                    .get_or_insert_with(String::new)
+                    .push_str(upstream_string(part, "refusal", "refusal content part")?);
             }
             unsupported => {
                 return Err(ChatError::upstream(format!(
@@ -762,54 +728,6 @@ fn convert_output_message(
         }
     }
     Ok(())
-}
-
-fn parse_usage(value: Option<&Value>) -> Result<TokenUsage, ChatError> {
-    let usage = value
-        .and_then(Value::as_object)
-        .ok_or_else(|| ChatError::upstream("terminal response is missing usage"))?;
-    let input_tokens = upstream_u64(usage, "input_tokens", "response usage")?;
-    let output_tokens = upstream_u64(usage, "output_tokens", "response usage")?;
-    let total_tokens = upstream_u64(usage, "total_tokens", "response usage")?;
-    let cached_input_tokens = optional_usage_detail(
-        usage.get("input_tokens_details"),
-        "cached_tokens",
-        "input token details",
-    )?;
-    let reasoning_tokens = optional_usage_detail(
-        usage.get("output_tokens_details"),
-        "reasoning_tokens",
-        "output token details",
-    )?;
-    if cached_input_tokens > input_tokens {
-        return Err(ChatError::upstream(
-            "cached input tokens exceed total input tokens",
-        ));
-    }
-    Ok(TokenUsage {
-        input_tokens,
-        cached_input_tokens,
-        output_tokens,
-        reasoning_tokens,
-        total_tokens,
-    })
-}
-
-fn optional_usage_detail(
-    value: Option<&Value>,
-    field: &str,
-    context: &str,
-) -> Result<u64, ChatError> {
-    match value {
-        None | Some(Value::Null) => Ok(0),
-        Some(Value::Object(details)) => match details.get(field) {
-            None | Some(Value::Null) => Ok(0),
-            Some(value) => value.as_u64().ok_or_else(|| {
-                ChatError::upstream(format!("{context}.{field} must be a non-negative integer"))
-            }),
-        },
-        Some(_) => Err(ChatError::upstream(format!("{context} must be an object"))),
-    }
 }
 
 fn incomplete_finish_reason(response: &Map<String, Value>) -> Result<&'static str, ChatError> {
@@ -835,12 +753,6 @@ fn upstream_string<'a>(
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| ChatError::upstream(format!("{context}.{field} must be a string")))
-}
-
-fn upstream_u64(object: &Map<String, Value>, field: &str, context: &str) -> Result<u64, ChatError> {
-    object.get(field).and_then(Value::as_u64).ok_or_else(|| {
-        ChatError::upstream(format!("{context}.{field} must be a non-negative integer"))
-    })
 }
 
 fn upstream_integer(

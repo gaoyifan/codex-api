@@ -39,9 +39,6 @@ pub(crate) enum UpstreamWebSocketError {
     #[error("upstream WebSocket handshake failed with HTTP status {status}")]
     Handshake { status: StatusCode },
 
-    #[error("upstream base URL must use http or https")]
-    UnsupportedUrlScheme,
-
     #[error("failed to build upstream WebSocket request")]
     Request,
 
@@ -79,7 +76,7 @@ async fn connect_once(
     base_url: &Url,
     credentials: &CredentialSnapshot,
 ) -> Result<UpstreamWebSocket, UpstreamWebSocketError> {
-    let websocket_url = responses_websocket_url(base_url)?;
+    let websocket_url = responses_websocket_url(base_url);
     let mut request = websocket_url
         .as_str()
         .into_client_request()
@@ -118,23 +115,21 @@ async fn connect_once(
         .map_err(classify_connect_error)
 }
 
-fn responses_websocket_url(base_url: &Url) -> Result<Url, UpstreamWebSocketError> {
+fn responses_websocket_url(base_url: &Url) -> Url {
     let mut url = base_url.clone();
-    match base_url.scheme() {
-        "http" => url
-            .set_scheme("ws")
-            .map_err(|()| UpstreamWebSocketError::UnsupportedUrlScheme)?,
-        "https" => url
-            .set_scheme("wss")
-            .map_err(|()| UpstreamWebSocketError::UnsupportedUrlScheme)?,
-        _ => return Err(UpstreamWebSocketError::UnsupportedUrlScheme),
-    }
+    let websocket_scheme = if base_url.scheme() == "http" {
+        "ws"
+    } else {
+        "wss"
+    };
+    url.set_scheme(websocket_scheme)
+        .expect("validated HTTP(S) upstream URL accepts a WebSocket scheme");
 
     let base_path = base_url.path().trim_end_matches('/');
     url.set_path(&format!("{base_path}/{RESPONSES_PATH}"));
     url.set_query(None);
     url.set_fragment(None);
-    Ok(url)
+    url
 }
 
 fn classify_connect_error(error: TungsteniteError) -> UpstreamWebSocketError {

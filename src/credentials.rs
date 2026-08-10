@@ -153,6 +153,23 @@ impl CredentialManager {
                         .perform_refresh(expected_generation)
                         .await
                         .map_err(Arc::new);
+                    let retryable_server_error = matches!(
+                        &outcome,
+                        Err(error)
+                            if matches!(
+                                error.as_ref(),
+                                CredentialError::OauthRejected(500..=599)
+                            )
+                    );
+                    if retryable_server_error {
+                        let mut flight = inner.refresh_flight.lock().await;
+                        if flight
+                            .as_ref()
+                            .is_some_and(|flight| flight.generation == expected_generation)
+                        {
+                            *flight = None;
+                        }
+                    }
                     sender.send_replace(Some(outcome));
                 });
                 receiver

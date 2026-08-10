@@ -42,10 +42,11 @@ Configuration is loaded once at startup. Restart the process after changing
 it. TLS is intentionally outside the service; put it behind a trusted reverse
 proxy when exposing it beyond a private network.
 
-`SIGINT` and `SIGTERM` stop new connections, cancel active Responses, Chat,
-and WebSocket operations, commit their ledger rows as `canceled`, and wait for
-the connection tasks and any dispatched OAuth token rotation to finish before
-the process exits.
+`SIGINT` and `SIGTERM` stop new connections and cancel Responses, Chat, and
+WebSocket operations that are still awaiting an upstream outcome. Outcomes
+already received from upstream retain their terminal status and usage. The
+service waits for ledger writes, connection tasks, and any dispatched OAuth
+token rotation to finish before the process exits.
 
 The ChatGPT authentication file has the same token structure as Codex CLI's
 `auth.json` and must declare `"auth_mode": "chatgpt"`. It is a seed only. On

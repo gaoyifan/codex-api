@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::auth::{ClientIdentity, authenticate};
 use crate::error::{ApiError, websocket_error};
+use crate::responses_terminal::{TerminalKind, parse_terminal_payload};
 use crate::state::AppState;
 use crate::store::{
     Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, RequestId, RequestMetadata,
@@ -33,11 +34,6 @@ struct PreparedRequest {
 struct ValidationError {
     param: &'static str,
     message: &'static str,
-}
-
-struct Terminal {
-    status: FinalStatus,
-    usage: Option<BillableUsage>,
 }
 
 pub(crate) async fn responses_websocket(
@@ -327,9 +323,17 @@ async fn proxy_connection(
                                 return;
                             }
                         };
-                        let terminal = match inspect_terminal(&event, in_flight.as_ref()) {
+                        if event.get("type").and_then(Value::as_str).is_none() {
+                            close_for_upstream_failure(
+                                &mut downstream,
+                                &state,
+                                &mut in_flight,
+                            ).await;
+                            return;
+                        }
+                        let terminal = match parse_terminal_payload(event) {
                             Ok(terminal) => terminal,
-                            Err(()) => {
+                            Err(_) => {
                                 close_for_upstream_failure(
                                     &mut downstream,
                                     &state,
@@ -348,13 +352,26 @@ async fn proxy_connection(
                                 return;
                             };
                             let request_id = active.request_id;
+                            let status = match terminal.kind {
+                                TerminalKind::Completed => FinalStatus::Completed,
+                                TerminalKind::Incomplete => FinalStatus::Incomplete,
+                                TerminalKind::Failed | TerminalKind::Error => {
+                                    FinalStatus::UpstreamError
+                                }
+                            };
+                            let usage = terminal.usage.map(|usage| BillableUsage {
+                                input_tokens: usage.input_tokens,
+                                cached_input_tokens: usage.cached_input_tokens,
+                                output_tokens: usage.output_tokens,
+                                rates: active.rates,
+                            });
                             if state
                                 .store
                                 .finalize_request(
                                     request_id,
-                                    terminal.status,
+                                    status,
                                     None,
-                                    terminal.usage,
+                                    usage,
                                 )
                                 .await
                                 .is_err()
@@ -591,62 +608,6 @@ async fn record_rejection(
         }
         Admission::WeeklyQuotaExceeded(_) => Ok(()),
     }
-}
-
-fn inspect_terminal(event: &Value, active: Option<&InFlight>) -> Result<Option<Terminal>, ()> {
-    let event_type = event.get("type").and_then(Value::as_str).ok_or(())?;
-    if event_type == "error" {
-        return Ok(Some(Terminal {
-            status: FinalStatus::UpstreamError,
-            usage: None,
-        }));
-    }
-    let (status, expected_response_status) = match event_type {
-        "response.completed" => (FinalStatus::Completed, "completed"),
-        "response.incomplete" => (FinalStatus::Incomplete, "incomplete"),
-        "response.failed" => (FinalStatus::UpstreamError, "failed"),
-        _ => return Ok(None),
-    };
-    let response = event.get("response").and_then(Value::as_object).ok_or(())?;
-    if response.get("status").and_then(Value::as_str) != Some(expected_response_status) {
-        return Err(());
-    }
-    let usage_value = response.get("usage").filter(|usage| !usage.is_null());
-    let usage = match usage_value {
-        Some(usage) => {
-            let active = active.ok_or(())?;
-            let input_tokens = usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .ok_or(())?;
-            let cached_input_tokens = match usage.get("input_tokens_details") {
-                None | Some(Value::Null) => 0,
-                Some(details) => {
-                    let details = details.as_object().ok_or(())?;
-                    match details.get("cached_tokens") {
-                        None | Some(Value::Null) => 0,
-                        Some(cached_tokens) => cached_tokens.as_u64().ok_or(())?,
-                    }
-                }
-            };
-            if cached_input_tokens > input_tokens {
-                return Err(());
-            }
-            let output_tokens = usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .ok_or(())?;
-            Some(BillableUsage {
-                input_tokens,
-                cached_input_tokens,
-                output_tokens,
-                rates: active.rates,
-            })
-        }
-        None if matches!(status, FinalStatus::UpstreamError) => None,
-        None => return Err(()),
-    };
-    Ok(Some(Terminal { status, usage }))
 }
 
 async fn send_downstream_json(downstream: &mut WebSocket, value: Value) -> Result<(), ()> {

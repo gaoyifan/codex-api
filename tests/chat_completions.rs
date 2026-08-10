@@ -733,6 +733,31 @@ async fn builds_the_chat_completion_only_from_the_terminal_full_response() {
 }
 
 #[tokio::test]
+async fn preserves_explicitly_empty_text_and_refusal_parts_as_empty_strings() {
+    let terminal = completed_event(
+        "resp_empty_parts",
+        json!([{
+            "id": "msg_empty",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "", "annotations": [], "logprobs": []},
+                {"type": "refusal", "refusal": ""}
+            ]
+        }]),
+    );
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![terminal])]).await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let (status, body) = response_json(relay.post(&minimal_request()).await).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let message = &body["choices"][0]["message"];
+    assert_eq!(message["content"], "");
+    assert_eq!(message["refusal"], "");
+}
+
+#[tokio::test]
 async fn uses_completed_output_items_when_the_private_terminal_omits_output() {
     let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![
         json!({
@@ -821,6 +846,7 @@ async fn maps_responses_function_calls_to_ordered_chat_tool_calls() {
     assert_eq!(message["role"], "assistant");
     assert!(message.as_object().unwrap().contains_key("content"));
     assert!(message["content"].is_null());
+    assert!(message["refusal"].is_null());
     assert_eq!(
         message["tool_calls"],
         json!([
@@ -968,7 +994,7 @@ async fn downstream_disconnect_during_chat_aggregation_marks_the_request_cancele
 }
 
 #[tokio::test]
-async fn downstream_disconnect_while_chat_terminal_accounting_is_blocked_marks_request_canceled() {
+async fn downstream_disconnect_after_chat_terminal_arrives_preserves_usage_and_completion() {
     let upstream = ScriptedUpstream::start(vec![UpstreamReply::Sse(vec![SseChunk {
         delay: Duration::from_secs(1),
         data: sse_event(&completed_event(
@@ -1017,22 +1043,111 @@ async fn downstream_disconnect_while_chat_terminal_accounting_is_blocked_marks_r
         .await
         .expect("release the terminal accounting write");
 
-    let status = timeout(Duration::from_secs(2), async {
+    let row = timeout(Duration::from_secs(2), async {
         loop {
-            let status = sqlx::query("SELECT status FROM request_logs ORDER BY id DESC LIMIT 1")
-                .fetch_optional(&mut database)
-                .await
-                .unwrap()
-                .map(|row| row.get::<String, _>("status"));
-            if status.as_deref() == Some("canceled") {
-                break status.unwrap();
+            let row = sqlx::query(
+                "SELECT status, http_status, input_tokens, cached_input_tokens, output_tokens, \
+                 cost_usd FROM request_logs ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_optional(&mut database)
+            .await
+            .unwrap();
+            if row
+                .as_ref()
+                .is_some_and(|row| row.get::<String, _>("status") != "started")
+            {
+                break row.unwrap();
             }
             sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("blocked terminal request log did not become canceled");
-    assert_eq!(status, "canceled");
+    .expect("blocked terminal request log was not finalized");
+    assert_eq!(row.get::<String, _>("status"), "completed");
+    assert_eq!(row.get::<i64, _>("http_status"), 200);
+    assert_eq!(row.get::<i64, _>("input_tokens"), 13);
+    assert_eq!(row.get::<i64, _>("cached_input_tokens"), 3);
+    assert_eq!(row.get::<i64, _>("output_tokens"), 8);
+    assert_eq!(row.get::<String, _>("cost_usd"), "0.000058300");
+}
+
+#[tokio::test]
+async fn downstream_disconnect_after_chat_eof_preserves_upstream_error() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::Sse(vec![SseChunk {
+        delay: Duration::from_secs(1),
+        data: sse_event(&json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {"id": "resp_without_terminal", "status": "in_progress"}
+        })),
+    }])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let client = relay.client.clone();
+    let url = format!("{}/v1/chat/completions", relay.base_url);
+    let request = minimal_request();
+    let downstream = tokio::spawn(async move {
+        client
+            .post(url)
+            .bearer_auth(API_KEY)
+            .json(&request)
+            .send()
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        while upstream.request_count() == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Chat request never reached upstream");
+
+    let mut database = relay.database().await;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut database)
+        .await
+        .expect("hold the EOF accounting write");
+    sleep(Duration::from_millis(1_200)).await;
+    assert!(
+        !downstream.is_finished(),
+        "Chat error response finished while EOF accounting was write-locked"
+    );
+
+    downstream.abort();
+    let _ = downstream.await;
+    sleep(Duration::from_millis(100)).await;
+    sqlx::query("COMMIT")
+        .execute(&mut database)
+        .await
+        .expect("release the EOF accounting write");
+
+    let row = timeout(Duration::from_secs(2), async {
+        loop {
+            let row = sqlx::query(
+                "SELECT status, http_status, input_tokens, cached_input_tokens, output_tokens, \
+                 cost_usd FROM request_logs ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_optional(&mut database)
+            .await
+            .unwrap();
+            if row
+                .as_ref()
+                .is_some_and(|row| row.get::<String, _>("status") != "started")
+            {
+                break row.unwrap();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("blocked EOF request log was not finalized");
+    assert_eq!(row.get::<String, _>("status"), "upstream_error");
+    assert_eq!(row.get::<i64, _>("http_status"), 502);
+    assert_eq!(row.get::<Option<i64>, _>("input_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("cached_input_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("output_tokens"), None);
+    assert_eq!(row.get::<Option<String>, _>("cost_usd"), None);
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ mod config;
 mod credentials;
 mod error;
 mod http_api;
+mod responses_terminal;
 mod sse;
 mod state;
 mod store;

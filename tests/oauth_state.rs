@@ -960,6 +960,94 @@ async fn oauth_failure_is_not_retried_or_reported_as_downstream_auth_failure() {
     assert_oauth_grant(&fake.oauth_requests()[0], "seed-refresh");
 }
 
+#[tokio::test]
+async fn later_request_can_recover_after_transient_oauth_failure() {
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+    fake.fail_oauth_with(StatusCode::SERVICE_UNAVAILABLE);
+    let fixture = RelayFixture::new(
+        &fake,
+        &seed(
+            access_token("transient-failure", now + Duration::minutes(4)),
+            "seed-refresh",
+            "account-a",
+            now,
+        ),
+    );
+
+    let relay = fixture.start().await;
+    let failed = post_streaming_response(&relay.responses_url()).await;
+
+    assert_eq!(failed.status, StatusCode::BAD_GATEWAY, "{}", failed.body);
+    assert_eq!(
+        fake.oauth_requests().len(),
+        1,
+        "one downstream request must make only one refresh attempt"
+    );
+    assert!(fake.upstream_requests().is_empty());
+
+    let recovered_access = access_token("recovered", now + Duration::hours(1));
+    fake.reply_with(full_oauth_reply(
+        &recovered_access,
+        "rotated-refresh",
+        "account-a",
+    ));
+    assert_success(&post_streaming_response(&relay.responses_url()).await);
+
+    let oauth = fake.oauth_requests();
+    assert_eq!(oauth.len(), 2, "a later request must retry the exchange");
+    assert_oauth_grant(&oauth[0], "seed-refresh");
+    assert_oauth_grant(&oauth[1], "seed-refresh");
+    let upstream = fake.upstream_requests();
+    assert_eq!(upstream.len(), 1);
+    assert_eq!(
+        upstream[0].authorization.as_deref(),
+        Some(bearer(&recovered_access).as_str())
+    );
+}
+
+#[tokio::test]
+async fn invalid_oauth_success_response_is_latched_without_reusing_the_refresh_token() {
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+    fake.reply_with(json!({
+        "access_token": "invalid-access\r\nx-invalid: true",
+        "refresh_token": "possibly-rotated-refresh"
+    }));
+    let fixture = RelayFixture::new(
+        &fake,
+        &seed(
+            access_token("invalid-response", now + Duration::minutes(4)),
+            "single-use-refresh",
+            "account-a",
+            now,
+        ),
+    );
+
+    let relay = fixture.start().await;
+    let first = post_streaming_response(&relay.responses_url()).await;
+
+    assert_eq!(first.status, StatusCode::BAD_GATEWAY, "{}", first.body);
+    assert_eq!(fake.oauth_requests().len(), 1);
+    assert_oauth_grant(&fake.oauth_requests()[0], "single-use-refresh");
+    assert!(fake.upstream_requests().is_empty());
+
+    fake.reply_with(full_oauth_reply(
+        &access_token("must-not-be-used", now + Duration::hours(1)),
+        "must-not-be-persisted",
+        "account-a",
+    ));
+    let second = post_streaming_response(&relay.responses_url()).await;
+
+    assert_eq!(second.status, StatusCode::BAD_GATEWAY, "{}", second.body);
+    assert_eq!(
+        fake.oauth_requests().len(),
+        1,
+        "an invalid 2xx response may have rotated the refresh token"
+    );
+    assert!(fake.upstream_requests().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_same_generation_callers_share_one_oauth_failure() {
     const REQUEST_COUNT: usize = 12;

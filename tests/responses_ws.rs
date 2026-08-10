@@ -790,6 +790,37 @@ async fn request_log_rows(
     }
 }
 
+async fn assert_only_request_log_has_no_usage_or_cost(database_path: &Path) {
+    let options = SqliteConnectOptions::new()
+        .filename(database_path)
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open request log database");
+    let row = sqlx::query(
+        "SELECT input_tokens, cached_input_tokens, output_tokens, cost_usd \
+         FROM request_logs",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query failed operation accounting");
+    for column in ["input_tokens", "cached_input_tokens", "output_tokens"] {
+        assert!(
+            row.try_get::<Option<i64>, _>(column)
+                .expect("decode nullable token count")
+                .is_none(),
+            "{column} must remain null"
+        );
+    }
+    assert!(
+        row.try_get::<Option<String>, _>("cost_usd")
+            .expect("decode nullable request cost")
+            .is_none()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_upgrade_authenticates_before_contacting_upstream() {
     let access_token = jwt(json!({"exp": 4_102_444_800_u64}));
@@ -1209,34 +1240,7 @@ async fn completed_response_without_usage_is_not_forwarded_or_billed() {
         rows,
         vec![("upstream_error".to_string(), "websocket".to_string(), true)]
     );
-    let options = SqliteConnectOptions::new()
-        .filename(&relay.database_path)
-        .read_only(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .expect("open request log database");
-    let row = sqlx::query(
-        "SELECT input_tokens, cached_input_tokens, output_tokens, cost_usd \
-         FROM request_logs",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query failed operation accounting");
-    for column in ["input_tokens", "cached_input_tokens", "output_tokens"] {
-        assert!(
-            row.try_get::<Option<i64>, _>(column)
-                .expect("decode nullable token count")
-                .is_none(),
-            "{column} must remain null"
-        );
-    }
-    assert!(
-        row.try_get::<Option<String>, _>("cost_usd")
-            .expect("decode nullable request cost")
-            .is_none()
-    );
+    assert_only_request_log_has_no_usage_or_cost(&relay.database_path).await;
     relay.stop().await;
 }
 
@@ -1267,6 +1271,46 @@ async fn malformed_present_cached_token_details_close_with_1011_before_terminal_
         rows,
         vec![("upstream_error".to_string(), "websocket".to_string(), true)]
     );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_total_tokens_closes_1011_without_terminal_forwarding_or_billing() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(&mut socket, &response_create("malformed total usage", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    let mut terminal = response_completed("resp-malformed-total", 3, 1, 2);
+    terminal["response"]["usage"]["total_tokens"] = json!("not-an-integer");
+    connection.send_json(terminal);
+
+    let message = timeout(TEST_TIMEOUT, socket.next())
+        .await
+        .expect("timed out waiting for downstream protocol close")
+        .expect("downstream ended without a protocol close")
+        .expect("read downstream protocol close");
+    let close = match message {
+        Message::Close(Some(close)) => close,
+        Message::Text(text) => panic!("malformed terminal was forwarded downstream: {text}"),
+        message => panic!("expected downstream protocol close, got {message:?}"),
+    };
+    assert_eq!(close.code, CloseCode::Error);
+
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
+    assert_only_request_log_has_no_usage_or_cost(&relay.database_path).await;
     relay.stop().await;
 }
 
@@ -1307,34 +1351,7 @@ async fn cached_tokens_above_input_tokens_fail_before_accounting_and_finalize_up
         rows,
         vec![("upstream_error".to_string(), "websocket".to_string(), true)]
     );
-    let options = SqliteConnectOptions::new()
-        .filename(&relay.database_path)
-        .read_only(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .expect("open request log database");
-    let row = sqlx::query(
-        "SELECT input_tokens, cached_input_tokens, output_tokens, cost_usd \
-         FROM request_logs",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query failed operation accounting");
-    for column in ["input_tokens", "cached_input_tokens", "output_tokens"] {
-        assert!(
-            row.try_get::<Option<i64>, _>(column)
-                .expect("decode nullable token count")
-                .is_none(),
-            "{column} must remain null"
-        );
-    }
-    assert!(
-        row.try_get::<Option<String>, _>("cost_usd")
-            .expect("decode nullable request cost")
-            .is_none()
-    );
+    assert_only_request_log_has_no_usage_or_cost(&relay.database_path).await;
     relay.stop().await;
 }
 
@@ -1380,34 +1397,7 @@ async fn usage_above_sqlite_range_closes_without_forwarding_and_finalizes_upstre
         rows,
         vec![("upstream_error".to_string(), "websocket".to_string(), true)]
     );
-    let options = SqliteConnectOptions::new()
-        .filename(&relay.database_path)
-        .read_only(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .expect("open request log database");
-    let row = sqlx::query(
-        "SELECT input_tokens, cached_input_tokens, output_tokens, cost_usd \
-         FROM request_logs",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query failed operation accounting");
-    for column in ["input_tokens", "cached_input_tokens", "output_tokens"] {
-        assert!(
-            row.try_get::<Option<i64>, _>(column)
-                .expect("decode nullable token count")
-                .is_none(),
-            "{column} must remain null"
-        );
-    }
-    assert!(
-        row.try_get::<Option<String>, _>("cost_usd")
-            .expect("decode nullable request cost")
-            .is_none()
-    );
+    assert_only_request_log_has_no_usage_or_cost(&relay.database_path).await;
     relay.stop().await;
 }
 

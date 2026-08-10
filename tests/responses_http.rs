@@ -63,6 +63,7 @@ struct ScriptedResponse {
     header_delay: Duration,
     header_dropped: Option<Arc<Notify>>,
     chunks: Vec<ScriptChunk>,
+    body_started: Option<Arc<Notify>>,
     hold_open: bool,
     dropped: Option<Arc<Notify>>,
 }
@@ -75,6 +76,7 @@ impl ScriptedResponse {
             header_delay: Duration::ZERO,
             header_dropped: None,
             chunks,
+            body_started: None,
             hold_open: false,
             dropped: None,
         }
@@ -87,6 +89,7 @@ impl ScriptedResponse {
             header_delay: Duration::ZERO,
             header_dropped: None,
             chunks: vec![ScriptChunk::immediate(value.to_string())],
+            body_started: None,
             hold_open: false,
             dropped: None,
         }
@@ -206,6 +209,9 @@ async fn fake_responses(
                 sleep(chunk.delay).await;
             }
             yield Ok::<Bytes, Infallible>(chunk.bytes);
+        }
+        if let Some(body_started) = response.body_started {
+            body_started.notify_one();
         }
         if response.hold_open {
             std::future::pending::<()>().await;
@@ -1005,6 +1011,66 @@ async fn responses_forwards_failed_terminals_without_usage_and_does_not_charge_t
 }
 
 #[tokio::test]
+async fn responses_accounts_and_forwards_an_error_event_without_waiting_for_eof() {
+    let upstream_stream_dropped = Arc::new(Notify::new());
+    let error = json!({
+        "type": "error",
+        "sequence_number": 1,
+        "code": "server_error",
+        "message": "upstream failed",
+        "param": null
+    });
+    let mut script = ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
+        "event: error\ndata: {error}\n\n"
+    ))]);
+    script.hold_open = true;
+    script.dropped = Some(Arc::clone(&upstream_stream_dropped));
+    let upstream = FakeUpstream::start(vec![script]).await;
+    let relay = Relay::start(&upstream.base_url()).await;
+
+    let response = authorized_request(&client(), &relay)
+        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+        .send()
+        .await
+        .expect("send Responses request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut events = Box::pin(response.bytes_stream().eventsource());
+    let forwarded = timeout(Duration::from_secs(1), events.next())
+        .await
+        .expect("relay waited for EOF before forwarding the error event")
+        .expect("downstream stream ended before the error event")
+        .expect("error event framing");
+    assert_eq!(forwarded.event, "error");
+    assert_eq!(
+        serde_json::from_str::<Value>(&forwarded.data).unwrap(),
+        error
+    );
+
+    assert_eq!(
+        request_logs(&relay.state_path).await,
+        [ObservedRequestLog {
+            status: "upstream_error".to_owned(),
+            http_status: Some(200),
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            exact_cost: None,
+        }],
+        "the error must be committed before it is forwarded"
+    );
+    assert!(
+        timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("downstream stream remained open after the error event")
+            .is_none(),
+        "the error event must terminate the downstream stream"
+    );
+    timeout(Duration::from_secs(1), upstream_stream_dropped.notified())
+        .await
+        .expect("relay kept the upstream stream open after the error event");
+}
+
+#[tokio::test]
 async fn responses_does_not_require_total_tokens_to_equal_the_billed_token_sum() {
     let terminal = json!({
         "type": "response.completed",
@@ -1090,6 +1156,76 @@ async fn responses_preserves_an_upstream_error_before_streaming_starts() {
         response.json::<Value>().await.expect("upstream error JSON"),
         upstream_error
     );
+}
+
+#[tokio::test]
+async fn responses_disconnect_after_upstream_error_starts_preserves_the_error_outcome() {
+    let upstream_body_started = Arc::new(Notify::new());
+    let upstream_body_dropped = Arc::new(Notify::new());
+    let mut script = ScriptedResponse::json(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "error": {
+                "message": "upstream rate limit",
+                "type": "requests",
+                "param": null,
+                "code": "rate_limit_exceeded"
+            }
+        }),
+    );
+    script.body_started = Some(Arc::clone(&upstream_body_started));
+    script.hold_open = true;
+    script.dropped = Some(Arc::clone(&upstream_body_dropped));
+    let upstream = FakeUpstream::start(vec![script]).await;
+    let relay = Relay::start(&upstream.base_url()).await;
+    let url = relay.responses_url();
+
+    let downstream = tokio::spawn(async move {
+        client()
+            .post(url)
+            .bearer_auth(DOWNSTREAM_KEY)
+            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+            .send()
+            .await
+    });
+    timeout(Duration::from_secs(2), upstream_body_started.notified())
+        .await
+        .expect("relay did not start consuming the upstream error body");
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !downstream.is_finished(),
+        "relay returned before the upstream error body completed"
+    );
+
+    downstream.abort();
+    let _ = downstream.await;
+    timeout(Duration::from_secs(2), upstream_body_dropped.notified())
+        .await
+        .expect("downstream disconnect did not drop the upstream error body");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logs = request_logs(&relay.state_path).await;
+        if logs.first().is_some_and(|row| row.status != "started") {
+            assert_eq!(
+                logs,
+                [ObservedRequestLog {
+                    status: "upstream_error".to_owned(),
+                    http_status: Some(429),
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    exact_cost: None,
+                }]
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnect left the upstream error ledger row unfinished: {logs:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

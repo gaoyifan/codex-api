@@ -17,7 +17,8 @@ use crate::{
     auth::{ClientIdentity, authenticate},
     chat::{self, ChatErrorKind, TerminalStatus},
     error::ApiError,
-    sse::{SseRead, SseReader, TerminalKind, Usage},
+    responses_terminal::{TerminalKind, Usage},
+    sse::{SseRead, SseReader},
     state::AppState,
     store::{
         Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, RequestId, RequestMetadata,
@@ -29,7 +30,8 @@ struct PendingRequest {
     store: Arc<Store>,
     shutdown: CancellationToken,
     request_id: Option<RequestId>,
-    cancellation_http_status: Option<u16>,
+    drop_status: FinalStatus,
+    drop_http_status: Option<u16>,
     pending_request: Option<TaskTrackerToken>,
 }
 
@@ -44,13 +46,14 @@ impl PendingRequest {
             store,
             shutdown,
             request_id: Some(request_id),
-            cancellation_http_status: None,
+            drop_status: FinalStatus::Canceled,
+            drop_http_status: None,
             pending_request: Some(pending_request),
         }
     }
 
     fn response_started(&mut self, status: StatusCode) {
-        self.cancellation_http_status = Some(status.as_u16());
+        self.drop_http_status = Some(status.as_u16());
     }
 
     async fn finish(
@@ -61,50 +64,65 @@ impl PendingRequest {
     ) -> Result<(), ApiError> {
         let request_id = self
             .request_id
+            .take()
             .expect("a pending request can only be finalized once");
-        let result = self
-            .store
-            .finalize_request(
-                request_id,
-                status,
-                http_status.map(|status| status.as_u16()),
-                usage,
-            )
-            .await;
-        self.request_id = None;
-        result.map_err(|_| ApiError::internal())
+        let pending_request = self
+            .pending_request
+            .take()
+            .expect("a pending request has a tracker token");
+        let store = Arc::clone(&self.store);
+        tokio::spawn(async move {
+            let _pending_request = pending_request;
+            store
+                .finalize_request(
+                    request_id,
+                    status,
+                    http_status.map(|status| status.as_u16()),
+                    usage,
+                )
+                .await
+        })
+        .await
+        .expect("request finalization task must not panic")
+        .map_err(|_| ApiError::internal())
     }
 
-    async fn finish_billable_terminal(
+    async fn finish_terminal(
         &mut self,
         status: FinalStatus,
         http_status: StatusCode,
         fallback_http_status: StatusCode,
-        usage: BillableUsage,
+        usage: Option<BillableUsage>,
     ) -> bool {
         let request_id = self
             .request_id
+            .take()
             .expect("a pending request can only be finalized once");
-        let result = self
-            .store
-            .finalize_request(request_id, status, Some(http_status.as_u16()), Some(usage))
-            .await;
-        self.request_id = None;
-        if result.is_ok() {
-            return true;
-        }
-        self.request_id = Some(request_id);
-        let _ = self
-            .store
-            .finalize_request(
-                request_id,
-                FinalStatus::UpstreamError,
-                Some(fallback_http_status.as_u16()),
-                None,
-            )
-            .await;
-        self.request_id = None;
-        false
+        let pending_request = self
+            .pending_request
+            .take()
+            .expect("a pending request has a tracker token");
+        let store = Arc::clone(&self.store);
+        tokio::spawn(async move {
+            let _pending_request = pending_request;
+            let result = store
+                .finalize_request(request_id, status, Some(http_status.as_u16()), usage)
+                .await;
+            if result.is_ok() {
+                return true;
+            }
+            let _ = store
+                .finalize_request(
+                    request_id,
+                    FinalStatus::UpstreamError,
+                    Some(fallback_http_status.as_u16()),
+                    None,
+                )
+                .await;
+            false
+        })
+        .await
+        .expect("terminal finalization task must not panic")
     }
 }
 
@@ -114,7 +132,8 @@ impl Drop for PendingRequest {
             return;
         };
         let store = Arc::clone(&self.store);
-        let http_status = self.cancellation_http_status;
+        let status = self.drop_status;
+        let http_status = self.drop_http_status;
         let pending_request = self
             .pending_request
             .take()
@@ -122,7 +141,7 @@ impl Drop for PendingRequest {
         tokio::spawn(async move {
             let _pending_request = pending_request;
             let _ = store
-                .finalize_request(request_id, FinalStatus::Canceled, http_status, None)
+                .finalize_request(request_id, status, http_status, None)
                 .await;
         });
     }
@@ -350,52 +369,38 @@ pub(crate) async fn chat_completions(
         match next {
             Ok(SseRead::Event(event)) => {
                 if event.terminal().is_none() {
-                    if let Ok(value) = serde_json::from_str::<Value>(&event.data) {
-                        match value.get("type").and_then(Value::as_str) {
-                            Some("response.output_item.done") => {
-                                if let Some(item) = value.get("item") {
-                                    completed_output_items.push(item.clone());
-                                }
-                            }
-                            Some("error") => {
-                                request
-                                    .finish(
-                                        FinalStatus::UpstreamError,
-                                        Some(StatusCode::BAD_GATEWAY),
-                                        None,
-                                    )
-                                    .await?;
-                                return Err(ApiError::gateway("Upstream response failed"));
-                            }
-                            _ => {}
-                        }
+                    if let Ok(value) = serde_json::from_str::<Value>(&event.data)
+                        && value.get("type").and_then(Value::as_str)
+                            == Some("response.output_item.done")
+                        && let Some(item) = value.get("item")
+                    {
+                        completed_output_items.push(item.clone());
                     }
                     continue;
                 }
 
-                let terminal = event.into_terminal().expect("checked above");
+                let mut terminal = event.into_terminal().expect("checked above");
                 let terminal_usage = terminal.usage;
-                let mut terminal_json = terminal.payload;
                 let terminal_output_is_empty = matches!(
-                    terminal_json.pointer("/response/output"),
+                    terminal.payload.pointer("/response/output"),
                     Some(Value::Array(output)) if output.is_empty()
                 );
                 if terminal_output_is_empty && !completed_output_items.is_empty() {
-                    terminal_json["response"]["output"] =
+                    terminal.payload["response"]["output"] =
                         Value::Array(std::mem::take(&mut completed_output_items));
                 }
-                match chat::convert_terminal_event(&terminal_json) {
-                    Ok(terminal) => {
-                        let status = match terminal.status {
+                match chat::convert_terminal_event(&terminal) {
+                    Ok(converted_terminal) => {
+                        let status = match converted_terminal.status {
                             TerminalStatus::Completed => FinalStatus::Completed,
                             TerminalStatus::Incomplete => FinalStatus::Incomplete,
                         };
                         if !request
-                            .finish_billable_terminal(
+                            .finish_terminal(
                                 status,
                                 StatusCode::OK,
                                 StatusCode::BAD_GATEWAY,
-                                billable_chat_usage(terminal.usage, rates),
+                                Some(billable_usage(converted_terminal.usage, rates)),
                             )
                             .await
                         {
@@ -403,7 +408,7 @@ pub(crate) async fn chat_completions(
                                 "Upstream terminal response could not be accounted",
                             ));
                         }
-                        return Ok(Json(terminal.chat_completion).into_response());
+                        return Ok(Json(converted_terminal.chat_completion).into_response());
                     }
                     Err(error) if error.kind == ChatErrorKind::UpstreamProtocol => {
                         return fail_chat_terminal(
@@ -417,7 +422,7 @@ pub(crate) async fn chat_completions(
                     Err(_) => unreachable!("terminal conversion cannot be a request error"),
                 }
             }
-            Ok(SseRead::Eof { .. }) | Err(_) => {
+            Ok(SseRead::Eof) | Err(_) => {
                 request
                     .finish(
                         FinalStatus::UpstreamError,
@@ -464,24 +469,16 @@ async fn forward_responses_stream(
                     let status = match terminal.kind {
                         TerminalKind::Completed => FinalStatus::Completed,
                         TerminalKind::Incomplete => FinalStatus::Incomplete,
-                        TerminalKind::Failed => FinalStatus::UpstreamError,
+                        TerminalKind::Failed | TerminalKind::Error => FinalStatus::UpstreamError,
                     };
-                    let finalized = match terminal.usage {
-                        Some(usage) => {
-                            request
-                                .finish_billable_terminal(
-                                    status,
-                                    StatusCode::OK,
-                                    StatusCode::OK,
-                                    billable_sse_usage(usage, rates),
-                                )
-                                .await
-                        }
-                        None => request
-                            .finish(status, Some(StatusCode::OK), None)
-                            .await
-                            .is_ok(),
-                    };
+                    let finalized = request
+                        .finish_terminal(
+                            status,
+                            StatusCode::OK,
+                            StatusCode::OK,
+                            terminal.usage.map(|usage| billable_usage(usage, rates)),
+                        )
+                        .await;
                     if !finalized {
                         return;
                     }
@@ -504,7 +501,7 @@ async fn forward_responses_stream(
                     return;
                 }
             }
-            Ok(SseRead::Eof { .. }) | Err(_) => {
+            Ok(SseRead::Eof) | Err(_) => {
                 let _ = request
                     .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
                     .await;
@@ -666,11 +663,15 @@ async fn upstream_error_response(
     upstream: reqwest::Response,
 ) -> Result<Response, ApiError> {
     let status = upstream.status();
+    request.drop_status = FinalStatus::UpstreamError;
+    request.drop_http_status = Some(status.as_u16());
     let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
     let body_result = tokio::select! {
         biased;
         _ = shutdown.cancelled() => {
-            request.finish(FinalStatus::Canceled, None, None).await?;
+            request
+                .finish(FinalStatus::UpstreamError, Some(status), None)
+                .await?;
             return Err(ApiError::shutdown());
         }
         result = upstream.bytes() => result,
@@ -706,40 +707,18 @@ async fn fail_chat_terminal(
     usage: Option<Usage>,
     message: &'static str,
 ) -> Result<Response, ApiError> {
-    match usage {
-        Some(usage) => {
-            let _ = request
-                .finish_billable_terminal(
-                    FinalStatus::UpstreamError,
-                    StatusCode::BAD_GATEWAY,
-                    StatusCode::BAD_GATEWAY,
-                    billable_sse_usage(usage, rates),
-                )
-                .await;
-        }
-        None => {
-            request
-                .finish(
-                    FinalStatus::UpstreamError,
-                    Some(StatusCode::BAD_GATEWAY),
-                    None,
-                )
-                .await?;
-        }
-    }
+    let _ = request
+        .finish_terminal(
+            FinalStatus::UpstreamError,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_GATEWAY,
+            usage.map(|usage| billable_usage(usage, rates)),
+        )
+        .await;
     Err(ApiError::gateway(message))
 }
 
-fn billable_sse_usage(usage: Usage, rates: ModelRates) -> BillableUsage {
-    BillableUsage {
-        input_tokens: usage.input_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        output_tokens: usage.output_tokens,
-        rates,
-    }
-}
-
-fn billable_chat_usage(usage: chat::TokenUsage, rates: ModelRates) -> BillableUsage {
+fn billable_usage(usage: Usage, rates: ModelRates) -> BillableUsage {
     BillableUsage {
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,

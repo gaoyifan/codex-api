@@ -182,7 +182,7 @@ Admission behavior:
 - Later requests receive an OpenAI-style HTTP `429` error with code `weekly_quota_exceeded`.
 - Concurrent requests independently observe committed spend. Do not invent reservations based on unknown future token usage.
 - For an upgraded WebSocket, check quota before every `response.create`. A rejected operation receives a standard Responses `error` event and the connection stays open.
-- Charge any terminal response that reports usage, including incomplete or failed responses. Failed/error responses without reported usage have a null cost; completed and incomplete terminal responses must report usage.
+- Charge any terminal response that reports usage, including incomplete or failed responses. Failed/error responses without reported usage have a null cost; completed and incomplete terminal responses must report usage. Once the relay receives an upstream terminal outcome, preserve that status and accounting even if the downstream disconnects before delivery; record `canceled` only while the upstream operation is still awaiting an outcome.
 
 ## 4. Authentication and Upstream Credential Refresh
 
@@ -230,9 +230,9 @@ Refresh behavior:
 
 The service must parse upstream SSE so it can inspect terminal usage and record accounting, then emit canonical SSE framing downstream. Preserve event names, event IDs, data JSON, order, and streaming timeliness. Do not promise byte-identical network chunks, and do not add a Chat Completions-style `[DONE]` marker.
 
-Forward unknown informational Responses events unchanged. Recognize terminal completed, incomplete, and failed events for accounting. Before emitting a terminal event, commit final usage, price, duration, and status to SQLite. If the terminal event is malformed, lacks required usage for a priced completion, or cannot be committed, close the stream without fabricating a successful terminal event.
+Forward unknown informational Responses events unchanged. Recognize completed, incomplete, failed, and error terminal events for accounting. Before emitting a terminal event, commit final usage, price, duration, and status to SQLite. If the terminal event is malformed, lacks required usage for a priced completion, or cannot be committed, close the stream without fabricating a successful terminal event.
 
-If the client disconnects, cancel the upstream request and finish the ledger row as canceled. Once HTTP SSE headers have been sent, do not attempt to change the HTTP status in response to a later stream error.
+If the client disconnects before an upstream terminal outcome arrives, cancel the upstream request and finish the ledger row as canceled. Once HTTP SSE headers have been sent, do not attempt to change the HTTP status in response to a later stream error.
 
 ## 6. Chat Completions Compatibility
 

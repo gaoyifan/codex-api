@@ -410,11 +410,7 @@ fn monday_start(now: OffsetDateTime) -> OffsetDateTime {
 }
 
 fn calculate_cost_nano_usd(usage: BillableUsage) -> Result<i64, StoreError> {
-    if usage.cached_input_tokens > usage.input_tokens
-        || usage.rates.input_usd_per_million.is_sign_negative()
-        || usage.rates.cached_input_usd_per_million.is_sign_negative()
-        || usage.rates.output_usd_per_million.is_sign_negative()
-    {
+    if usage.cached_input_tokens > usage.input_tokens {
         return Err(StoreError::InvalidUsage);
     }
     let uncached = Decimal::from(usage.input_tokens - usage.cached_input_tokens);
