@@ -115,14 +115,22 @@ async fn proxy_connection(
                                     .await;
                                     return;
                                 }
-                                close_for_client_protocol_error(
-                                    &mut downstream,
-                                    &mut upstream,
-                                    &state,
-                                    &mut in_flight,
+                                let error = websocket_error(
+                                    "invalid_request_error",
+                                    None,
                                     "response.create must be valid JSON",
-                                ).await;
-                                return;
+                                );
+                                if send_downstream_json(&mut downstream, error).await.is_err() {
+                                    close_after_client_disconnect(
+                                        &mut upstream,
+                                        &state,
+                                        &mut in_flight,
+                                        None,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                continue;
                             }
                         };
                         let prepared = match prepare_request(value, &state, &identity) {

@@ -1167,6 +1167,80 @@ async fn ping_and_pong_frames_are_forwarded_both_ways_and_leave_the_connection_u
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_response_without_usage_is_not_forwarded_or_billed() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(
+        &mut socket,
+        &response_create("successful response missing usage", None),
+    )
+    .await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    let mut terminal = response_completed("resp-missing-usage", 3, 1, 2);
+    terminal["response"]
+        .as_object_mut()
+        .expect("response object")
+        .remove("usage");
+    connection.send_json(terminal);
+
+    let message = timeout(TEST_TIMEOUT, socket.next())
+        .await
+        .expect("timed out waiting for downstream accounting close")
+        .expect("downstream ended without an accounting close")
+        .expect("read downstream accounting close");
+    let close = match message {
+        Message::Close(Some(close)) => close,
+        Message::Text(text) => panic!("unaccountable terminal was forwarded downstream: {text}"),
+        message => panic!("expected downstream accounting close, got {message:?}"),
+    };
+    assert_eq!(close.code, CloseCode::Error);
+
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
+    let options = SqliteConnectOptions::new()
+        .filename(&relay.database_path)
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open request log database");
+    let row = sqlx::query(
+        "SELECT input_tokens, cached_input_tokens, output_tokens, cost_usd \
+         FROM request_logs",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query failed operation accounting");
+    for column in ["input_tokens", "cached_input_tokens", "output_tokens"] {
+        assert!(
+            row.try_get::<Option<i64>, _>(column)
+                .expect("decode nullable token count")
+                .is_none(),
+            "{column} must remain null"
+        );
+    }
+    assert!(
+        row.try_get::<Option<String>, _>("cost_usd")
+            .expect("decode nullable request cost")
+            .is_none()
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_present_cached_token_details_close_with_1011_before_terminal_forwarding() {
     let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
     let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
@@ -1617,31 +1691,68 @@ async fn quota_is_checked_per_operation_and_rejections_keep_the_socket_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn malformed_text_and_binary_application_frames_close_with_1003() {
+async fn malformed_text_is_rejected_without_closing_or_contacting_upstream() {
     let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
     let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
-
-    let mut malformed = connect_downstream(
+    let mut socket = connect_downstream(
         &relay.websocket_url(),
         Some(&format!("Bearer {CLIENT_KEY}")),
     )
     .await
     .expect("upgrade malformed-text socket");
     let _ = upstream.expect_handshake().await;
-    let malformed_upstream = upstream.expect_connection().await;
-    malformed
+    let connection = upstream.expect_connection().await;
+    socket
         .send(Message::Text("{not-json".into()))
         .await
         .expect("send malformed text frame");
-    let close = receive_close(&mut malformed).await;
-    assert_eq!(close.code, CloseCode::Unsupported);
-    let _ = upstream.expect_close(malformed_upstream.id).await;
+    let error = receive_json(&mut socket).await;
+    assert_responses_error(&error, "invalid_request_error", None);
+    assert!(error["param"].is_null());
     let rows = request_log_rows(&relay.database_path, 1).await;
     assert_eq!(
         rows,
         vec![("rejected".to_string(), "websocket".to_string(), true)]
     );
+    assert!(
+        timeout(Duration::from_millis(100), upstream.events.recv())
+            .await
+            .is_err(),
+        "malformed downstream text reached the upstream WebSocket"
+    );
 
+    send_json(
+        &mut socket,
+        &response_create("valid after malformed text", None),
+    )
+    .await;
+    let forwarded = upstream.expect_text(connection.id).await;
+    assert_eq!(
+        forwarded["input"][0]["content"][0]["text"],
+        "valid after malformed text"
+    );
+    let terminal = response_completed("resp-after-malformed-text", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+    let rows = request_log_rows(&relay.database_path, 2).await;
+    assert_eq!(
+        rows,
+        vec![
+            ("rejected".to_string(), "websocket".to_string(), true),
+            ("completed".to_string(), "websocket".to_string(), true),
+        ]
+    );
+    assert_eq!(upstream.connection_count(), 1);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binary_application_frames_close_with_1003() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
     let mut binary = connect_downstream(
         &relay.websocket_url(),
         Some(&format!("Bearer {CLIENT_KEY}")),
@@ -1657,12 +1768,7 @@ async fn malformed_text_and_binary_application_frames_close_with_1003() {
     let close = receive_close(&mut binary).await;
     assert_eq!(close.code, CloseCode::Unsupported);
     let _ = upstream.expect_close(binary_upstream.id).await;
-    let rows = request_log_rows(&relay.database_path, 1).await;
-    assert_eq!(
-        rows,
-        vec![("rejected".to_string(), "websocket".to_string(), true)]
-    );
-    assert_eq!(upstream.connection_count(), 2);
+    assert_eq!(upstream.connection_count(), 1);
     relay.stop().await;
 }
 

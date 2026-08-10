@@ -968,6 +968,107 @@ async fn downstream_disconnect_during_chat_aggregation_marks_the_request_cancele
 }
 
 #[tokio::test]
+async fn downstream_disconnect_while_chat_terminal_accounting_is_blocked_marks_request_canceled() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::Sse(vec![SseChunk {
+        delay: Duration::from_secs(1),
+        data: sse_event(&completed_event(
+            "resp_blocked_accounting",
+            text_output("complete"),
+        )),
+    }])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let client = relay.client.clone();
+    let url = format!("{}/v1/chat/completions", relay.base_url);
+    let request = minimal_request();
+    let downstream = tokio::spawn(async move {
+        client
+            .post(url)
+            .bearer_auth(API_KEY)
+            .json(&request)
+            .send()
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        while upstream.request_count() == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Chat request never reached upstream");
+
+    let mut database = relay.database().await;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut database)
+        .await
+        .expect("hold the terminal accounting write");
+    sleep(Duration::from_millis(1_200)).await;
+    assert!(
+        !downstream.is_finished(),
+        "Chat response finished while terminal accounting was write-locked"
+    );
+
+    downstream.abort();
+    let _ = downstream.await;
+    sleep(Duration::from_millis(100)).await;
+    sqlx::query("COMMIT")
+        .execute(&mut database)
+        .await
+        .expect("release the terminal accounting write");
+
+    let status = timeout(Duration::from_secs(2), async {
+        loop {
+            let status = sqlx::query("SELECT status FROM request_logs ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut database)
+                .await
+                .unwrap()
+                .map(|row| row.get::<String, _>("status"));
+            if status.as_deref() == Some("canceled") {
+                break status.unwrap();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("blocked terminal request log did not become canceled");
+    assert_eq!(status, "canceled");
+}
+
+#[tokio::test]
+async fn unaccountable_chat_terminal_returns_and_records_bad_gateway() {
+    let unaccountable_tokens = i64::MAX as u64 + 1;
+    let mut terminal = completed_event("resp_unaccountable", text_output("complete"));
+    terminal["response"]["usage"] = json!({
+        "input_tokens": unaccountable_tokens,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 0,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": unaccountable_tokens
+    });
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![terminal])]).await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let (status, body) = response_json(relay.post(&minimal_request()).await).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+
+    let mut database = relay.database().await;
+    let row = sqlx::query(
+        "SELECT status, http_status, input_tokens, cached_input_tokens, output_tokens, cost_usd \
+         FROM request_logs ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&mut database)
+    .await
+    .expect("read unaccountable Chat request log");
+    assert_eq!(row.get::<String, _>("status"), "upstream_error");
+    assert_eq!(row.get::<i64, _>("http_status"), 502);
+    assert_eq!(row.get::<Option<i64>, _>("input_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("cached_input_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("output_tokens"), None);
+    assert_eq!(row.get::<Option<String>, _>("cost_usd"), None);
+}
+
+#[tokio::test]
 async fn turns_upstream_http_errors_error_events_and_failed_responses_into_gateway_errors() {
     let failed = json!({
         "type": "response.failed",

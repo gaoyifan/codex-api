@@ -62,17 +62,49 @@ impl PendingRequest {
         let request_id = self
             .request_id
             .expect("a pending request can only be finalized once");
-        self.store
+        let result = self
+            .store
             .finalize_request(
                 request_id,
                 status,
                 http_status.map(|status| status.as_u16()),
                 usage,
             )
-            .await
-            .map_err(|_| ApiError::internal())?;
+            .await;
         self.request_id = None;
-        Ok(())
+        result.map_err(|_| ApiError::internal())
+    }
+
+    async fn finish_billable_terminal(
+        &mut self,
+        status: FinalStatus,
+        http_status: StatusCode,
+        fallback_http_status: StatusCode,
+        usage: BillableUsage,
+    ) -> bool {
+        let request_id = self
+            .request_id
+            .expect("a pending request can only be finalized once");
+        let result = self
+            .store
+            .finalize_request(request_id, status, Some(http_status.as_u16()), Some(usage))
+            .await;
+        self.request_id = None;
+        if result.is_ok() {
+            return true;
+        }
+        self.request_id = Some(request_id);
+        let _ = self
+            .store
+            .finalize_request(
+                request_id,
+                FinalStatus::UpstreamError,
+                Some(fallback_http_status.as_u16()),
+                None,
+            )
+            .await;
+        self.request_id = None;
+        false
     }
 }
 
@@ -105,16 +137,7 @@ pub(crate) async fn responses(
     let parsed = match serde_json::from_slice::<Value>(&body) {
         Ok(parsed) => parsed,
         Err(_) => {
-            reject_request(
-                &state,
-                &identity,
-                "",
-                None,
-                ApiProtocol::Responses,
-                "request",
-                "request body must be valid JSON",
-            )
-            .await?;
+            reject_request(&state, &identity, "", None, ApiProtocol::Responses).await?;
             return Err(ApiError::invalid(
                 "request",
                 "request body must be valid JSON",
@@ -136,8 +159,6 @@ pub(crate) async fn responses(
                 &model,
                 reasoning_effort,
                 ApiProtocol::Responses,
-                "model",
-                "model is not configured",
             )
             .await?;
             return Err(ApiError::invalid("model", "model is not configured"));
@@ -153,8 +174,6 @@ pub(crate) async fn responses(
                 &model,
                 reasoning_effort,
                 ApiProtocol::Responses,
-                error.param().unwrap_or("request"),
-                error.message(),
             )
             .await?;
             return Err(error);
@@ -228,16 +247,7 @@ pub(crate) async fn chat_completions(
     let parsed = match serde_json::from_slice::<Value>(&body) {
         Ok(parsed) => parsed,
         Err(_) => {
-            reject_request(
-                &state,
-                &identity,
-                "",
-                None,
-                ApiProtocol::ChatCompletions,
-                "request",
-                "request body must be valid JSON",
-            )
-            .await?;
+            reject_request(&state, &identity, "", None, ApiProtocol::ChatCompletions).await?;
             return Err(ApiError::invalid(
                 "request",
                 "request body must be valid JSON",
@@ -256,8 +266,6 @@ pub(crate) async fn chat_completions(
             &tentative_model,
             tentative_reasoning_effort.clone(),
             ApiProtocol::ChatCompletions,
-            "model",
-            "model is not configured",
         )
         .await?;
         return Err(ApiError::invalid("model", "model is not configured"));
@@ -271,8 +279,6 @@ pub(crate) async fn chat_completions(
                 &tentative_model,
                 tentative_reasoning_effort,
                 ApiProtocol::ChatCompletions,
-                error.param.as_deref().unwrap_or("request"),
-                &error.message,
             )
             .await?;
             return Err(ApiError::invalid(
@@ -367,19 +373,9 @@ pub(crate) async fn chat_completions(
                     continue;
                 }
 
-                let terminal_usage = event.terminal().expect("checked above").usage;
-                let mut terminal_json = match serde_json::from_str::<Value>(&event.data) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return fail_chat_terminal(
-                            &mut request,
-                            rates,
-                            terminal_usage,
-                            "Upstream terminal response was malformed",
-                        )
-                        .await;
-                    }
-                };
+                let terminal = event.into_terminal().expect("checked above");
+                let terminal_usage = terminal.usage;
+                let mut terminal_json = terminal.payload;
                 let terminal_output_is_empty = matches!(
                     terminal_json.pointer("/response/output"),
                     Some(Value::Array(output)) if output.is_empty()
@@ -394,13 +390,19 @@ pub(crate) async fn chat_completions(
                             TerminalStatus::Completed => FinalStatus::Completed,
                             TerminalStatus::Incomplete => FinalStatus::Incomplete,
                         };
-                        request
-                            .finish(
+                        if !request
+                            .finish_billable_terminal(
                                 status,
-                                Some(StatusCode::OK),
-                                Some(billable_chat_usage(terminal.usage, rates)),
+                                StatusCode::OK,
+                                StatusCode::BAD_GATEWAY,
+                                billable_chat_usage(terminal.usage, rates),
                             )
-                            .await?;
+                            .await
+                        {
+                            return Err(ApiError::gateway(
+                                "Upstream terminal response could not be accounted",
+                            ));
+                        }
                         return Ok(Json(terminal.chat_completion).into_response());
                     }
                     Err(error) if error.kind == ChatErrorKind::UpstreamProtocol => {
@@ -464,15 +466,23 @@ async fn forward_responses_stream(
                         TerminalKind::Incomplete => FinalStatus::Incomplete,
                         TerminalKind::Failed => FinalStatus::UpstreamError,
                     };
-                    if request
-                        .finish(
-                            status,
-                            Some(StatusCode::OK),
-                            terminal.usage.map(|usage| billable_sse_usage(usage, rates)),
-                        )
-                        .await
-                        .is_err()
-                    {
+                    let finalized = match terminal.usage {
+                        Some(usage) => {
+                            request
+                                .finish_billable_terminal(
+                                    status,
+                                    StatusCode::OK,
+                                    StatusCode::OK,
+                                    billable_sse_usage(usage, rates),
+                                )
+                                .await
+                        }
+                        None => request
+                            .finish(status, Some(StatusCode::OK), None)
+                            .await
+                            .is_ok(),
+                    };
+                    if !finalized {
                         return;
                     }
                     tokio::select! {
@@ -621,8 +631,6 @@ async fn reject_request(
     model: &str,
     reasoning_effort: Option<String>,
     api_protocol: ApiProtocol,
-    _param: &str,
-    _message: &str,
 ) -> Result<(), ApiError> {
     let metadata = RequestMetadata {
         api_key_id: identity.id.clone(),
@@ -640,30 +648,13 @@ async fn reject_request(
         Admission::Admitted(request_id) => request_id,
         Admission::WeeklyQuotaExceeded(_) => unreachable!("an unlimited ledger entry was rejected"),
     };
-    finish(
-        state,
-        request_id,
-        FinalStatus::Rejected,
-        Some(StatusCode::BAD_REQUEST),
-        None,
-    )
-    .await
-}
-
-async fn finish(
-    state: &AppState,
-    request_id: RequestId,
-    status: FinalStatus,
-    http_status: Option<StatusCode>,
-    usage: Option<BillableUsage>,
-) -> Result<(), ApiError> {
     state
         .store
         .finalize_request(
             request_id,
-            status,
-            http_status.map(|status| status.as_u16()),
-            usage,
+            FinalStatus::Rejected,
+            Some(StatusCode::BAD_REQUEST.as_u16()),
+            None,
         )
         .await
         .map_err(|_| ApiError::internal())
@@ -715,13 +706,27 @@ async fn fail_chat_terminal(
     usage: Option<Usage>,
     message: &'static str,
 ) -> Result<Response, ApiError> {
-    request
-        .finish(
-            FinalStatus::UpstreamError,
-            Some(StatusCode::BAD_GATEWAY),
-            usage.map(|usage| billable_sse_usage(usage, rates)),
-        )
-        .await?;
+    match usage {
+        Some(usage) => {
+            let _ = request
+                .finish_billable_terminal(
+                    FinalStatus::UpstreamError,
+                    StatusCode::BAD_GATEWAY,
+                    StatusCode::BAD_GATEWAY,
+                    billable_sse_usage(usage, rates),
+                )
+                .await;
+        }
+        None => {
+            request
+                .finish(
+                    FinalStatus::UpstreamError,
+                    Some(StatusCode::BAD_GATEWAY),
+                    None,
+                )
+                .await?;
+        }
+    }
     Err(ApiError::gateway(message))
 }
 

@@ -22,7 +22,7 @@ eventsource-stream = "0.2.3"
 futures-util = { version = "0.3.33", features = ["sink"] }
 http = "1.4.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "rustls", "stream"] }
-rust_decimal = { version = "1.40.0", features = ["serde-with-str"] }
+rust_decimal = "1.40.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -39,10 +39,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
 [dev-dependencies]
-assert_cmd = "2.1.2"
 async-stream = "0.3.6"
-axum-test = { version = "21.0.0", default-features = false, features = ["reqwest", "ws"] }
 http-body-util = "0.1.3"
-predicates = "3.1.3"
 tempfile = "3.27.0"
 tokio-stream = "0.1.18"

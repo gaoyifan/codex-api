@@ -75,14 +75,6 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn param(&self) -> Option<&str> {
-        self.param.as_deref()
-    }
-
-    pub(crate) fn message(&self) -> &str {
-        &self.message
-    }
-
     pub(crate) fn body(&self) -> Value {
         json!({
             "error": {

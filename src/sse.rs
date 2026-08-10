@@ -30,6 +30,11 @@ impl SseEvent {
         self.terminal.as_ref()
     }
 
+    /// Consumes this record and returns its validated terminal payload.
+    pub fn into_terminal(self) -> Option<TerminalEvent> {
+        self.terminal
+    }
+
     /// Encodes this record using canonical LF-delimited SSE framing.
     ///
     /// The effective event ID is always emitted, including an empty ID. This
@@ -110,9 +115,8 @@ impl TerminalKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalEvent {
     pub kind: TerminalKind,
-    /// The complete Responses `response` object, retained for protocol
-    /// conversion by the Chat Completions handler.
-    pub response: Value,
+    /// The parsed terminal SSE data object used by protocol conversion.
+    pub payload: Value,
     pub usage: Option<Usage>,
 }
 
@@ -300,14 +304,23 @@ fn validate_terminal(event: &Event) -> Result<Option<TerminalEvent>, ProtocolErr
     let usage = parse_usage(response, kind)?;
     Ok(Some(TerminalEvent {
         kind,
-        response: response.clone(),
+        payload,
         usage,
     }))
 }
 
 fn parse_usage(response: &Value, kind: TerminalKind) -> Result<Option<Usage>, ProtocolError> {
     let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) else {
-        return Ok(None);
+        return match kind {
+            TerminalKind::Failed => Ok(None),
+            TerminalKind::Completed | TerminalKind::Incomplete => {
+                Err(ProtocolError::InvalidTerminalField {
+                    event: kind.event_name().to_owned(),
+                    field: "response.usage",
+                    expected: "an object",
+                })
+            }
+        };
     };
     if !usage.is_object() {
         return Err(ProtocolError::InvalidTerminalField {

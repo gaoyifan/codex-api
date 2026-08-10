@@ -107,8 +107,9 @@ header, and send text frames such as:
 ```
 
 Only one response may be in flight per connection. Validation and quota errors
-are Responses `error` events and leave the socket usable. Malformed JSON or
-binary application frames close it with code 1003.
+are Responses `error` events and leave the socket usable. Malformed JSON is
+reported the same way without contacting upstream; binary application frames
+close the socket with code 1003.
 
 ## Accounting and weekly limits
 

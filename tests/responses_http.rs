@@ -735,6 +735,90 @@ async fn responses_forwards_each_usage_bearing_terminal_event_type() {
 }
 
 #[tokio::test]
+async fn responses_suppress_unaccountable_success_terminals_and_finalize_upstream_error() {
+    let unaccountable_tokens = i64::MAX as u64 + 1;
+    let terminals = [
+        ("response.completed", "completed"),
+        ("response.incomplete", "incomplete"),
+    ];
+    let scripts = terminals
+        .iter()
+        .map(|(event, status)| {
+            let data = json!({
+                "type": event,
+                "sequence_number": 1,
+                "response": {
+                    "id": format!("resp_{status}_unaccountable"),
+                    "status": status,
+                    "model": MODEL,
+                    "output": [],
+                    "usage": {
+                        "input_tokens": unaccountable_tokens,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 0,
+                        "total_tokens": unaccountable_tokens
+                    }
+                }
+            });
+            ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
+                "event: {event}\ndata: {data}\n\n"
+            ))])
+        })
+        .collect();
+    let upstream = FakeUpstream::start(scripts).await;
+    let relay = Relay::start(&upstream.base_url()).await;
+    let client = client();
+
+    for _ in terminals {
+        let response = authorized_request(&client, &relay)
+            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+            .send()
+            .await
+            .expect("send Responses request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
+        assert!(
+            events.is_empty(),
+            "an unaccountable success terminal must not be forwarded"
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logs = request_logs(&relay.state_path).await;
+        if logs.len() == 2 && logs.iter().all(|row| row.status != "started") {
+            assert_eq!(
+                logs,
+                [
+                    ObservedRequestLog {
+                        status: "upstream_error".to_owned(),
+                        http_status: Some(200),
+                        input_tokens: None,
+                        cached_input_tokens: None,
+                        output_tokens: None,
+                        exact_cost: None,
+                    },
+                    ObservedRequestLog {
+                        status: "upstream_error".to_owned(),
+                        http_status: Some(200),
+                        input_tokens: None,
+                        cached_input_tokens: None,
+                        output_tokens: None,
+                        exact_cost: None,
+                    },
+                ]
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unaccountable terminal left an unfinished ledger row: {logs:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
 async fn responses_treats_null_usage_detail_objects_as_zero() {
     let terminal = json!({
         "type": "response.completed",
@@ -784,6 +868,68 @@ async fn responses_treats_null_usage_detail_objects_as_zero() {
             exact_cost: Some("0.000022000".to_owned()),
         }]
     );
+}
+
+#[tokio::test]
+async fn responses_suppress_success_terminals_without_usage_and_finalize_upstream_error() {
+    let cases = [
+        ("response.completed", "completed", true),
+        ("response.completed", "completed", false),
+        ("response.incomplete", "incomplete", true),
+        ("response.incomplete", "incomplete", false),
+    ];
+    let scripts = cases
+        .iter()
+        .map(|(event, status, include_null_usage)| {
+            let mut response = json!({
+                "id": format!("resp_{status}_without_usage"),
+                "status": status,
+                "model": MODEL,
+                "output": []
+            });
+            if *include_null_usage {
+                response["usage"] = Value::Null;
+            }
+            let data = json!({
+                "type": event,
+                "sequence_number": 1,
+                "response": response
+            });
+            ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
+                "event: {event}\ndata: {data}\n\n"
+            ))])
+        })
+        .collect();
+    let upstream = FakeUpstream::start(scripts).await;
+    let relay = Relay::start(&upstream.base_url()).await;
+    let client = client();
+
+    for _ in cases {
+        let response = authorized_request(&client, &relay)
+            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+            .send()
+            .await
+            .expect("send Responses request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
+        assert!(
+            events.is_empty(),
+            "a success terminal without usage must not be forwarded"
+        );
+    }
+
+    let logs = request_logs(&relay.state_path).await;
+    assert_eq!(logs.len(), 4);
+    assert!(logs.iter().all(|row| {
+        row == &ObservedRequestLog {
+            status: "upstream_error".to_owned(),
+            http_status: Some(200),
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            exact_cost: None,
+        }
+    }));
 }
 
 #[tokio::test]

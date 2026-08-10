@@ -182,7 +182,7 @@ Admission behavior:
 - Later requests receive an OpenAI-style HTTP `429` error with code `weekly_quota_exceeded`.
 - Concurrent requests independently observe committed spend. Do not invent reservations based on unknown future token usage.
 - For an upgraded WebSocket, check quota before every `response.create`. A rejected operation receives a standard Responses `error` event and the connection stays open.
-- Charge any terminal response that reports usage, including incomplete or failed responses. Requests without reported usage have a null cost.
+- Charge any terminal response that reports usage, including incomplete or failed responses. Failed/error responses without reported usage have a null cost; completed and incomplete terminal responses must report usage.
 
 ## 4. Authentication and Upstream Credential Refresh
 
@@ -326,7 +326,7 @@ Forward upstream text event frames in order. Inspect terminal frames before forw
 Handle control and failure behavior as follows:
 
 - Forward or respond correctly to ping, pong, and close frames.
-- Reject malformed JSON text and binary application messages with close code 1003.
+- Reject malformed JSON text with a standard Responses `error` event while keeping the connection usable; reject binary application messages with close code 1003.
 - On downstream cancellation, close the upstream socket and mark an in-flight operation canceled.
 - On an abnormal upstream close or protocol failure, complete the ledger row as an upstream error and close downstream with 1011.
 - On validation or quota rejection after upgrade, send a standard Responses `error` event and keep the socket open for a later valid operation.
