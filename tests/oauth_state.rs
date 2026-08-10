@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Semaphore};
 
 const CLIENT_KEY: &str = "sk-test-client";
 const MODEL: &str = "gpt-5.6-luna";
@@ -39,6 +39,7 @@ struct OauthReply {
     status: StatusCode,
     body: Value,
     delay: StdDuration,
+    gate: Option<Arc<Semaphore>>,
 }
 
 impl Default for OauthReply {
@@ -47,6 +48,7 @@ impl Default for OauthReply {
             status: StatusCode::OK,
             body: json!({}),
             delay: StdDuration::ZERO,
+            gate: None,
         }
     }
 }
@@ -99,6 +101,7 @@ impl FakeCodexServer {
             status: StatusCode::OK,
             body,
             delay: StdDuration::ZERO,
+            gate: None,
         };
     }
 
@@ -107,7 +110,19 @@ impl FakeCodexServer {
             status: StatusCode::OK,
             body,
             delay,
+            gate: None,
         };
+    }
+
+    fn reply_after_release(&self, body: Value) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        *self.state.oauth_reply.lock().expect("OAuth reply lock") = OauthReply {
+            status: StatusCode::OK,
+            body,
+            delay: StdDuration::ZERO,
+            gate: Some(Arc::clone(&gate)),
+        };
+        gate
     }
 
     fn fail_oauth_with(&self, status: StatusCode) {
@@ -118,6 +133,19 @@ impl FakeCodexServer {
                 "error_description": "scripted OAuth failure"
             }),
             delay: StdDuration::ZERO,
+            gate: None,
+        };
+    }
+
+    fn fail_oauth_with_delay(&self, status: StatusCode, delay: StdDuration) {
+        *self.state.oauth_reply.lock().expect("OAuth reply lock") = OauthReply {
+            status,
+            body: json!({
+                "error": "temporarily_unavailable",
+                "error_description": "scripted delayed OAuth failure"
+            }),
+            delay,
+            gate: None,
         };
     }
 
@@ -273,6 +301,12 @@ async fn fake_oauth(State(state): State<Arc<FakeState>>, body: Bytes) -> Respons
         .expect("OAuth requests lock")
         .push(ObservedOauthRequest { body: parsed });
     let reply = state.oauth_reply.lock().expect("OAuth reply lock").clone();
+    if let Some(gate) = reply.gate {
+        gate.acquire_owned()
+            .await
+            .expect("OAuth response gate was closed")
+            .forget();
+    }
     if !reply.delay.is_zero() {
         tokio::time::sleep(reply.delay).await;
     }
@@ -403,6 +437,52 @@ impl RelayProcess {
     }
 }
 
+async fn expect_seed_startup_failure(fixture: &RelayFixture) -> std::process::Output {
+    let listen = unused_local_addr();
+    write_config(
+        &fixture.config_path,
+        listen,
+        &fixture.database_path,
+        &fixture.auth_path,
+        &fixture.upstream_base_url,
+        &fixture.oauth_url,
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codex-api"))
+        .arg("--config")
+        .arg(&fixture.config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start codex-api process for rejected seed");
+
+    for _ in 0..100 {
+        if child
+            .try_wait()
+            .expect("poll rejected-seed process")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("collect rejected-seed process output");
+        }
+        if tokio::net::TcpStream::connect(listen).await.is_ok() {
+            child
+                .kill()
+                .expect("kill process that accepted an invalid auth seed");
+            let _ = child.wait();
+            panic!("codex-api listened at {listen} with an invalid auth seed");
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+
+    child
+        .kill()
+        .expect("kill process that did not reject invalid auth seed");
+    let _ = child.wait();
+    panic!("codex-api did not reject an invalid auth seed before listening");
+}
+
 impl Drop for RelayProcess {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
@@ -471,6 +551,7 @@ fn write_auth_seed(path: &Path, seed: &AuthSeed) {
         .format(&Rfc3339)
         .expect("format auth last_refresh");
     let value = json!({
+        "auth_mode": "chatgpt",
         "OPENAI_API_KEY": null,
         "tokens": {
             "id_token": id_token(&seed.account_id),
@@ -581,6 +662,93 @@ fn seed(
         refresh_token: refresh_token.into(),
         account_id: account_id.into(),
         last_refresh,
+    }
+}
+
+#[tokio::test]
+async fn auth_seed_rejects_header_control_characters_before_listening_without_leaking_them() {
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+    let cases = [
+        seed(
+            "access-header-injection\r\nx-leaked-access",
+            "refresh-a",
+            "account-a",
+            now,
+        ),
+        seed(
+            access_token("valid-header", now + Duration::hours(1)),
+            "refresh-b",
+            "account-header-injection\r\nx-leaked-account",
+            now,
+        ),
+    ];
+
+    for invalid_seed in cases {
+        let leaked_access = invalid_seed.access_token.clone();
+        let leaked_account = invalid_seed.account_id.clone();
+        let fixture = RelayFixture::new(&fake, &invalid_seed);
+        let output = expect_seed_startup_failure(&fixture).await;
+        assert!(!output.status.success());
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(diagnostics.to_ascii_lowercase().contains("auth"));
+        assert!(!diagnostics.contains(&leaked_access));
+        assert!(!diagnostics.contains(&leaked_account));
+        assert!(!diagnostics.contains("x-leaked-access"));
+        assert!(!diagnostics.contains("x-leaked-account"));
+    }
+}
+
+#[tokio::test]
+async fn auth_seed_requires_explicit_chatgpt_mode_without_leaking_seed_contents() {
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+
+    for replacement_mode in [None, Some("definitely-not-chatgpt-mode")] {
+        let fixture = RelayFixture::new(
+            &fake,
+            &seed(
+                access_token("mode-secret-access", now + Duration::hours(1)),
+                "mode-secret-refresh",
+                "mode-secret-account",
+                now,
+            ),
+        );
+        let mut auth: Value = serde_json::from_slice(
+            &std::fs::read(&fixture.auth_path).expect("read auth seed for mode mutation"),
+        )
+        .expect("parse auth seed for mode mutation");
+        let object = auth.as_object_mut().expect("auth seed object");
+        match replacement_mode {
+            Some(mode) => {
+                object.insert("auth_mode".to_owned(), Value::String(mode.to_owned()));
+            }
+            None => {
+                object.remove("auth_mode");
+            }
+        }
+        std::fs::write(
+            &fixture.auth_path,
+            serde_json::to_vec_pretty(&auth).expect("serialize mutated auth mode"),
+        )
+        .expect("write mutated auth mode");
+
+        let output = expect_seed_startup_failure(&fixture).await;
+        assert!(!output.status.success());
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(diagnostics.to_ascii_lowercase().contains("auth"));
+        assert!(!diagnostics.contains("definitely-not-chatgpt-mode"));
+        assert!(!diagnostics.contains("mode-secret-access"));
+        assert!(!diagnostics.contains("mode-secret-refresh"));
+        assert!(!diagnostics.contains("mode-secret-account"));
     }
 }
 
@@ -790,6 +958,374 @@ async fn oauth_failure_is_not_retried_or_reported_as_downstream_auth_failure() {
     assert_eq!(fake.upstream_requests().len(), 1);
     assert_eq!(fake.oauth_requests().len(), 1);
     assert_oauth_grant(&fake.oauth_requests()[0], "seed-refresh");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_generation_callers_share_one_oauth_failure() {
+    const REQUEST_COUNT: usize = 12;
+
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+    fake.fail_oauth_with_delay(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StdDuration::from_millis(100),
+    );
+    let fixture = RelayFixture::new(
+        &fake,
+        &seed(
+            access_token("shared-failure", now + Duration::minutes(4)),
+            "single-use-refresh",
+            "account-a",
+            now,
+        ),
+    );
+    let relay = fixture.start().await;
+    let responses_url = relay.responses_url();
+    let barrier = Arc::new(Barrier::new(REQUEST_COUNT));
+    let requests = (0..REQUEST_COUNT)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let responses_url = responses_url.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                post_streaming_response(&responses_url).await
+            })
+        })
+        .collect::<Vec<_>>();
+
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        for request in requests {
+            let response = request.await.expect("concurrent failed refresh task");
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_GATEWAY,
+                "{}",
+                response.body
+            );
+        }
+    })
+    .await
+    .expect("concurrent failed refresh requests timed out");
+
+    let oauth = fake.oauth_requests();
+    assert_eq!(
+        oauth.len(),
+        1,
+        "same-generation callers must share the failed exchange instead of reusing the refresh token"
+    );
+    assert_oauth_grant(&oauth[0], "single-use-refresh");
+    assert!(fake.upstream_requests().is_empty());
+}
+
+#[tokio::test]
+async fn refreshed_id_token_without_account_claim_preserves_account_and_rotated_tokens() {
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+    let rotated_access = access_token("claimless-rotation", now + Duration::hours(1));
+    let final_access = access_token("after-claimless-restart", now + Duration::hours(2));
+    fake.reply_with(json!({
+        "id_token": unsigned_jwt(json!({
+            "sub": "user-without-workspace-claim",
+            "email": "relay-test@example.invalid"
+        })),
+        "access_token": rotated_access,
+        "refresh_token": "rotated-after-claimless-id-token"
+    }));
+    let fixture = RelayFixture::new(
+        &fake,
+        &seed(
+            access_token("claimless-seed", now + Duration::minutes(4)),
+            "seed-refresh",
+            "account-a",
+            now,
+        ),
+    );
+
+    let first_process = fixture.start().await;
+    assert_success(&post_streaming_response(&first_process.responses_url()).await);
+    assert_eq!(
+        fake.upstream_requests()[0].account_id.as_deref(),
+        Some("account-a")
+    );
+    first_process.stop();
+
+    fake.clear_observations();
+    fake.reject_next_upstream_requests(1);
+    fake.reply_with(json!({ "access_token": final_access }));
+    let restarted = fixture.start().await;
+    assert_success(&post_streaming_response(&restarted.responses_url()).await);
+
+    assert_oauth_grant(
+        &fake.oauth_requests()[0],
+        "rotated-after-claimless-id-token",
+    );
+    let upstream = fake.upstream_requests();
+    assert_eq!(
+        upstream
+            .iter()
+            .map(|request| request.authorization.clone())
+            .collect::<Vec<_>>(),
+        vec![Some(bearer(&rotated_access)), Some(bearer(&final_access))]
+    );
+    assert!(
+        upstream
+            .iter()
+            .all(|request| request.account_id.as_deref() == Some("account-a"))
+    );
+}
+
+#[tokio::test]
+async fn oauth_output_with_header_control_characters_is_not_published_or_persisted() {
+    let now = OffsetDateTime::now_utc();
+    let invalid_responses = [
+        json!({
+            "id_token": id_token("account-a"),
+            "access_token": "oauth-access-injection\r\nx-invalid-access",
+            "refresh_token": "rotated-with-invalid-access"
+        }),
+        json!({
+            "id_token": unsigned_jwt(json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "oauth-account-injection\r\nx-invalid-account"
+                }
+            })),
+            "access_token": access_token("valid-access-invalid-account", now + Duration::hours(1)),
+            "refresh_token": "rotated-with-invalid-account"
+        }),
+    ];
+
+    for (case_index, invalid_response) in invalid_responses.into_iter().enumerate() {
+        let fake = FakeCodexServer::start().await;
+        fake.reply_with(invalid_response);
+        let fixture = RelayFixture::new(
+            &fake,
+            &seed(
+                access_token(
+                    &format!("invalid-oauth-output-seed-{case_index}"),
+                    now + Duration::minutes(4),
+                ),
+                "seed-refresh",
+                "account-a",
+                now,
+            ),
+        );
+
+        let first_process = fixture.start().await;
+        let rejected = post_streaming_response(&first_process.responses_url()).await;
+        assert_eq!(
+            rejected.status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            rejected.body
+        );
+        assert_eq!(fake.oauth_requests().len(), 1);
+        assert_oauth_grant(&fake.oauth_requests()[0], "seed-refresh");
+        assert!(
+            fake.upstream_requests().is_empty(),
+            "invalid refreshed header values must never reach the upstream"
+        );
+        first_process.stop();
+
+        // If the failed refresh neither published nor persisted its generation,
+        // restart still sees the expiring seed and exchanges its original token.
+        fake.clear_observations();
+        let recovered_access =
+            access_token(&format!("recovered-{case_index}"), now + Duration::hours(2));
+        fake.reply_with(full_oauth_reply(
+            &recovered_access,
+            "recovered-refresh",
+            "account-a",
+        ));
+        let restarted = fixture.start().await;
+        assert_success(&post_streaming_response(&restarted.responses_url()).await);
+        assert_eq!(fake.oauth_requests().len(), 1);
+        assert_oauth_grant(&fake.oauth_requests()[0], "seed-refresh");
+        let upstream = fake.upstream_requests();
+        assert_eq!(upstream.len(), 1);
+        assert_eq!(
+            upstream[0].authorization.as_deref(),
+            Some(bearer(&recovered_access).as_str())
+        );
+        assert_eq!(upstream[0].account_id.as_deref(), Some("account-a"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canceling_refresh_initiator_does_not_cancel_dispatched_rotation_or_duplicate_it() {
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+    let refreshed_access = access_token("cancellation-safe", now + Duration::hours(1));
+    fake.reply_with_delay(
+        full_oauth_reply(&refreshed_access, "cancellation-safe-refresh", "account-a"),
+        StdDuration::from_millis(500),
+    );
+    let fixture = RelayFixture::new(
+        &fake,
+        &seed(
+            access_token("cancel-initiator", now + Duration::minutes(4)),
+            "seed-refresh",
+            "account-a",
+            now,
+        ),
+    );
+    let relay = fixture.start().await;
+    let responses_url = relay.responses_url();
+    let initiating_url = responses_url.clone();
+    let initiating = tokio::spawn(async move { post_streaming_response(&initiating_url).await });
+
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        while fake.oauth_requests().is_empty() {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initiating OAuth exchange was not dispatched");
+    initiating.abort();
+    let initiating_result = initiating.await;
+    assert!(
+        initiating_result
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled),
+        "initiating request was not canceled"
+    );
+
+    let waiter = post_streaming_response(&responses_url).await;
+    assert_success(&waiter);
+    assert_eq!(
+        fake.oauth_requests().len(),
+        1,
+        "canceling the initiating request must not cancel or duplicate a dispatched token rotation"
+    );
+    assert!(fake.upstream_requests().iter().all(
+        |request| request.authorization.as_deref() == Some(bearer(&refreshed_access).as_str())
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigterm_waits_for_dispatched_rotation_to_persist_before_clean_exit() {
+    let fake = FakeCodexServer::start().await;
+    let now = OffsetDateTime::now_utc();
+    let rotated_access = access_token("sigterm-rotated", now + Duration::hours(1));
+    let release_oauth = fake.reply_after_release(full_oauth_reply(
+        &rotated_access,
+        "sigterm-rotated-refresh",
+        "account-a",
+    ));
+    let fixture = RelayFixture::new(
+        &fake,
+        &seed(
+            access_token("sigterm-expiring", now + Duration::minutes(4)),
+            "stale-seed-refresh",
+            "account-a",
+            now,
+        ),
+    );
+    let stale_auth_seed = std::fs::read(&fixture.auth_path).expect("read stale auth seed");
+    let mut relay = fixture.start().await;
+    let responses_url = relay.responses_url();
+    let waiting_request = tokio::spawn(async move {
+        let response = reqwest::Client::builder()
+            .timeout(StdDuration::from_secs(5))
+            .build()
+            .expect("build shutdown-test client")
+            .post(&responses_url)
+            .bearer_auth(CLIENT_KEY)
+            .json(&json!({
+                "model": MODEL,
+                "input": "Reply with OK.",
+                "stream": true
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        Ok::<PublicResponse, reqwest::Error>(PublicResponse { status, body })
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        while fake.oauth_requests().is_empty() {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("OAuth provider never observed the dispatched rotation");
+    assert_eq!(fake.oauth_requests().len(), 1);
+    assert_oauth_grant(&fake.oauth_requests()[0], "stale-seed-refresh");
+
+    let signal_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(relay.child.id().to_string())
+        .status()
+        .expect("send SIGTERM to codex-api");
+    assert!(signal_status.success(), "kill -TERM failed");
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    assert!(
+        relay
+            .child
+            .try_wait()
+            .expect("poll relay after SIGTERM")
+            .is_none(),
+        "relay exited while an accepted OAuth rotation was still gated"
+    );
+
+    release_oauth.add_permits(1);
+    let shutdown_response = tokio::time::timeout(StdDuration::from_secs(5), waiting_request)
+        .await
+        .expect("authenticated request did not finish during graceful shutdown")
+        .expect("authenticated request task failed");
+    if let Ok(response) = shutdown_response {
+        assert_eq!(
+            response.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            response.body
+        );
+        let body: Value = serde_json::from_str(&response.body)
+            .expect("shutdown response must use the standard JSON error envelope");
+        assert_eq!(
+            body.pointer("/error/code").and_then(Value::as_str),
+            Some("server_shutting_down")
+        );
+    }
+    let exit_status = tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            if let Some(status) = relay.child.try_wait().expect("poll graceful relay exit") {
+                break status;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("relay did not exit within the graceful shutdown bound");
+    assert!(exit_status.success(), "relay exited with {exit_status}");
+    assert_eq!(
+        std::fs::read(&fixture.auth_path).expect("read unchanged stale auth seed"),
+        stale_auth_seed,
+        "refresh must not rewrite the auth seed"
+    );
+    relay.stop();
+
+    // The stale seed remains unchanged. Restart must therefore obtain both
+    // rotated fields from SQLite and make no second OAuth exchange.
+    fake.reply_with(full_oauth_reply(
+        &access_token("unexpected-second-refresh", now + Duration::hours(2)),
+        "unexpected-second-refresh-token",
+        "account-a",
+    ));
+    let restarted = fixture.start().await;
+    assert_success(&post_streaming_response(&restarted.responses_url()).await);
+    assert_eq!(
+        fake.oauth_requests().len(),
+        1,
+        "restart reused the stale seed instead of the persisted rotation"
+    );
+    let upstream = fake.upstream_requests();
+    assert_eq!(upstream.len(), 1);
+    assert!(upstream.iter().all(|request| {
+        request.authorization.as_deref() == Some(bearer(&rotated_access).as_str())
+            && request.account_id.as_deref() == Some("account-a")
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

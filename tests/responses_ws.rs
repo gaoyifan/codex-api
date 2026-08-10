@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::ws::{Message as AxumMessage, WebSocket};
+use axum::extract::ws::{CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket};
 use axum::extract::{Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -44,6 +44,9 @@ type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Debug)]
 enum UpstreamCommand {
     Text(String),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Close { code: u16, reason: String },
     Abort,
 }
 
@@ -65,6 +68,15 @@ impl UpstreamConnection {
             .send(UpstreamCommand::Abort)
             .expect("fake upstream connection should still be open");
     }
+
+    fn close(&self, code: u16, reason: &str) {
+        self.commands
+            .send(UpstreamCommand::Close {
+                code,
+                reason: reason.to_owned(),
+            })
+            .expect("fake upstream connection should still be open");
+    }
 }
 
 #[derive(Debug)]
@@ -77,6 +89,14 @@ enum UpstreamEvent {
     Text {
         connection_id: usize,
         text: String,
+    },
+    Ping {
+        connection_id: usize,
+        payload: Vec<u8>,
+    },
+    Pong {
+        connection_id: usize,
+        payload: Vec<u8>,
     },
     Close {
         connection_id: usize,
@@ -282,11 +302,24 @@ async fn run_fake_upstream(mut socket: WebSocket, state: FakeUpstreamState, conn
                         return;
                     }
                     Some(Ok(AxumMessage::Ping(payload))) => {
+                        if state.events.send(UpstreamEvent::Ping {
+                            connection_id,
+                            payload: payload.to_vec(),
+                        }).is_err() {
+                            return;
+                        }
                         if socket.send(AxumMessage::Pong(payload)).await.is_err() {
                             return;
                         }
                     }
-                    Some(Ok(AxumMessage::Pong(_))) => {}
+                    Some(Ok(AxumMessage::Pong(payload))) => {
+                        if state.events.send(UpstreamEvent::Pong {
+                            connection_id,
+                            payload: payload.to_vec(),
+                        }).is_err() {
+                            return;
+                        }
+                    }
                     Some(Ok(AxumMessage::Binary(_))) | Some(Err(_)) | None => return,
                 }
             }
@@ -294,6 +327,28 @@ async fn run_fake_upstream(mut socket: WebSocket, state: FakeUpstreamState, conn
                 match command {
                     Some(UpstreamCommand::Text(text)) => {
                         if socket.send(AxumMessage::Text(text.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(UpstreamCommand::Ping(payload)) => {
+                        if socket.send(AxumMessage::Ping(payload.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(UpstreamCommand::Pong(payload)) => {
+                        if socket.send(AxumMessage::Pong(payload.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(UpstreamCommand::Close { code, reason }) => {
+                        if socket
+                            .send(AxumMessage::Close(Some(AxumCloseFrame {
+                                code,
+                                reason: reason.into(),
+                            })))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -436,6 +491,7 @@ fn write_relay_files(upstream: &FakeUpstream, options: &RelayOptions) -> RelayFi
         &auth_path,
         serde_json::to_vec_pretty(&json!({
             "OPENAI_API_KEY": null,
+            "auth_mode": "chatgpt",
             "tokens": {
                 "id_token": id_token,
                 "access_token": options.access_token,
@@ -718,7 +774,10 @@ async fn request_log_rows(
                 .map(|row| {
                     let status = row.get::<String, _>("status");
                     let transport = row.get::<String, _>("transport");
-                    let http_status_is_null = row.try_get::<i64, _>("http_status").is_err();
+                    let http_status_is_null = row
+                        .try_get::<Option<i64>, _>("http_status")
+                        .expect("decode nullable HTTP status")
+                        .is_none();
                     (status, transport, http_status_is_null)
                 })
                 .collect();
@@ -862,6 +921,10 @@ async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normali
             .and_then(|value| value.to_str().ok()),
         Some("codex_cli_rs")
     );
+    assert_eq!(
+        headers.get("version").and_then(|value| value.to_str().ok()),
+        Some("0.147.0")
+    );
     assert!(
         headers
             .get("user-agent")
@@ -890,6 +953,33 @@ async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normali
     assert_eq!(upstream.connection_count(), 1);
 
     let terminal = response_completed("resp-normalized", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_null_is_accepted_and_forced_false_upstream() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    let mut create = response_create("nullable store", None);
+    create["store"] = Value::Null;
+    send_json(&mut socket, &create).await;
+    let forwarded = upstream.expect_text(connection.id).await;
+    assert_eq!(forwarded["store"], false);
+
+    let terminal = response_completed("resp-null-store", 1, 0, 1);
     connection.send_json(terminal.clone());
     assert_eq!(receive_json(&mut socket).await, terminal);
     socket.close(None).await.expect("close downstream socket");
@@ -943,6 +1033,336 @@ async fn upstream_text_events_are_forwarded_unchanged_and_in_order() {
 
     socket.close(None).await.expect("close downstream socket");
     let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ping_and_pong_frames_are_forwarded_both_ways_and_leave_the_connection_usable() {
+    const DOWNSTREAM_PING: &[u8] = b"downstream-ping";
+    const UPSTREAM_PING: &[u8] = b"upstream-ping";
+    const DOWNSTREAM_PONG: &[u8] = b"downstream-pong";
+    const UPSTREAM_PONG: &[u8] = b"upstream-pong";
+
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    timeout(TEST_TIMEOUT, async {
+        socket
+            .send(Message::Ping(DOWNSTREAM_PING.to_vec().into()))
+            .await
+            .expect("send downstream ping");
+        match upstream
+            .events
+            .recv()
+            .await
+            .expect("upstream event channel")
+        {
+            UpstreamEvent::Ping {
+                connection_id,
+                payload,
+            } => {
+                assert_eq!(connection_id, connection.id);
+                assert_eq!(payload, DOWNSTREAM_PING);
+            }
+            event => panic!("expected forwarded downstream ping, got {event:?}"),
+        }
+
+        connection
+            .commands
+            .send(UpstreamCommand::Pong(UPSTREAM_PONG.to_vec()))
+            .expect("fake upstream connection should still be open");
+        loop {
+            match socket
+                .next()
+                .await
+                .expect("downstream socket ended during pong forwarding")
+                .expect("read downstream pong")
+            {
+                Message::Pong(payload) if payload.as_ref() == UPSTREAM_PONG => break,
+                Message::Pong(_) => {}
+                Message::Ping(payload) => socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("reply to unrelated downstream ping"),
+                message => panic!("expected forwarded upstream pong, got {message:?}"),
+            }
+        }
+
+        connection
+            .commands
+            .send(UpstreamCommand::Ping(UPSTREAM_PING.to_vec()))
+            .expect("fake upstream connection should still be open");
+        loop {
+            match socket
+                .next()
+                .await
+                .expect("downstream socket ended during ping forwarding")
+                .expect("read downstream ping")
+            {
+                Message::Ping(payload) if payload.as_ref() == UPSTREAM_PING => break,
+                Message::Ping(payload) => socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("reply to unrelated downstream ping"),
+                Message::Pong(_) => {}
+                message => panic!("expected forwarded upstream ping, got {message:?}"),
+            }
+        }
+        socket
+            .send(Message::Pong(DOWNSTREAM_PONG.to_vec().into()))
+            .await
+            .expect("send downstream pong");
+        loop {
+            match upstream
+                .events
+                .recv()
+                .await
+                .expect("upstream event channel")
+            {
+                UpstreamEvent::Pong {
+                    connection_id,
+                    payload,
+                } if payload == DOWNSTREAM_PONG => {
+                    assert_eq!(connection_id, connection.id);
+                    break;
+                }
+                UpstreamEvent::Pong {
+                    connection_id,
+                    payload,
+                } if payload == UPSTREAM_PING => {
+                    assert_eq!(connection_id, connection.id);
+                }
+                event => panic!("expected forwarded downstream pong, got {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out exercising bidirectional ping/pong forwarding");
+
+    send_json(
+        &mut socket,
+        &response_create("usable after control frames", None),
+    )
+    .await;
+    let forwarded = upstream.expect_text(connection.id).await;
+    assert_eq!(
+        forwarded["input"][0]["content"][0]["text"],
+        "usable after control frames"
+    );
+    let terminal = response_completed("resp-after-controls", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_present_cached_token_details_close_with_1011_before_terminal_forwarding() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(&mut socket, &response_create("malformed usage", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    let mut terminal = response_completed("resp-malformed-usage", 3, 1, 2);
+    terminal["response"]["usage"]["input_tokens_details"] =
+        json!({"cached_tokens": "not-an-integer"});
+    connection.send_json(terminal);
+
+    let close = receive_close(&mut socket).await;
+    assert_eq!(close.code, CloseCode::Error);
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_tokens_above_input_tokens_fail_before_accounting_and_finalize_upstream_error() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(
+        &mut socket,
+        &response_create("invalid cached token count", None),
+    )
+    .await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    connection.send_json(response_completed("resp-invalid-cached", 1, 2, 1));
+    let message = timeout(TEST_TIMEOUT, socket.next())
+        .await
+        .expect("timed out waiting for downstream protocol close")
+        .expect("downstream ended without a protocol close")
+        .expect("read downstream protocol close");
+    let close = match message {
+        Message::Close(Some(close)) => close,
+        Message::Text(text) => panic!("malformed terminal was forwarded downstream: {text}"),
+        message => panic!("expected downstream protocol close, got {message:?}"),
+    };
+    assert_eq!(close.code, CloseCode::Error);
+
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
+    let options = SqliteConnectOptions::new()
+        .filename(&relay.database_path)
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open request log database");
+    let row = sqlx::query(
+        "SELECT input_tokens, cached_input_tokens, output_tokens, cost_usd \
+         FROM request_logs",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query failed operation accounting");
+    for column in ["input_tokens", "cached_input_tokens", "output_tokens"] {
+        assert!(
+            row.try_get::<Option<i64>, _>(column)
+                .expect("decode nullable token count")
+                .is_none(),
+            "{column} must remain null"
+        );
+    }
+    assert!(
+        row.try_get::<Option<String>, _>("cost_usd")
+            .expect("decode nullable request cost")
+            .is_none()
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_above_sqlite_range_closes_without_forwarding_and_finalizes_upstream_error() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(
+        &mut socket,
+        &response_create("usage outside SQLite range", None),
+    )
+    .await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    connection.send_json(response_completed(
+        "resp-usage-out-of-range",
+        i64::MAX as u64 + 1,
+        0,
+        1,
+    ));
+    let message = timeout(TEST_TIMEOUT, socket.next())
+        .await
+        .expect("timed out waiting for downstream accounting close")
+        .expect("downstream ended without an accounting close")
+        .expect("read downstream accounting close");
+    let close = match message {
+        Message::Close(Some(close)) => close,
+        Message::Text(text) => panic!("unaccountable terminal was forwarded downstream: {text}"),
+        message => panic!("expected downstream accounting close, got {message:?}"),
+    };
+    assert_eq!(close.code, CloseCode::Error);
+
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
+    let options = SqliteConnectOptions::new()
+        .filename(&relay.database_path)
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open request log database");
+    let row = sqlx::query(
+        "SELECT input_tokens, cached_input_tokens, output_tokens, cost_usd \
+         FROM request_logs",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query failed operation accounting");
+    for column in ["input_tokens", "cached_input_tokens", "output_tokens"] {
+        assert!(
+            row.try_get::<Option<i64>, _>(column)
+                .expect("decode nullable token count")
+                .is_none(),
+            "{column} must remain null"
+        );
+    }
+    assert!(
+        row.try_get::<Option<String>, _>("cost_usd")
+            .expect("decode nullable request cost")
+            .is_none()
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_event_type_must_match_response_status() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(&mut socket, &response_create("mismatched terminal", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    let mut terminal = response_completed("resp-status-mismatch", 1, 0, 1);
+    terminal["response"]["status"] = json!("incomplete");
+    connection.send_json(terminal);
+
+    let close = receive_close(&mut socket).await;
+    assert_eq!(close.code, CloseCode::Error);
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
     relay.stop().await;
 }
 
@@ -1026,6 +1446,71 @@ async fn second_in_flight_create_is_rejected_locally_then_a_later_turn_is_allowe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_is_checked_before_rejecting_a_second_in_flight_create() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            weekly_limit_usd: Some("0.000001"),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+
+    let mut first_socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade first downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let first_connection = upstream.expect_connection().await;
+    send_json(
+        &mut first_socket,
+        &response_create("keep this response in flight", None),
+    )
+    .await;
+    let _ = upstream.expect_text(first_connection.id).await;
+
+    let mut spending_socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade spending downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let spending_connection = upstream.expect_connection().await;
+    send_json(
+        &mut spending_socket,
+        &response_create("commit spend on another connection", None),
+    )
+    .await;
+    let _ = upstream.expect_text(spending_connection.id).await;
+    let spending_terminal = response_completed("resp-spend", 1, 0, 1);
+    spending_connection.send_json(spending_terminal.clone());
+    assert_eq!(receive_json(&mut spending_socket).await, spending_terminal);
+
+    send_json(
+        &mut first_socket,
+        &response_create("quota takes precedence", None),
+    )
+    .await;
+    let error = receive_json(&mut first_socket).await;
+    assert_responses_error(&error, "weekly_quota_exceeded", None);
+
+    let rows = request_log_rows(&relay.database_path, 3).await;
+    assert_eq!(
+        rows,
+        vec![
+            ("started".to_string(), "websocket".to_string(), true),
+            ("completed".to_string(), "websocket".to_string(), true),
+            ("rejected".to_string(), "websocket".to_string(), true),
+        ]
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validation_errors_are_not_forwarded_and_leave_the_connection_usable() {
     let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
     let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
@@ -1055,6 +1540,10 @@ async fn validation_errors_are_not_forwarded_and_leave_the_connection_usable() {
         (
             json!({"type": "response.create", "model": MODEL, "input": [], "store": true}),
             "store",
+        ),
+        (
+            json!({"type": "response.create", "model": MODEL, "input": [], "max_output_tokens": 64}),
+            "max_output_tokens",
         ),
     ];
     for (request, param) in invalid_requests {
@@ -1147,6 +1636,11 @@ async fn malformed_text_and_binary_application_frames_close_with_1003() {
     let close = receive_close(&mut malformed).await;
     assert_eq!(close.code, CloseCode::Unsupported);
     let _ = upstream.expect_close(malformed_upstream.id).await;
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("rejected".to_string(), "websocket".to_string(), true)]
+    );
 
     let mut binary = connect_downstream(
         &relay.websocket_url(),
@@ -1163,6 +1657,11 @@ async fn malformed_text_and_binary_application_frames_close_with_1003() {
     let close = receive_close(&mut binary).await;
     assert_eq!(close.code, CloseCode::Unsupported);
     let _ = upstream.expect_close(binary_upstream.id).await;
+    let rows = request_log_rows(&relay.database_path, 1).await;
+    assert_eq!(
+        rows,
+        vec![("rejected".to_string(), "websocket".to_string(), true)]
+    );
     assert_eq!(upstream.connection_count(), 2);
     relay.stop().await;
 }
@@ -1201,6 +1700,71 @@ async fn closing_downstream_cancels_the_in_flight_upstream_operation() {
         rows,
         vec![("canceled".to_string(), "websocket".to_string(), true)]
     );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_close_handshakes_are_completed_in_both_directions() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+
+    let mut downstream_initiated = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream-initiated close socket");
+    let _ = upstream.expect_handshake().await;
+    let first_connection = upstream.expect_connection().await;
+    downstream_initiated
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "downstream complete".into(),
+        })))
+        .await
+        .expect("send downstream close");
+    let downstream_reply = receive_close(&mut downstream_initiated).await;
+    assert_eq!(downstream_reply.code, CloseCode::Normal);
+    assert_eq!(downstream_reply.reason, "downstream complete");
+    assert_eq!(upstream.expect_close(first_connection.id).await, Some(1000));
+
+    let mut upstream_initiated = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade upstream-initiated close socket");
+    let _ = upstream.expect_handshake().await;
+    let second_connection = upstream.expect_connection().await;
+    second_connection.close(1000, "upstream complete");
+    let upstream_close = receive_close(&mut upstream_initiated).await;
+    assert_eq!(upstream_close.code, CloseCode::Normal);
+    assert_eq!(upstream_close.reason, "upstream complete");
+    assert_eq!(
+        upstream.expect_close(second_connection.id).await,
+        Some(1000)
+    );
+
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_abnormal_upstream_close_is_mapped_to_1011() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    connection.close(1002, "upstream protocol violation");
+    let close = receive_close(&mut socket).await;
+    assert_eq!(close.code, CloseCode::Error);
+    assert_eq!(upstream.expect_close(connection.id).await, Some(1002));
     relay.stop().await;
 }
 

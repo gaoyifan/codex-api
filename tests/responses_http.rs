@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +19,8 @@ use bytes::Bytes;
 use eventsource_stream::{Event, Eventsource};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, Row};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
@@ -57,6 +60,8 @@ impl ScriptChunk {
 struct ScriptedResponse {
     status: StatusCode,
     content_type: &'static str,
+    header_delay: Duration,
+    header_dropped: Option<Arc<Notify>>,
     chunks: Vec<ScriptChunk>,
     hold_open: bool,
     dropped: Option<Arc<Notify>>,
@@ -67,6 +72,8 @@ impl ScriptedResponse {
         Self {
             status: StatusCode::OK,
             content_type: "text/event-stream",
+            header_delay: Duration::ZERO,
+            header_dropped: None,
             chunks,
             hold_open: false,
             dropped: None,
@@ -77,6 +84,8 @@ impl ScriptedResponse {
         Self {
             status,
             content_type: "application/json",
+            header_delay: Duration::ZERO,
+            header_dropped: None,
             chunks: vec![ScriptChunk::immediate(value.to_string())],
             hold_open: false,
             dropped: None,
@@ -186,6 +195,10 @@ async fn fake_responses(
         .expect("fake upstream response script exhausted");
     let status = response.status;
     let content_type = response.content_type;
+    let _header_drop = NotifyOnDrop(response.header_dropped);
+    if !response.header_delay.is_zero() {
+        sleep(response.header_delay).await;
+    }
     let body = stream! {
         let _notify_on_drop = NotifyOnDrop(response.dropped);
         for chunk in response.chunks {
@@ -208,6 +221,7 @@ async fn fake_responses(
 
 struct Relay {
     addr: SocketAddr,
+    state_path: PathBuf,
     child: Child,
     _temp_dir: TempDir,
 }
@@ -222,6 +236,7 @@ impl Relay {
         std::fs::write(
             &auth_path,
             serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
                 "OPENAI_API_KEY": null,
                 "tokens": {
                     "id_token": "test-id-token",
@@ -290,6 +305,7 @@ output_usd_per_million = "6.00"
 
         Self {
             addr,
+            state_path,
             child,
             _temp_dir: temp_dir,
         }
@@ -328,6 +344,47 @@ async fn parse_sse_bytes(bytes: Bytes) -> Vec<Event> {
         events.push(event.expect("valid downstream SSE framing"));
     }
     events
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ObservedRequestLog {
+    status: String,
+    http_status: Option<i64>,
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    exact_cost: Option<String>,
+}
+
+async fn request_logs(path: &Path) -> Vec<ObservedRequestLog> {
+    let mut database = timeout(
+        Duration::from_secs(2),
+        sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new().filename(path).read_only(true),
+        ),
+    )
+    .await
+    .expect("open request log database in time")
+    .expect("open request log database");
+    sqlx::query(
+        "SELECT status, http_status, input_tokens, cached_input_tokens, output_tokens, \
+                CASE WHEN cost_usd IS NULL THEN NULL ELSE printf('%.9f', cost_usd) END \
+                    AS exact_cost \
+         FROM request_logs ORDER BY id",
+    )
+    .fetch_all(&mut database)
+    .await
+    .expect("read public request logs")
+    .into_iter()
+    .map(|row| ObservedRequestLog {
+        status: row.get("status"),
+        http_status: row.get("http_status"),
+        input_tokens: row.get("input_tokens"),
+        cached_input_tokens: row.get("cached_input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        exact_cost: row.get("exact_cost"),
+    })
+    .collect()
 }
 
 fn completed_sse() -> String {
@@ -393,6 +450,10 @@ async fn responses_rejects_storage_and_background_modes_before_upstream() {
             "background",
             json!({"model": MODEL, "input": "hello", "stream": true, "background": true}),
         ),
+        (
+            "max_output_tokens",
+            json!({"model": MODEL, "input": "hello", "stream": true, "max_output_tokens": 64}),
+        ),
     ] {
         let response = authorized_request(&client, &relay)
             .json(&body)
@@ -433,7 +494,6 @@ async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
             "parameters": {"type": "object", "properties": {}}
         }],
         "parallel_tool_calls": true,
-        "max_output_tokens": 64,
         "previous_response_id": "resp_previous",
         "prompt_cache_key": "cache-test",
         "include": ["reasoning.encrypted_content"]
@@ -475,6 +535,13 @@ async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
             .get("originator")
             .and_then(|value| value.to_str().ok()),
         Some("codex_cli_rs")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("version")
+            .and_then(|value| value.to_str().ok()),
+        Some("0.147.0")
     );
     assert!(
         captured
@@ -668,6 +735,181 @@ async fn responses_forwards_each_usage_bearing_terminal_event_type() {
 }
 
 #[tokio::test]
+async fn responses_treats_null_usage_detail_objects_as_zero() {
+    let terminal = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_null_details",
+            "status": "completed",
+            "model": MODEL,
+            "output": [],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": null,
+                "output_tokens": 2,
+                "output_tokens_details": null,
+                "total_tokens": 12
+            }
+        }
+    });
+    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
+        format!("event: response.completed\ndata: {terminal}\n\n"),
+    )])])
+    .await;
+    let relay = Relay::start(&upstream.base_url()).await;
+
+    let response = authorized_request(&client(), &relay)
+        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+        .send()
+        .await
+        .expect("send Responses request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, "response.completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(&events[0].data).unwrap(),
+        terminal
+    );
+
+    assert_eq!(
+        request_logs(&relay.state_path).await,
+        [ObservedRequestLog {
+            status: "completed".to_owned(),
+            http_status: Some(200),
+            input_tokens: Some(10),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(2),
+            exact_cost: Some("0.000022000".to_owned()),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn responses_forwards_failed_terminals_without_usage_and_does_not_charge_them() {
+    let failed_with_null_usage = json!({
+        "type": "response.failed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_failed_null_usage",
+            "status": "failed",
+            "error": {"code": "rate_limit_exceeded", "message": "try later"},
+            "usage": null
+        }
+    });
+    let failed_without_usage = json!({
+        "type": "response.failed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_failed_missing_usage",
+            "status": "failed",
+            "error": {"code": "context_length_exceeded", "message": "too long"}
+        }
+    });
+    let scripts = [&failed_with_null_usage, &failed_without_usage]
+        .into_iter()
+        .map(|terminal| {
+            ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
+                "event: response.failed\ndata: {terminal}\n\n"
+            ))])
+        })
+        .collect();
+    let upstream = FakeUpstream::start(scripts).await;
+    let relay = Relay::start(&upstream.base_url()).await;
+    let client = client();
+
+    for expected in [&failed_with_null_usage, &failed_without_usage] {
+        let response = authorized_request(&client, &relay)
+            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+            .send()
+            .await
+            .expect("send Responses request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "response.failed");
+        assert_eq!(
+            serde_json::from_str::<Value>(&events[0].data).unwrap(),
+            *expected
+        );
+    }
+
+    assert_eq!(
+        request_logs(&relay.state_path).await,
+        [
+            ObservedRequestLog {
+                status: "upstream_error".to_owned(),
+                http_status: Some(200),
+                input_tokens: None,
+                cached_input_tokens: None,
+                output_tokens: None,
+                exact_cost: None,
+            },
+            ObservedRequestLog {
+                status: "upstream_error".to_owned(),
+                http_status: Some(200),
+                input_tokens: None,
+                cached_input_tokens: None,
+                output_tokens: None,
+                exact_cost: None,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn responses_does_not_require_total_tokens_to_equal_the_billed_token_sum() {
+    let terminal = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_independent_total",
+            "status": "completed",
+            "model": MODEL,
+            "output": [],
+            "usage": {
+                "input_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 3,
+                "output_tokens_details": {"reasoning_tokens": 1},
+                "total_tokens": 9
+            }
+        }
+    });
+    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
+        format!("event: response.completed\ndata: {terminal}\n\n"),
+    )])])
+    .await;
+    let relay = Relay::start(&upstream.base_url()).await;
+
+    let response = authorized_request(&client(), &relay)
+        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+        .send()
+        .await
+        .expect("send Responses request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, "response.completed");
+    let forwarded: Value = serde_json::from_str(&events[0].data).unwrap();
+    assert_eq!(forwarded, terminal);
+    assert_eq!(forwarded["response"]["usage"]["total_tokens"], 9);
+
+    assert_eq!(
+        request_logs(&relay.state_path).await,
+        [ObservedRequestLog {
+            status: "completed".to_owned(),
+            http_status: Some(200),
+            input_tokens: Some(2),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(3),
+            exact_cost: Some("0.000020000".to_owned()),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn responses_preserves_an_upstream_error_before_streaming_starts() {
     let upstream_error = json!({
         "error": {
@@ -836,4 +1078,220 @@ async fn responses_client_disconnect_cancels_the_upstream_stream() {
     timeout(Duration::from_secs(3), upstream_stream_dropped.notified())
         .await
         .expect("dropping the downstream response did not cancel upstream");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logs = request_logs(&relay.state_path).await;
+        if logs.first().is_some_and(|row| row.status == "canceled") {
+            assert_eq!(
+                logs,
+                [ObservedRequestLog {
+                    status: "canceled".to_owned(),
+                    http_status: Some(200),
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    exact_cost: None,
+                }]
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnect left the streaming ledger row unfinished: {logs:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn responses_prioritizes_an_already_closed_downstream_over_ready_terminal_or_eof() {
+    const ATTEMPTS: usize = 16;
+
+    let created = json!({"type": "response.created", "sequence_number": 0});
+    let scripts = (0..ATTEMPTS)
+        .map(|attempt| {
+            let second = if attempt % 2 == 0 {
+                ScriptChunk::after(Duration::from_millis(100), completed_sse())
+            } else {
+                ScriptChunk::after(Duration::from_millis(100), Bytes::new())
+            };
+            ScriptedResponse::sse(vec![
+                ScriptChunk::immediate(format!("event: response.created\ndata: {created}\n\n")),
+                second,
+            ])
+        })
+        .collect();
+    let upstream = FakeUpstream::start(scripts).await;
+    let relay = Relay::start(&upstream.base_url()).await;
+
+    for attempt in 0..ATTEMPTS {
+        let client = client();
+        let response = authorized_request(&client, &relay)
+            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+            .send()
+            .await
+            .expect("send Responses request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut events = Box::pin(response.bytes_stream().eventsource());
+        let first = timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("first event did not arrive")
+            .expect("stream ended before first event")
+            .expect("first event framing");
+        assert_eq!(first.event, "response.created");
+
+        sleep(Duration::from_millis(90)).await;
+        drop(events);
+        drop(client);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let logs = request_logs(&relay.state_path).await;
+            if logs.get(attempt).is_some_and(|row| row.status != "started") {
+                assert_eq!(
+                    logs[attempt],
+                    ObservedRequestLog {
+                        status: "canceled".to_owned(),
+                        http_status: Some(200),
+                        input_tokens: None,
+                        cached_input_tokens: None,
+                        output_tokens: None,
+                        exact_cost: None,
+                    },
+                    "attempt {attempt} selected the ready upstream branch after downstream closure"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attempt {attempt} left its race ledger row unfinished: {logs:?}"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_disconnect_before_upstream_headers_is_logged_as_canceled() {
+    let mut delayed = ScriptedResponse::sse(vec![ScriptChunk::immediate(completed_sse())]);
+    delayed.header_delay = Duration::from_secs(5);
+    let mut upstream = FakeUpstream::start(vec![delayed]).await;
+    let relay = Relay::start(&upstream.base_url()).await;
+    let url = relay.responses_url();
+    let request = tokio::spawn(async move {
+        client()
+            .post(url)
+            .bearer_auth(DOWNSTREAM_KEY)
+            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+            .send()
+            .await
+    });
+
+    let _ = upstream.next_request().await;
+    request.abort();
+    let _ = request.await;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logs = request_logs(&relay.state_path).await;
+        if logs.first().is_some_and(|row| row.status == "canceled") {
+            assert_eq!(
+                logs,
+                [ObservedRequestLog {
+                    status: "canceled".to_owned(),
+                    http_status: None,
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    exact_cost: None,
+                }]
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnect left the pre-stream ledger row unfinished: {logs:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn responses_tracks_a_pre_header_disconnect_finalizer_through_sigterm() {
+    let upstream_request_dropped = Arc::new(Notify::new());
+    let mut delayed = ScriptedResponse::sse(vec![ScriptChunk::immediate(completed_sse())]);
+    delayed.header_delay = Duration::from_secs(5);
+    delayed.header_dropped = Some(Arc::clone(&upstream_request_dropped));
+    let mut upstream = FakeUpstream::start(vec![delayed]).await;
+    let mut relay = Relay::start(&upstream.base_url()).await;
+    let url = relay.responses_url();
+    let request = tokio::spawn(async move {
+        client()
+            .post(url)
+            .bearer_auth(DOWNSTREAM_KEY)
+            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+            .send()
+            .await
+    });
+    let _ = upstream.next_request().await;
+
+    let mut database = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&relay.state_path)
+            .busy_timeout(Duration::from_secs(5)),
+    )
+    .await
+    .expect("open lifecycle write lock connection");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut database)
+        .await
+        .expect("hold the cancellation ledger write");
+
+    request.abort();
+    let _ = request.await;
+    timeout(Duration::from_secs(2), upstream_request_dropped.notified())
+        .await
+        .expect("downstream disconnect did not cancel the pre-header upstream request");
+
+    let process_id = relay.child.id().expect("relay process ID");
+    let terminated = Command::new("kill")
+        .args(["-TERM", &process_id.to_string()])
+        .status()
+        .await
+        .expect("signal relay shutdown");
+    assert!(terminated.success(), "failed to signal relay shutdown");
+    sleep(Duration::from_millis(150)).await;
+    assert!(
+        relay
+            .child
+            .try_wait()
+            .expect("poll relay shutdown")
+            .is_none(),
+        "relay exited before its blocked cancellation finalizer committed"
+    );
+
+    sqlx::query("COMMIT")
+        .execute(&mut database)
+        .await
+        .expect("release the cancellation ledger write");
+    drop(database);
+    let exit = timeout(Duration::from_secs(2), relay.child.wait())
+        .await
+        .expect("relay did not finish after the cancellation commit was released")
+        .expect("wait for relay shutdown");
+    assert!(exit.success(), "relay shutdown failed with {exit}");
+    assert_eq!(
+        request_logs(&relay.state_path).await,
+        [ObservedRequestLog {
+            status: "canceled".to_owned(),
+            http_status: None,
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            exact_cost: None,
+        }]
+    );
 }

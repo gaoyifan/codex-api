@@ -1,0 +1,26 @@
+[server]
+listen = "127.0.0.1:8080"
+enable_websockets = true
+
+[state]
+path = "./codex-api.sqlite3"
+
+[upstream]
+base_url = "https://chatgpt.com/backend-api/codex"
+oauth_token_url = "https://auth.openai.com/oauth/token"
+auth_file = "/path/to/codex/auth.json"
+supports_websockets = true
+
+[[api_keys]]
+id = "client-a"
+secret = "sk-local-change-me"
+weekly_limit_usd = "10.00"
+
+[[api_keys]]
+id = "unlimited-client"
+secret = "sk-local-change-this-too"
+
+[model_prices."gpt-5.6-luna"]
+input_usd_per_million = "1.00"
+cached_input_usd_per_million = "0.10"
+output_usd_per_million = "6.00"

@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     convert::Infallible,
     net::{SocketAddr, TcpListener as StdTcpListener},
+    path::PathBuf,
     process::Stdio,
     sync::{
         Arc,
@@ -20,6 +21,7 @@ use axum::{
 };
 use reqwest::{Client, Response as ClientResponse};
 use serde_json::{Value, json};
+use sqlx::{Connection, Row, SqliteConnection};
 use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -115,7 +117,7 @@ impl Drop for ScriptedUpstream {
 
 async fn upstream_handler(State(state): State<Arc<UpstreamState>>, body: Bytes) -> Response<Body> {
     state.request_count.fetch_add(1, Ordering::SeqCst);
-    let request = serde_json::from_slice(&body).unwrap_or_else(|_| Value::Null);
+    let request = serde_json::from_slice(&body).unwrap_or(Value::Null);
     state.requests.lock().await.push(request);
 
     let reply = state.replies.lock().await.pop_front().unwrap_or_else(|| {
@@ -154,6 +156,7 @@ struct TestRelay {
     child: Child,
     client: Client,
     base_url: String,
+    database_path: PathBuf,
 }
 
 impl TestRelay {
@@ -245,6 +248,7 @@ output_usd_per_million = "6.00"
                 .build()
                 .unwrap(),
             base_url: format!("http://{listen}"),
+            database_path,
         }
     }
 
@@ -257,6 +261,12 @@ output_usd_per_million = "6.00"
 
     async fn post(&self, body: &Value) -> ClientResponse {
         self.request(body).send().await.unwrap()
+    }
+
+    async fn database(&self) -> SqliteConnection {
+        SqliteConnection::connect(&format!("sqlite://{}", self.database_path.display()))
+            .await
+            .unwrap()
     }
 }
 
@@ -404,6 +414,37 @@ async fn accepts_only_the_documented_non_streaming_defaults() {
 }
 
 #[tokio::test]
+async fn reasoning_effort_accepts_null_as_omitted_and_forwards_max() {
+    let upstream = ScriptedUpstream::start(vec![
+        UpstreamReply::events(vec![completed_event(
+            "resp_null_reasoning",
+            text_output("null"),
+        )]),
+        UpstreamReply::events(vec![completed_event(
+            "resp_max_reasoning",
+            text_output("max"),
+        )]),
+    ])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let mut omitted = minimal_request();
+    omitted["reasoning_effort"] = Value::Null;
+    let (status, body) = response_json(relay.post(&omitted).await).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let mut maximum = minimal_request();
+    maximum["reasoning_effort"] = json!("max");
+    let (status, body) = response_json(relay.post(&maximum).await).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let sent = upstream.requests().await;
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0].get("reasoning").is_none());
+    assert_eq!(sent[1]["reasoning"], json!({"effort": "max"}));
+}
+
+#[tokio::test]
 async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
     let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![completed_event(
         "resp_conversion",
@@ -470,7 +511,6 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
         "tool_choice": {"type": "function", "function": {"name": "weather"}},
         "parallel_tool_calls": true,
         "reasoning_effort": "low",
-        "max_completion_tokens": 321,
         "stream": false,
         "n": 1
     });
@@ -485,7 +525,6 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
     assert_eq!(sent["store"], false);
     assert_eq!(sent["parallel_tool_calls"], true);
     assert_eq!(sent["reasoning"], json!({"effort": "low"}));
-    assert_eq!(sent["max_output_tokens"], 321);
     assert_eq!(
         sent["tool_choice"],
         json!({"type": "function", "name": "weather"})
@@ -532,7 +571,7 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
             {"type": "function_call_output", "call_id": "call_time", "output": "12:00"}
         ])
     );
-    for chat_only_field in ["messages", "reasoning_effort", "max_completion_tokens", "n"] {
+    for chat_only_field in ["messages", "reasoning_effort", "n"] {
         assert!(
             sent.get(chat_only_field).is_none(),
             "Chat-only field {chat_only_field} leaked upstream: {sent}"
@@ -579,6 +618,53 @@ async fn maps_each_simple_tool_choice_to_the_responses_wire_shape() {
         assert_eq!(request["tool_choice"], choice);
         assert_eq!(request["tools"][0]["strict"], false);
     }
+}
+
+#[tokio::test]
+async fn function_tools_map_omitted_or_null_parameters_and_null_strictness() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![completed_event(
+        "resp_nullable_tools",
+        text_output("done"),
+    )])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Use a tool"}],
+        "tools": [
+            {"type": "function", "function": {"name": "without_schema"}},
+            {
+                "type": "function",
+                "function": {
+                    "name": "nullable_schema",
+                    "parameters": null,
+                    "strict": null
+                }
+            }
+        ]
+    });
+
+    let (status, body) = response_json(relay.post(&request).await).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let sent = upstream.requests().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0]["tools"],
+        json!([
+            {
+                "type": "function",
+                "name": "without_schema",
+                "parameters": null,
+                "strict": false
+            },
+            {
+                "type": "function",
+                "name": "nullable_schema",
+                "parameters": null,
+                "strict": false
+            }
+        ])
+    );
 }
 
 #[tokio::test]
@@ -644,6 +730,61 @@ async fn builds_the_chat_completion_only_from_the_terminal_full_response() {
     let serialized = body.to_string();
     assert!(!serialized.contains("WRONG DELTA"));
     assert!(!serialized.contains("private chain"));
+}
+
+#[tokio::test]
+async fn uses_completed_output_items_when_the_private_terminal_omits_output() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![
+        json!({
+            "type": "response.output_item.done",
+            "sequence_number": 3,
+            "item": {
+                "id": "msg_private",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "private endpoint output",
+                    "annotations": [],
+                    "logprobs": []
+                }]
+            }
+        }),
+        completed_event("resp_private_terminal", json!([])),
+    ])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let (status, body) = response_json(relay.post(&minimal_request()).await).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "private endpoint output"
+    );
+}
+
+#[tokio::test]
+async fn completed_items_do_not_mask_a_non_array_terminal_output() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![
+        json!({
+            "type": "response.output_item.done",
+            "sequence_number": 3,
+            "item": {
+                "id": "msg_fallback",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "must not be used"}]
+            }
+        }),
+        completed_event("resp_malformed_output", json!({"not": "an array"})),
+    ])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    assert_gateway_error(relay.post(&minimal_request()).await).await;
+    assert_eq!(upstream.request_count(), 1);
 }
 
 #[tokio::test]
@@ -762,6 +903,68 @@ async fn does_not_send_partial_json_before_the_terminal_response() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["choices"][0]["message"]["content"], "terminal text");
     assert!(!body.to_string().contains("partial text"));
+}
+
+#[tokio::test]
+async fn downstream_disconnect_during_chat_aggregation_marks_the_request_canceled() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::Sse(vec![
+        SseChunk {
+            delay: Duration::ZERO,
+            data: sse_event(&json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "delta": "started"
+            })),
+        },
+        SseChunk {
+            delay: Duration::from_secs(5),
+            data: sse_event(&completed_event(
+                "resp_after_disconnect",
+                text_output("too late"),
+            )),
+        },
+    ])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let client = relay.client.clone();
+    let url = format!("{}/v1/chat/completions", relay.base_url);
+    let request = minimal_request();
+    let downstream = tokio::spawn(async move {
+        client
+            .post(url)
+            .bearer_auth(API_KEY)
+            .json(&request)
+            .send()
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        while upstream.request_count() == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Chat request never reached upstream");
+    downstream.abort();
+    let _ = downstream.await;
+
+    let mut database = relay.database().await;
+    let status = timeout(Duration::from_secs(2), async {
+        loop {
+            let status = sqlx::query("SELECT status FROM request_logs ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut database)
+                .await
+                .unwrap()
+                .map(|row| row.get::<String, _>("status"));
+            if status.as_deref() == Some("canceled") {
+                break status.unwrap();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("request log did not become canceled");
+    assert_eq!(status, "canceled");
 }
 
 #[tokio::test]
@@ -891,6 +1094,69 @@ async fn rejects_hosted_custom_program_and_shell_output_items() {
 }
 
 #[tokio::test]
+async fn rejected_chat_requests_retain_valid_reasoning_effort_in_the_ledger() {
+    let upstream = ScriptedUpstream::start(Vec::new()).await;
+    let relay = TestRelay::start(&upstream).await;
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "reasoning_effort": "high",
+        "temperature": 0.2
+    });
+
+    let (status, body) = response_json(relay.post(&request).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(upstream.request_count(), 0);
+
+    let mut database = relay.database().await;
+    let row =
+        sqlx::query("SELECT reasoning_effort, status FROM request_logs ORDER BY id DESC LIMIT 1")
+            .fetch_one(&mut database)
+            .await
+            .unwrap();
+    assert_eq!(row.get::<String, _>("reasoning_effort"), "high");
+    assert_eq!(row.get::<String, _>("status"), "rejected");
+}
+
+#[tokio::test]
+async fn rejects_empty_text_part_arrays_before_accessing_upstream() {
+    let upstream = ScriptedUpstream::start(Vec::new()).await;
+    let relay = TestRelay::start(&upstream).await;
+    let cases = [
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": []}]
+        }),
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "assistant", "content": []}]
+        }),
+        json!({
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": {"name": "empty", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_empty", "content": []}
+            ]
+        }),
+    ];
+
+    for request in cases {
+        let (status, body) = response_json(relay.post(&request).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+    assert_eq!(upstream.request_count(), 0);
+}
+
+#[tokio::test]
 async fn rejects_every_unsupported_chat_category_before_accessing_upstream() {
     let upstream = ScriptedUpstream::start(Vec::new()).await;
     let relay = TestRelay::start(&upstream).await;
@@ -934,6 +1200,14 @@ async fn rejects_every_unsupported_chat_category_before_accessing_upstream() {
             json!({"tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "lookup"}]}}),
         ),
         ("deprecated max tokens", json!({"max_tokens": 50})),
+        (
+            "unsupported completion token limit",
+            json!({"max_completion_tokens": 50}),
+        ),
+        (
+            "unsupported Responses output token limit",
+            json!({"max_output_tokens": 50}),
+        ),
         ("stop sequences", json!({"stop": ["END"]})),
         ("log probabilities", json!({"logprobs": true})),
         ("top log probabilities", json!({"top_logprobs": 3})),

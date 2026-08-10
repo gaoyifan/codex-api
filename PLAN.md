@@ -72,6 +72,11 @@ Configuration rules:
 
 Do not add configuration hot reload, dynamic API key management, a pricing fetcher, model aliases, wildcard prices, feature flags, or compatibility modes.
 
+On `SIGINT` or `SIGTERM`, stop accepting new connections, cancel active HTTP
+SSE, Chat aggregation, and WebSocket operations, commit their ledger rows as
+`canceled`, wait for upgraded WebSocket tasks and any already-dispatched OAuth
+rotation to finish, and then exit.
+
 ## 3. SQLite State and Public Request Log
 
 Use SQLx migrations and a file-backed SQLite database. Create a new database file with mode `0600`. Configure SQLite for concurrent asynchronous access with WAL and a bounded busy timeout.
@@ -86,7 +91,8 @@ Keep credential tables internal. Persist the current:
 - access-token expiry, when it can be decoded
 - last refresh time
 
-Credential precedence on startup:
+Only accept an authentication seed with `auth_mode: "chatgpt"`; other Codex
+authentication modes are out of scope. Credential precedence on startup:
 
 1. Import `auth.json` when no credential row exists.
 2. On later starts, compare `auth.json.last_refresh` to the SQLite refresh time.
@@ -147,6 +153,10 @@ http_status
 ```
 
 Treat this view as a public read-only interface and test it directly. Credential tables and the underlying request table remain implementation details. Do not expose request logs through HTTP and do not add quota response headers.
+
+Expose `cost_usd` as canonical decimal `TEXT` with exactly nine fractional
+digits. Derive it from the integer nano-USD value without a floating-point
+conversion.
 
 Never store prompts, outputs, ChatGPT account identifiers, raw errors, or authentication values in request logs. Retain request logs permanently in v1; do not implement cleanup or retention jobs.
 
@@ -213,6 +223,7 @@ Refresh behavior:
 - require a JSON body with an exact configured `model`
 - require explicit `stream: true`; missing, null, or false is a local `400 invalid_request_error`
 - reject `store: true` and background mode
+- reject `max_output_tokens`, which the subscription HTTP endpoint does not support
 - send `store: false` upstream
 - otherwise preserve supported Responses request fields rather than defining an unnecessarily narrow DTO
 - preserve the upstream non-2xx status and standard error body before streaming starts
@@ -240,7 +251,6 @@ Accepted v1 subset:
 - `tool_choice`: none, auto, required, or one named function
 - `parallel_tool_calls`
 - `reasoning_effort`
-- `max_completion_tokens`
 
 Reject, without silently dropping:
 
@@ -249,7 +259,9 @@ Reject, without silently dropping:
 - structured response formats and verbosity controls
 - legacy `functions`, `function_call`, and `role: function`
 - custom tools and allowed-tools extensions
-- deprecated `max_tokens`
+- output-token limits (`max_completion_tokens`, deprecated `max_tokens`, and
+  Responses `max_output_tokens`), which the ChatGPT Codex subscription endpoint
+  rejects
 - stop sequences, logprobs, logit bias, penalties, seed, prediction, web-search options, and all other unsupported request fields
 
 Request conversion:
@@ -261,10 +273,14 @@ Request conversion:
 - Flatten Chat function tool and named tool-choice wrappers to their Responses representations.
 - Send `strict: false` when Chat omitted it, because the default semantics differ.
 - Map `reasoning_effort` to `reasoning.effort`.
-- Map `max_completion_tokens` to `max_output_tokens`.
 - Force upstream `stream: true` and `store: false`.
 
-Consume the complete upstream stream without returning partial output. Use the full response carried by `response.completed` or `response.incomplete` as the only output source; do not reconstruct a response from deltas as a fallback.
+Consume the complete upstream stream without returning partial output. Prefer a
+non-empty full output carried by `response.completed` or `response.incomplete`.
+The private Codex endpoint normally delivers full items in
+`response.output_item.done` and leaves terminal output empty, so retain those
+completed items as the fallback output source. Never reconstruct output from
+text or argument deltas.
 
 Response conversion:
 
@@ -301,6 +317,7 @@ For each downstream text message:
 - require an exact configured model
 - reject transport-specific `stream` and `background` fields
 - reject `store: true` and send `store: false` upstream
+- reject `max_output_tokens`, which the subscription WebSocket endpoint does not support
 - add only the upstream-private fields currently required by the Codex WebSocket wire contract
 - check quota and create a separate ledger row
 
@@ -378,7 +395,7 @@ After the test suite is complete, sub-agents may implement separate config/state
 - every supported role and content representation converts correctly and preserves order
 - function definitions, named/automatic/required tool choice, assistant tool calls, multiple calls, and tool outputs convert correctly
 - omitted function strictness becomes `strict: false`
-- reasoning effort and maximum completion tokens map correctly
+- reasoning effort maps correctly and unsupported token limits are rejected
 - output text, refusal, function calls, creation metadata, finish reason, and usage map correctly
 - completed, tool-call, length, content-filter, upstream failure, malformed terminal, unsupported output item, and no-terminal cases are covered
 - every unsupported Chat field is rejected and never silently omitted

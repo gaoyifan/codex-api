@@ -29,6 +29,8 @@ const ACCOUNT_ID: &str = "account-id-must-not-leak";
 const REFRESH_TOKEN: &str = "refresh-token-must-not-leak";
 const MODEL: &str = "test-model";
 
+type MissingFieldCase = (&'static str, fn(&str) -> String, &'static str);
+
 #[derive(Debug)]
 struct CapturedOutput {
     status: ExitStatus,
@@ -404,7 +406,7 @@ async fn missing_configuration_file_fails_before_startup() {
 
 #[tokio::test]
 async fn missing_required_configuration_fields_fail_before_listening() {
-    let cases: [(&str, fn(&str) -> String, &str); 5] = [
+    let cases: [MissingFieldCase; 5] = [
         (
             "server listen",
             |config| config.replace(&format!("listen = \"{}\"\n", extract_listen(config)), ""),
@@ -564,6 +566,32 @@ async fn invalid_api_key_definitions_are_rejected() {
         assert!(
             !output.status.success(),
             "invalid API key case {name} was accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_key_secrets_with_ascii_whitespace_are_rejected_before_listening() {
+    let cases = [
+        ("leading space", r#"secret = " whitespace-secret-marker""#),
+        ("embedded space", r#"secret = "whitespace-secret marker""#),
+        ("embedded tab", r#"secret = "whitespace-secret\tmarker""#),
+    ];
+
+    for (name, replacement) in cases {
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        let base = std::fs::read_to_string(&fixture.config_path).expect("read base config");
+        fixture.write_config(&base.replacen(&format!(r#"secret = "{FIRST_KEY}""#), replacement, 1));
+
+        let output = expect_startup_failure(&[
+            "--config",
+            fixture.config_path.to_str().expect("UTF-8 config path"),
+        ])
+        .await;
+        assert_error_mentions(&output, "secret");
+        assert!(
+            !output.combined().contains("whitespace-secret"),
+            "startup output exposed the invalid configured secret for {name}"
         );
     }
 }
@@ -809,6 +837,49 @@ async fn missing_malformed_and_incorrect_bearer_credentials_are_rejected_locally
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn duplicate_authorization_field_values_are_rejected_locally() {
+    let upstream = FakeUpstream::start().await;
+    let fixture = Fixture::new(&upstream.base_url());
+    let service = start_service(&fixture).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("build HTTP client");
+
+    let response = client
+        .post(format!("http://{}/v1/responses", fixture.listen_address))
+        .header("authorization", format!("Bearer {FIRST_KEY}"))
+        .header("authorization", "Bearer definitely-wrong")
+        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+        .send()
+        .await
+        .expect("send request with duplicate authorization fields");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response_body = response.text().await.expect("read auth error body");
+    let error: Value = serde_json::from_str(&response_body)
+        .unwrap_or_else(|_| panic!("auth error was not JSON: {response_body}"));
+    assert_eq!(
+        error.pointer("/error/type"),
+        Some(&json!("invalid_request_error"))
+    );
+    assert_eq!(
+        error.pointer("/error/code"),
+        Some(&json!("invalid_api_key"))
+    );
+    assert!(!response_body.contains(FIRST_KEY));
+
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        upstream.requests().is_empty(),
+        "request with duplicate authorization fields reached upstream"
+    );
+
+    let output = service.stop();
+    assert!(!output.combined().contains(FIRST_KEY));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn each_configured_key_can_use_the_responses_and_chat_http_apis() {
     let upstream = FakeUpstream::start().await;
     let fixture = Fixture::new(&upstream.base_url());
@@ -818,53 +889,66 @@ async fn each_configured_key_can_use_the_responses_and_chat_http_apis() {
         .build()
         .expect("build HTTP client");
 
-    let responses = client
-        .post(format!("http://{}/v1/responses", fixture.listen_address))
-        .bearer_auth(FIRST_KEY)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(responses.status(), StatusCode::OK);
-    assert_eq!(
-        responses
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.split(';').next().unwrap_or(value)),
-        Some("text/event-stream")
-    );
-    let responses_body = responses.text().await.expect("read Responses stream");
-    assert!(responses_body.contains("event: response.completed"));
-    assert!(responses_body.contains("resp_auth_test"));
+    for (key_id, key) in [(FIRST_KEY_ID, FIRST_KEY), (SECOND_KEY_ID, SECOND_KEY)] {
+        let responses = client
+            .post(format!("http://{}/v1/responses", fixture.listen_address))
+            .bearer_auth(key)
+            .json(&json!({
+                "model": MODEL,
+                "input": format!("hello from {key_id}"),
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send Responses request for {key_id}: {error}"));
+        assert_eq!(responses.status(), StatusCode::OK, "key {key_id}");
+        assert_eq!(
+            responses
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap_or(value)),
+            Some("text/event-stream"),
+            "key {key_id}"
+        );
+        let responses_body = responses
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("read Responses stream for {key_id}: {error}"));
+        assert!(responses_body.contains("event: response.completed"));
+        assert!(responses_body.contains("resp_auth_test"));
 
-    let chat = client
-        .post(format!(
-            "http://{}/v1/chat/completions",
-            fixture.listen_address
-        ))
-        .bearer_auth(SECOND_KEY)
-        .json(&json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .send()
-        .await
-        .expect("send Chat Completions request");
-    assert_eq!(chat.status(), StatusCode::OK);
-    let chat_body: Value = chat.json().await.expect("read Chat Completion JSON");
-    assert_eq!(chat_body["object"], "chat.completion");
-    assert_eq!(chat_body["id"], "resp_auth_test");
-    assert_eq!(
-        chat_body["choices"][0]["message"]["content"],
-        "authenticated"
-    );
+        let chat = client
+            .post(format!(
+                "http://{}/v1/chat/completions",
+                fixture.listen_address
+            ))
+            .bearer_auth(key)
+            .json(&json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": format!("hello from {key_id}")}]
+            }))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("send Chat Completions request for {key_id}: {error}"));
+        assert_eq!(chat.status(), StatusCode::OK, "key {key_id}");
+        let chat_body: Value = chat
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("read Chat Completion JSON for {key_id}: {error}"));
+        assert_eq!(chat_body["object"], "chat.completion", "key {key_id}");
+        assert_eq!(chat_body["id"], "resp_auth_test", "key {key_id}");
+        assert_eq!(
+            chat_body["choices"][0]["message"]["content"], "authenticated",
+            "key {key_id}"
+        );
+    }
 
     let observed = upstream.requests();
     assert_eq!(
         observed.len(),
-        2,
-        "both valid requests should reach upstream"
+        4,
+        "all four valid key and endpoint combinations should reach upstream"
     );
     let expected_upstream_authorization = format!("Bearer {}", fixture.access_token);
     let first_downstream_authorization = format!("Bearer {FIRST_KEY}");

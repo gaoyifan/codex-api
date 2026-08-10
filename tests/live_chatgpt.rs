@@ -122,17 +122,40 @@ output_usd_per_million = "6.00"
             "input": PROMPT,
             "stream": true,
             "store": false,
-            "reasoning": { "effort": "low" },
-            "max_output_tokens": 128
+            "reasoning": { "effort": "low" }
         }))
         .send()
         .await
         .context("the live Responses HTTP request failed")?;
-    ensure!(
-        responses_http.status() == StatusCode::OK,
-        "the live Responses HTTP request returned status {}",
-        responses_http.status()
-    );
+    if responses_http.status() != StatusCode::OK {
+        let status = responses_http.status();
+        let error: Value = responses_http
+            .json()
+            .await
+            .context("the live Responses HTTP error was not JSON")?;
+        let detail = match error.get("detail") {
+            Some(Value::Array(items)) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| {
+                        json!({
+                            "type": item.get("type"),
+                            "loc": item.get("loc"),
+                            "msg": item.get("msg"),
+                        })
+                    })
+                    .collect(),
+            ),
+            Some(Value::String(detail)) => Value::String(detail.clone()),
+            _ => Value::Null,
+        };
+        bail!(
+            "the live Responses HTTP request returned status {status}, detail={detail}, type={:?}, code={:?}, param={:?}",
+            error.pointer("/error/type").and_then(Value::as_str),
+            error.pointer("/error/code").and_then(Value::as_str),
+            error.pointer("/error/param").and_then(Value::as_str),
+        );
+    }
     let content_type = responses_http
         .headers()
         .get(CONTENT_TYPE)
@@ -194,8 +217,7 @@ output_usd_per_million = "6.00"
             "messages": [{ "role": "user", "content": PROMPT }],
             "stream": false,
             "n": 1,
-            "reasoning_effort": "low",
-            "max_completion_tokens": 128
+            "reasoning_effort": "low"
         }))
         .send()
         .await
@@ -225,16 +247,40 @@ output_usd_per_million = "6.00"
         .get("choices")
         .and_then(Value::as_array)
         .context("the live Chat Completions response omitted choices")?;
-    ensure!(
-        choices.len() == 1
-            && choices[0].pointer("/message/role").and_then(Value::as_str) == Some("assistant")
-            && choices[0]
-                .pointer("/message/content")
+    if !(choices.len() == 1
+        && choices[0].pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+        && choices[0]
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .is_some()
+        && choices[0].get("finish_reason").and_then(Value::as_str) == Some("stop"))
+    {
+        bail!(
+            "the live Chat response had role={:?}, content_kind={}, content_length={:?}, finish_reason={:?}",
+            choices
+                .first()
+                .and_then(|choice| choice.pointer("/message/role"))
+                .and_then(Value::as_str),
+            choices
+                .first()
+                .and_then(|choice| choice.pointer("/message/content"))
+                .map(|value| match value {
+                    Value::Null => "null",
+                    Value::String(_) => "string",
+                    _ => "other",
+                })
+                .unwrap_or("missing"),
+            choices
+                .first()
+                .and_then(|choice| choice.pointer("/message/content"))
                 .and_then(Value::as_str)
-                .is_some()
-            && choices[0].get("finish_reason").and_then(Value::as_str) == Some("stop"),
-        "the live Chat Completions response was not a completed assistant message"
-    );
+                .map(str::len),
+            choices
+                .first()
+                .and_then(|choice| choice.get("finish_reason"))
+                .and_then(Value::as_str),
+        );
+    }
     let chat_usage = chat
         .get("usage")
         .context("the live Chat Completions response omitted usage")?;
@@ -280,8 +326,7 @@ output_usd_per_million = "6.00"
                 "model": MODEL,
                 "input": PROMPT,
                 "store": false,
-                "reasoning": { "effort": "low" },
-                "max_output_tokens": 128
+                "reasoning": { "effort": "low" }
             })
             .to_string()
             .into(),
