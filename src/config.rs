@@ -56,13 +56,57 @@ pub(crate) struct UpstreamConfig {
     pub(crate) supports_websockets: bool,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub(crate) struct ApiKeyConfig {
     pub(crate) id: String,
     pub(crate) secret: SecretString,
-    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
     pub(crate) weekly_limit_usd: Option<Decimal>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiKeyConfigInput {
+    id: String,
+    secret: Option<SecretString>,
+    secret_file: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    weekly_limit_usd: Option<Decimal>,
+}
+
+impl<'de> Deserialize<'de> for ApiKeyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = ApiKeyConfigInput::deserialize(deserializer)?;
+        let secret = match (input.secret, input.secret_file) {
+            (Some(secret), None) => secret,
+            (None, Some(path)) => std::fs::read_to_string(&path)
+                .map(SecretString::from)
+                .map_err(|error| {
+                    de::Error::custom(format!(
+                        "failed to read API key secret file {}: {error}",
+                        path.display()
+                    ))
+                })?,
+            (Some(_), Some(_)) => {
+                return Err(de::Error::custom(
+                    "API key must set exactly one of secret or secret_file",
+                ));
+            }
+            (None, None) => {
+                return Err(de::Error::custom(
+                    "API key must set exactly one of secret or secret_file",
+                ));
+            }
+        };
+
+        Ok(Self {
+            id: input.id,
+            secret,
+            weekly_limit_usd: input.weekly_limit_usd,
+        })
+    }
 }
 
 impl fmt::Debug for ApiKeyConfig {

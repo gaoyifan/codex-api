@@ -1001,3 +1001,37 @@ async fn each_configured_key_can_use_the_responses_and_chat_http_apis() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_key_can_be_loaded_from_a_file_without_embedding_it_in_config() {
+    let upstream = FakeUpstream::start().await;
+    let fixture = Fixture::new(&upstream.base_url());
+    let secret_path = fixture._directory.path().join("client-a.key");
+    std::fs::write(&secret_path, FIRST_KEY).expect("write API key secret file");
+
+    let config = std::fs::read_to_string(&fixture.config_path).expect("read base config");
+    let config = config.replacen(
+        &format!(r#"secret = "{FIRST_KEY}""#),
+        &format!(r#"secret_file = "{}""#, secret_path.display()),
+        1,
+    );
+    assert!(!config.contains(FIRST_KEY));
+    fixture.write_config(&config);
+
+    let service = start_service(&fixture).await;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .expect("build HTTP client")
+        .post(format!("http://{}/v1/responses", fixture.listen_address))
+        .bearer_auth(FIRST_KEY)
+        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
+        .send()
+        .await
+        .expect("send request authenticated by secret file");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("read Responses stream");
+    assert!(body.contains("event: response.completed"));
+    service.stop();
+}
