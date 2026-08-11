@@ -1007,7 +1007,7 @@ async fn api_key_can_be_loaded_from_a_file_without_embedding_it_in_config() {
     let upstream = FakeUpstream::start().await;
     let fixture = Fixture::new(&upstream.base_url());
     let secret_path = fixture._directory.path().join("client-a.key");
-    std::fs::write(&secret_path, FIRST_KEY).expect("write API key secret file");
+    std::fs::write(&secret_path, format!("{FIRST_KEY}\n")).expect("write API key secret file");
 
     let config = std::fs::read_to_string(&fixture.config_path).expect("read base config");
     let config = config.replacen(

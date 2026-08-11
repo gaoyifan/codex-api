@@ -81,14 +81,20 @@ impl<'de> Deserialize<'de> for ApiKeyConfig {
         let input = ApiKeyConfigInput::deserialize(deserializer)?;
         let secret = match (input.secret, input.secret_file) {
             (Some(secret), None) => secret,
-            (None, Some(path)) => std::fs::read_to_string(&path)
-                .map(SecretString::from)
-                .map_err(|error| {
+            (None, Some(path)) => {
+                let mut secret = std::fs::read_to_string(&path).map_err(|error| {
                     de::Error::custom(format!(
                         "failed to read API key secret file {}: {error}",
                         path.display()
                     ))
-                })?,
+                })?;
+                if secret.ends_with("\r\n") {
+                    secret.truncate(secret.len() - 2);
+                } else if secret.ends_with('\n') {
+                    secret.pop();
+                }
+                SecretString::from(secret)
+            }
             (Some(_), Some(_)) => {
                 return Err(de::Error::custom(
                     "API key must set exactly one of secret or secret_file",
