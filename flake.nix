@@ -32,6 +32,8 @@
         };
     in
     {
+      nixosModules.default = import ./nixos-module.nix { inherit self; };
+
       packages = forAllSystems (
         system:
         let
@@ -69,9 +71,20 @@
         };
       });
 
-      checks = forAllSystems (system: {
-        package = self.packages.${system}.default;
-      });
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        {
+          package = self.packages.${system}.default;
+        }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          nixos-module = import ./nixos-module-test.nix {
+            inherit self nixpkgs system;
+          };
+        }
+      );
 
       devShells = forAllSystems (
         system:

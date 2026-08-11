@@ -27,11 +27,50 @@ Protocol baselines:
 
 ## 2. Configuration and Command-Line Interface
 
-Initialize a Rust binary crate and require the configuration path through:
+Initialize a Rust binary crate with an explicit subcommand:
 
 ```text
-codex-api --config /path/to/config.toml
+codex-api serve
 ```
+
+The command-line interface also provides human-oriented, read-only state
+queries:
+
+```text
+codex-api logs [--limit N] [--api-key-id ID] [--model MODEL] [--status STATUS] [--since RFC3339] [--until RFC3339]
+codex-api quota
+```
+
+All commands resolve configuration in this order: explicit `--config`, the
+`CODEX_API_CONFIG` environment variable, then
+`/etc/codex-api/config.toml`.
+
+`logs` defaults to the newest 20 rows ordered by ledger ID descending. Filters
+are combined with AND; `since` is inclusive and `until` is exclusive, and both
+accept RFC3339 timestamps at whole-second precision. Accepted
+statuses are `started`, `completed`, `incomplete`, `rejected`,
+`upstream_error`, `canceled`, and `internal_error`. Its compact table contains
+API key ID, UTC time, model/reasoning, protocol/transport,
+input/cached-input/output tokens in thousands, exact USD cost, duration, and
+status. Null accounting values display as `—`.
+
+`quota` lists every configured API key in configuration order for the current
+UTC week beginning Monday at 00:00, including spend, limit, remaining amount,
+and `unlimited`, `available`, or `blocked` status. It sums non-null persisted
+cost values exactly; a limited key is blocked at or above its limit.
+
+Both queries load configuration but open the existing SQLite database
+read-only. They do not create or migrate it, initialize ChatGPT credentials,
+contact the network, or listen on a port, and never print API key secrets or
+upstream credentials. The CLI is for interactive inspection; the stable
+`request_logs` view remains the scripting and custom-query interface.
+
+Export a `nixosModules.default` flake output with a
+`services.codex-api` module. The module installs the package, manages the
+default static service user/group, runs the explicit `serve` subcommand, and
+sets `CODEX_API_CONFIG` for the systemd service and interactive sessions. Its
+`configFile` option is a runtime string suitable for an agenix or sops-nix path;
+it must not generate secret-bearing TOML in the Nix store.
 
 Configuration is read once at startup. Changes require a restart. Provide a redacted `config.example.toml` with this shape:
 
@@ -342,7 +381,9 @@ The test seams are fixed as follows:
 - restart-based observation for internal credential state
 - a controlled clock injected through the library `run_with_clock` boundary for
   expiry, duration, and week-boundary behavior; the binary uses the system clock
-- direct read-only SQL only against the public `request_logs` view
+- real binary processes for the human-oriented `logs` and `quota` query CLI
+- direct read-only SQL against the public `request_logs` view for scripted and
+  custom inspection
 
 Do not mock internal modules, inspect private credential tables from tests, or make routers, middleware, converters, and SQL queries public merely for testing.
 
@@ -372,6 +413,18 @@ After the test suite is complete, sub-agents may implement separate config/state
 - missing configuration, missing required fields, unreadable auth seed, invalid auth structure, invalid prices, duplicate API keys, impossible WebSocket configuration, and unwritable SQLite all fail before listening
 - errors and operational logs never reveal secrets
 - valid configuration starts and serves both HTTP endpoints
+- omitting the required subcommand fails, while `serve` starts the relay
+- configuration is discovered from `CODEX_API_CONFIG`, an explicit
+  `--config` overrides it, and the documented `/etc` default is advertised
+- the NixOS module evaluates to the documented service command, runtime and
+  session environment, installed package, and static service account
+
+### Query CLI
+
+- `logs` defaults to the latest 20 rows in reverse ledger order and renders the documented compact columns and null markers
+- key, model, status, inclusive `since`, exclusive `until`, and positive limit filters work independently and together; invalid filters fail with actionable errors
+- `quota` lists all configured keys in order and reports exact current-UTC-week spend, limits, remaining amounts, and unlimited/available/blocked state
+- both commands work while the relay owns a WAL database, make no network requests, do not initialize credentials, do not modify or create state, and never reveal secrets
 
 ### Downstream authentication
 
@@ -455,7 +508,7 @@ The live flow performs one minimal Responses HTTP request, one Chat conversion r
 
 After the full suite exists and is red, implement in this order:
 
-1. crate structure, CLI parsing, TOML loading, startup validation, and graceful shutdown
+1. crate structure, explicit serve/query CLI parsing, TOML loading, startup validation, and graceful shutdown
 2. SQLite migrations, credential import precedence, request ledger, and public view
 3. downstream static-key authentication and OpenAI-style local errors
 4. upstream HTTP/SSE client and Responses handler
@@ -480,7 +533,7 @@ Deliver:
 - Rust source and committed `Cargo.lock`
 - SQLx migrations
 - `config.example.toml`
-- README with configuration, operation, API examples, quota semantics, request-log schema, and live-test command
+- README with configuration, explicit serve and query commands, API examples, quota semantics, request-log schema, and live-test command
 - `.gitignore` excluding credentials, SQLite databases, WAL/SHM files, and build output
 
 Do not add TLS termination, Docker packaging, configuration reload, registration/login, management APIs, `/v1/models`, multi-account scheduling, log cleanup, speculative retries, feature flags, compatibility layers, or other unrequested protocol coverage in v1.

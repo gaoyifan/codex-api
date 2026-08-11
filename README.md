@@ -35,14 +35,14 @@ The crate requires Rust 1.94 or newer.
 ```bash
 cargo build --release
 cp config.example.toml config.toml
-./target/release/codex-api --config ./config.toml
+CODEX_API_CONFIG="$PWD/config.toml" ./target/release/codex-api serve
 ```
 
 With Nix flakes enabled, the equivalent package and development workflows are:
 
 ```bash
 nix build
-nix run . -- --config ./config.toml
+CODEX_API_CONFIG="$PWD/config.toml" nix run . -- serve
 nix develop
 ```
 
@@ -53,6 +53,17 @@ blocks; run `cargo test --all-targets` from `nix develop` instead.
 Configuration is loaded once at startup. Restart the process after changing
 it. TLS is intentionally outside the service; put it behind a trusted reverse
 proxy when exposing it beyond a private network.
+
+Every command resolves the configuration path in this order: an explicit
+`--config`, `CODEX_API_CONFIG`, then `/etc/codex-api/config.toml`. For a local
+checkout without installing under `/etc`, use:
+
+```bash
+export CODEX_API_CONFIG="$PWD/config.toml"
+codex-api serve
+codex-api logs
+codex-api quota
+```
 
 `SIGINT` and `SIGTERM` stop new connections and cancel Responses, Chat, and
 WebSocket operations that are still awaiting an upstream outcome. Outcomes
@@ -80,6 +91,45 @@ See [config.example.toml](config.example.toml). Important rules:
 
 The service creates a new SQLite state file with mode `0600`, enables WAL, and
 uses a bounded busy timeout. Run a single service instance against a state file.
+
+## NixOS module
+
+The flake exports `nixosModules.default`. The module installs the CLI, creates
+the default `codex-api` service account, starts `codex-api serve`, and exports
+`CODEX_API_CONFIG` to both the service and login sessions. Its `configFile`
+option is a runtime string path rather than a Nix path, so an agenix or sops-nix
+secret is not copied into the world-readable Nix store.
+
+Add this flake as an input to the NixOS configuration and import its module. An
+el2 host module under `~/nix/nixos/hosts/el2/` can use this shape:
+
+```nix
+{
+  config,
+  inputs,
+  lib,
+  ...
+}:
+{
+  imports = [ inputs.codex-api.nixosModules.default ];
+
+  age.secrets.codex-api-config = lib.mkIf config.services.secrets.hasRealFiles {
+    file = config.services.secrets.filesDir + "/nixos/el2/codex-api-config.age";
+    owner = "codex-api";
+    group = "codex-api";
+  };
+
+  services.codex-api = {
+    enable = true;
+    configFile = "/run/agenix/codex-api-config";
+  };
+}
+```
+
+When the host uses the default `/etc/codex-api/config.toml`, `configFile` can be
+omitted. If `user` or `group` is changed from `codex-api`, define that account
+outside this module and grant it read access to the runtime configuration and
+Codex authentication file, plus write access to the configured SQLite path.
 
 ## Requests
 
@@ -164,7 +214,42 @@ http_status
 
 `cost_usd` is canonical decimal `TEXT` with exactly nine fractional digits, so
 it preserves the ledger's nano-USD precision without a floating-point
-conversion. For example:
+conversion.
+
+For interactive inspection, `logs` prints the newest 20 requests by default:
+
+```bash
+codex-api logs
+codex-api logs \
+  --limit 50 \
+  --api-key-id client-a \
+  --model gpt-5.6-luna \
+  --status completed \
+  --since 2026-08-10T00:00:00Z \
+  --until 2026-08-11T00:00:00Z
+```
+
+The filters are combined with AND. `--since` is inclusive and `--until` is
+exclusive; both accept RFC3339 timestamps at whole-second precision. Status accepts `started`, `completed`, `incomplete`, `rejected`,
+`upstream_error`, `canceled`, and `internal_error`. The compact table shows API
+key ID, UTC request time, model and reasoning effort, API protocol and
+transport, input/cached-input/output tokens in thousands, exact USD cost,
+duration, and status. Missing accounting values are shown as `—`.
+
+`quota` prints every configured API key in configuration order for the current
+UTC week, beginning Monday at 00:00. It shows exact spend, configured limit,
+remaining allowance, and `unlimited`, `available`, or `blocked` status:
+
+```bash
+codex-api quota
+```
+
+Both query commands open the existing state database read-only. They do not
+create or migrate a database, initialize ChatGPT credentials, contact the
+network, or listen on a port, and their output never includes configured API
+key secrets or upstream credentials.
+
+For scripts and custom queries, use the stable `request_logs` view directly:
 
 ```bash
 sqlite3 ./codex-api.sqlite3 \
