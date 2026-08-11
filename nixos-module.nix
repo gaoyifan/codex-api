@@ -7,6 +7,8 @@
 }:
 let
   cfg = config.services.codex-api;
+  toml = pkgs.formats.toml { };
+  configFile = toml.generate "codex-api.toml" cfg.settings;
 in
 {
   options.services.codex-api = {
@@ -19,14 +21,9 @@ in
       description = "The codex-api package to use.";
     };
 
-    configFile = lib.mkOption {
-      type = lib.types.nonEmptyStr;
-      default = "/etc/codex-api/config.toml";
-      description = ''
-        Runtime path to the TOML configuration file. Use a path under /run for
-        configuration supplied by agenix or sops-nix so secrets do not enter
-        the Nix store.
-      '';
+    settings = lib.mkOption {
+      type = toml.type;
+      description = "Configuration written to codex-api.toml.";
     };
 
     user = lib.mkOption {
@@ -52,14 +49,14 @@ in
     users.groups = lib.mkIf (cfg.group == "codex-api") { codex-api = { }; };
 
     environment.systemPackages = [ cfg.package ];
-    environment.sessionVariables.CODEX_API_CONFIG = cfg.configFile;
+    environment.sessionVariables.CODEX_API_CONFIG = "${configFile}";
 
     systemd.services.codex-api = {
       description = "ChatGPT Codex API relay";
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
-      environment.CODEX_API_CONFIG = cfg.configFile;
+      environment.CODEX_API_CONFIG = "${configFile}";
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} serve";
         User = cfg.user;

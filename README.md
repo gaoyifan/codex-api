@@ -82,7 +82,8 @@ rewritten.
 
 See [config.example.toml](config.example.toml). Important rules:
 
-- API key IDs and secrets must be non-empty and unique.
+- API key IDs and resolved secrets must be non-empty and unique. Set exactly
+  one of `secret` or `secret_file` for each key.
 - Decimal prices and limits must be quoted strings and non-negative.
 - `model_prices` is the exact model allowlist.
 - Omitting `weekly_limit_usd` makes a key unlimited.
@@ -96,9 +97,9 @@ uses a bounded busy timeout. Run a single service instance against a state file.
 
 The flake exports `nixosModules.default`. The module installs the CLI, creates
 the default `codex-api` service account, starts `codex-api serve`, and exports
-`CODEX_API_CONFIG` to both the service and login sessions. Its `configFile`
-option is a runtime string path rather than a Nix path, so an agenix or sops-nix
-secret is not copied into the world-readable Nix store.
+`CODEX_API_CONFIG` to both the service and login sessions. It renders the
+non-secret `settings` attribute set with `pkgs.formats.toml`; secret values stay
+in agenix or sops-nix files referenced by `auth_file` and `secret_file`.
 
 Add this flake as an input to the NixOS configuration and import its module. An
 el2 host module under `~/nix/nixos/hosts/el2/` can use this shape:
@@ -113,23 +114,42 @@ el2 host module under `~/nix/nixos/hosts/el2/` can use this shape:
 {
   imports = [ inputs.codex-api.nixosModules.default ];
 
-  age.secrets.codex-api-config = lib.mkIf config.services.secrets.hasRealFiles {
-    file = config.services.secrets.filesDir + "/nixos/el2/codex-api-config.age";
-    owner = "codex-api";
-    group = "codex-api";
+  age.secrets = lib.mkIf config.services.secrets.hasRealFiles {
+    codex-api-auth = {
+      file = config.services.secrets.filesDir + "/nixos/el2/codex-api-auth.age";
+      owner = "codex-api";
+      group = "codex-api";
+    };
+    codex-api-key = {
+      file = config.services.secrets.filesDir + "/nixos/el2/codex-api-key.age";
+      owner = "codex-api";
+      group = "codex-api";
+    };
   };
 
   services.codex-api = {
     enable = true;
-    configFile = "/run/agenix/codex-api-config";
+    settings = {
+      server.listen = "127.0.0.1:8080";
+      state.path = "/var/lib/codex-api/state.sqlite3";
+      upstream.auth_file = config.age.secrets.codex-api-auth.path;
+      api_keys = [{
+        id = "client-a";
+        secret_file = config.age.secrets.codex-api-key.path;
+      }];
+      model_prices."gpt-5.6-luna" = {
+        input_usd_per_million = "0.20";
+        cached_input_usd_per_million = "0.02";
+        output_usd_per_million = "1.20";
+      };
+    };
   };
 }
 ```
 
-When the host uses the default `/etc/codex-api/config.toml`, `configFile` can be
-omitted. If `user` or `group` is changed from `codex-api`, define that account
-outside this module and grant it read access to the runtime configuration and
-Codex authentication file, plus write access to the configured SQLite path.
+If `user` or `group` is changed from `codex-api`, define that account outside
+this module and grant it read access to the configured secret files, plus write
+access to the configured SQLite path.
 
 ## Requests
 

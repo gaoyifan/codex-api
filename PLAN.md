@@ -69,8 +69,9 @@ Export a `nixosModules.default` flake output with a
 `services.codex-api` module. The module installs the package, manages the
 default static service user/group, runs the explicit `serve` subcommand, and
 sets `CODEX_API_CONFIG` for the systemd service and interactive sessions. Its
-`configFile` option is a runtime string suitable for an agenix or sops-nix path;
-it must not generate secret-bearing TOML in the Nix store.
+`settings` option is rendered with `pkgs.formats.toml`; the generated store file
+contains only non-secret settings and runtime paths to agenix or sops-nix
+credential files.
 
 Configuration is read once at startup. Changes require a restart. Provide a redacted `config.example.toml` with this shape:
 
@@ -90,19 +91,21 @@ supports_websockets = true
 
 [[api_keys]]
 id = "client-a"
-secret = "sk-local-secret"
+secret_file = "/run/agenix/codex-api-key"
 weekly_limit_usd = "10.00" # optional; omission means unlimited
 
 [model_prices."gpt-5.6-luna"]
-input_usd_per_million = "1.00"
-cached_input_usd_per_million = "0.10"
-output_usd_per_million = "6.00"
+input_usd_per_million = "0.20"
+cached_input_usd_per_million = "0.02"
+output_usd_per_million = "1.20"
 ```
 
 Configuration rules:
 
-- API key IDs and secrets must be non-empty and unique.
-- API key secrets remain in configuration and memory only; never persist them to SQLite.
+- API key IDs and resolved secrets must be non-empty and unique. Each key sets
+  exactly one of `secret` or `secret_file`.
+- API key secrets remain in configuration or their referenced files and in
+  memory only; never persist them to SQLite.
 - `model_prices` is also the model allowlist. Every request must name an exact configured model so every request log has a deterministic cost, including requests made with an unlimited key.
 - Money values are decimal strings and must be non-negative.
 - Reject unknown configuration fields so configuration typos fail before the server starts listening.
