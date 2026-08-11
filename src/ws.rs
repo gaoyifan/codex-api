@@ -71,410 +71,368 @@ pub(crate) async fn responses_websocket(
 }
 
 async fn proxy_connection(
-    mut downstream: WebSocket,
-    mut upstream: UpstreamWebSocket,
+    downstream: WebSocket,
+    upstream: UpstreamWebSocket,
     state: Arc<AppState>,
     identity: ClientIdentity,
 ) {
-    let mut in_flight = None;
+    WsSession {
+        downstream,
+        upstream,
+        state,
+        identity,
+        active: None,
+    }
+    .run()
+    .await;
+}
 
-    loop {
-        tokio::select! {
-            biased;
-            _ = state.shutdown.cancelled() => {
-                finalize_active(&state, &mut in_flight, FinalStatus::Canceled).await;
-                let _ = upstream
+struct WsSession {
+    downstream: WebSocket,
+    upstream: UpstreamWebSocket,
+    state: Arc<AppState>,
+    identity: ClientIdentity,
+    active: Option<InFlight>,
+}
+
+enum ConnectionEvent {
+    Shutdown,
+    ClientGone,
+    Downstream(DownstreamMessage),
+    UpstreamGone,
+    Upstream(UpstreamMessage),
+}
+
+enum ConnectionEnd {
+    Shutdown,
+    ClientDisconnect(Option<UpstreamCloseFrame>),
+    ClientProtocolError,
+    UpstreamFailure,
+    UpstreamClosed(Option<UpstreamCloseFrame>),
+    InternalFailure,
+    AccountingFailure,
+}
+
+impl WsSession {
+    async fn run(mut self) {
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = self.state.shutdown.cancelled() => ConnectionEvent::Shutdown,
+                message = self.downstream.recv() => match message {
+                    Some(Ok(message)) => ConnectionEvent::Downstream(message),
+                    Some(Err(_)) | None => ConnectionEvent::ClientGone,
+                },
+                message = self.upstream.next() => match message {
+                    Some(Ok(message)) => ConnectionEvent::Upstream(message),
+                    Some(Err(_)) | None => ConnectionEvent::UpstreamGone,
+                },
+            };
+
+            let end = match event {
+                ConnectionEvent::Shutdown => Some(ConnectionEnd::Shutdown),
+                ConnectionEvent::ClientGone => Some(ConnectionEnd::ClientDisconnect(None)),
+                ConnectionEvent::Downstream(message) => self.handle_downstream(message).await,
+                ConnectionEvent::UpstreamGone => Some(ConnectionEnd::UpstreamFailure),
+                ConnectionEvent::Upstream(message) => self.handle_upstream(message).await,
+            };
+            if let Some(end) = end {
+                self.finish(end).await;
+                return;
+            }
+        }
+    }
+
+    async fn handle_downstream(&mut self, message: DownstreamMessage) -> Option<ConnectionEnd> {
+        match message {
+            DownstreamMessage::Text(text) => self.handle_create(text.as_str()).await,
+            DownstreamMessage::Binary(_) => Some(ConnectionEnd::ClientProtocolError),
+            DownstreamMessage::Ping(payload) => self
+                .upstream
+                .send(UpstreamMessage::Ping(payload))
+                .await
+                .err()
+                .map(|_| ConnectionEnd::UpstreamFailure),
+            DownstreamMessage::Pong(payload) => self
+                .upstream
+                .send(UpstreamMessage::Pong(payload))
+                .await
+                .err()
+                .map(|_| ConnectionEnd::UpstreamFailure),
+            DownstreamMessage::Close(frame) => {
+                let _ = self.downstream.flush().await;
+                Some(ConnectionEnd::ClientDisconnect(
+                    frame.map(downstream_close_to_upstream),
+                ))
+            }
+        }
+    }
+
+    async fn handle_create(&mut self, text: &str) -> Option<ConnectionEnd> {
+        let value = match serde_json::from_str::<Value>(text) {
+            Ok(value) => value,
+            Err(_) => {
+                return self
+                    .reject(
+                        &Value::Null,
+                        websocket_error(
+                            "invalid_request_error",
+                            None,
+                            "response.create must be valid JSON",
+                        ),
+                    )
+                    .await;
+            }
+        };
+        let prepared = match prepare_request(value, &self.state, &self.identity) {
+            Ok(prepared) => prepared,
+            Err((value, validation)) => {
+                return self
+                    .reject(
+                        &value,
+                        websocket_error(
+                            "invalid_request_error",
+                            Some(validation.param),
+                            validation.message,
+                        ),
+                    )
+                    .await;
+            }
+        };
+
+        let admission = match self
+            .state
+            .store
+            .begin_request(&prepared.metadata, self.identity.weekly_limit_usd)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(_) => return Some(ConnectionEnd::InternalFailure),
+        };
+        let request_id = match admission {
+            Admission::Admitted(request_id) => request_id,
+            Admission::WeeklyQuotaExceeded(_) => {
+                return self
+                    .send_error(websocket_error(
+                        "weekly_quota_exceeded",
+                        None,
+                        "The configured weekly quota has been exceeded",
+                    ))
+                    .await;
+            }
+        };
+
+        if self.active.is_some() {
+            if self
+                .state
+                .store
+                .finalize_request(request_id, FinalStatus::Rejected, None, None)
+                .await
+                .is_err()
+            {
+                return Some(ConnectionEnd::InternalFailure);
+            }
+            return self
+                .send_error(websocket_error(
+                    "response_in_progress",
+                    None,
+                    "A response is already in progress on this connection",
+                ))
+                .await;
+        }
+
+        if self
+            .upstream
+            .send(UpstreamMessage::Text(prepared.payload.to_string().into()))
+            .await
+            .is_err()
+        {
+            let _ = self
+                .state
+                .store
+                .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
+                .await;
+            return Some(ConnectionEnd::UpstreamFailure);
+        }
+        self.active = Some(InFlight {
+            request_id,
+            rates: prepared.rates,
+        });
+        None
+    }
+
+    async fn reject(&mut self, value: &Value, error: Value) -> Option<ConnectionEnd> {
+        if record_rejection(&self.state, &self.identity, value)
+            .await
+            .is_err()
+        {
+            return Some(ConnectionEnd::InternalFailure);
+        }
+        self.send_error(error).await
+    }
+
+    async fn send_error(&mut self, error: Value) -> Option<ConnectionEnd> {
+        self.downstream
+            .send(DownstreamMessage::Text(error.to_string().into()))
+            .await
+            .err()
+            .map(|_| ConnectionEnd::ClientDisconnect(None))
+    }
+
+    async fn handle_upstream(&mut self, message: UpstreamMessage) -> Option<ConnectionEnd> {
+        match message {
+            UpstreamMessage::Text(text) => self.handle_upstream_text(text.as_str()).await,
+            UpstreamMessage::Binary(_) | UpstreamMessage::Frame(_) => {
+                Some(ConnectionEnd::UpstreamFailure)
+            }
+            UpstreamMessage::Ping(payload) => self
+                .downstream
+                .send(DownstreamMessage::Ping(payload))
+                .await
+                .err()
+                .map(|_| ConnectionEnd::ClientDisconnect(None)),
+            UpstreamMessage::Pong(payload) => self
+                .downstream
+                .send(DownstreamMessage::Pong(payload))
+                .await
+                .err()
+                .map(|_| ConnectionEnd::ClientDisconnect(None)),
+            UpstreamMessage::Close(frame) => {
+                let _ = self.upstream.flush().await;
+                Some(ConnectionEnd::UpstreamClosed(frame))
+            }
+        }
+    }
+
+    async fn handle_upstream_text(&mut self, text: &str) -> Option<ConnectionEnd> {
+        let event = match serde_json::from_str::<Value>(text) {
+            Ok(event) if event.get("type").and_then(Value::as_str).is_some() => event,
+            Ok(_) | Err(_) => return Some(ConnectionEnd::UpstreamFailure),
+        };
+        let terminal = match parse_terminal_payload(event) {
+            Ok(terminal) => terminal,
+            Err(_) => return Some(ConnectionEnd::UpstreamFailure),
+        };
+        if let Some(terminal) = terminal {
+            let Some(active) = self.active.take() else {
+                return Some(ConnectionEnd::UpstreamFailure);
+            };
+            let status = match terminal.kind {
+                TerminalKind::Completed => FinalStatus::Completed,
+                TerminalKind::Incomplete => FinalStatus::Incomplete,
+                TerminalKind::Failed | TerminalKind::Error => FinalStatus::UpstreamError,
+            };
+            let usage = terminal.usage.map(|usage| BillableUsage {
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+                rates: active.rates,
+            });
+            if self
+                .state
+                .store
+                .finalize_request(active.request_id, status, None, usage)
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .state
+                    .store
+                    .finalize_request(active.request_id, FinalStatus::UpstreamError, None, None)
+                    .await;
+                return Some(ConnectionEnd::AccountingFailure);
+            }
+        }
+        self.downstream
+            .send(DownstreamMessage::Text(text.to_owned().into()))
+            .await
+            .err()
+            .map(|_| ConnectionEnd::ClientDisconnect(None))
+    }
+
+    async fn finish(&mut self, end: ConnectionEnd) {
+        match end {
+            ConnectionEnd::Shutdown => {
+                self.finalize_active(FinalStatus::Canceled).await;
+                let _ = self
+                    .upstream
                     .send(UpstreamMessage::Close(Some(UpstreamCloseFrame {
                         code: CloseCode::Away,
                         reason: "Server is shutting down".into(),
                     })))
                     .await;
-                send_downstream_close(&mut downstream, 1001, "Server is shutting down").await;
-                return;
+                self.close_downstream(1001, "Server is shutting down").await;
             }
-            downstream_message = downstream.recv() => {
-                match downstream_message {
-                    Some(Ok(DownstreamMessage::Text(text))) => {
-                        let value = match serde_json::from_str::<Value>(text.as_str()) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                if record_rejection(&state, &identity, &Value::Null)
-                                    .await
-                                    .is_err()
-                                {
-                                    close_for_internal_error(
-                                        &mut downstream,
-                                        &mut upstream,
-                                        &state,
-                                        &mut in_flight,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                let error = websocket_error(
-                                    "invalid_request_error",
-                                    None,
-                                    "response.create must be valid JSON",
-                                );
-                                if send_downstream_json(&mut downstream, error).await.is_err() {
-                                    close_after_client_disconnect(
-                                        &mut upstream,
-                                        &state,
-                                        &mut in_flight,
-                                        None,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                continue;
-                            }
-                        };
-                        let prepared = match prepare_request(value, &state, &identity) {
-                            Ok(prepared) => prepared,
-                            Err((value, validation)) => {
-                                if record_rejection(&state, &identity, &value).await.is_err() {
-                                    close_for_internal_error(
-                                        &mut downstream,
-                                        &mut upstream,
-                                        &state,
-                                        &mut in_flight,
-                                    ).await;
-                                    return;
-                                }
-                                let error = websocket_error(
-                                    "invalid_request_error",
-                                    Some(validation.param),
-                                    validation.message,
-                                );
-                                if send_downstream_json(&mut downstream, error).await.is_err() {
-                                    close_after_client_disconnect(
-                                        &mut upstream,
-                                        &state,
-                                        &mut in_flight,
-                                        None,
-                                    ).await;
-                                    return;
-                                }
-                                continue;
-                            }
-                        };
-
-                        let admission = match state
-                            .store
-                            .begin_request(&prepared.metadata, identity.weekly_limit_usd)
-                            .await
-                        {
-                            Ok(admission) => admission,
-                            Err(_) => {
-                                close_for_internal_error(
-                                    &mut downstream,
-                                    &mut upstream,
-                                    &state,
-                                    &mut in_flight,
-                                ).await;
-                                return;
-                            }
-                        };
-                        let request_id = match admission {
-                            Admission::Admitted(request_id) => request_id,
-                            Admission::WeeklyQuotaExceeded(_) => {
-                                let error = websocket_error(
-                                    "weekly_quota_exceeded",
-                                    None,
-                                    "The configured weekly quota has been exceeded",
-                                );
-                                if send_downstream_json(&mut downstream, error).await.is_err() {
-                                    close_after_client_disconnect(
-                                        &mut upstream,
-                                        &state,
-                                        &mut in_flight,
-                                        None,
-                                    ).await;
-                                    return;
-                                }
-                                continue;
-                            }
-                        };
-
-                        if in_flight.is_some() {
-                            if state
-                                .store
-                                .finalize_request(request_id, FinalStatus::Rejected, None, None)
-                                .await
-                                .is_err()
-                            {
-                                close_for_internal_error(
-                                    &mut downstream,
-                                    &mut upstream,
-                                    &state,
-                                    &mut in_flight,
-                                )
-                                .await;
-                                return;
-                            }
-                            let error = websocket_error(
-                                "response_in_progress",
-                                None,
-                                "A response is already in progress on this connection",
-                            );
-                            if send_downstream_json(&mut downstream, error).await.is_err() {
-                                close_after_client_disconnect(
-                                    &mut upstream,
-                                    &state,
-                                    &mut in_flight,
-                                    None,
-                                )
-                                .await;
-                                return;
-                            }
-                            continue;
-                        }
-
-                        let payload = prepared.payload.to_string();
-                        if upstream
-                            .send(UpstreamMessage::Text(payload.into()))
-                            .await
-                            .is_err()
-                        {
-                            let _ = state
-                                .store
-                                .finalize_request(
-                                    request_id,
-                                    FinalStatus::UpstreamError,
-                                    None,
-                                    None,
-                                )
-                                .await;
-                            send_downstream_close(
-                                &mut downstream,
-                                1011,
-                                "Upstream WebSocket failure",
-                            ).await;
-                            return;
-                        }
-                        in_flight = Some(InFlight {
-                            request_id,
-                            rates: prepared.rates,
-                        });
-                    }
-                    Some(Ok(DownstreamMessage::Binary(_))) => {
-                        close_for_client_protocol_error(
-                            &mut downstream,
-                            &mut upstream,
-                            &state,
-                            &mut in_flight,
-                            "Binary application messages are unsupported",
-                        ).await;
-                        return;
-                    }
-                    Some(Ok(DownstreamMessage::Ping(payload))) => {
-                        if upstream.send(UpstreamMessage::Ping(payload)).await.is_err() {
-                            close_for_upstream_failure(
-                                &mut downstream,
-                                &state,
-                                &mut in_flight,
-                            ).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(DownstreamMessage::Pong(payload))) => {
-                        if upstream.send(UpstreamMessage::Pong(payload)).await.is_err() {
-                            close_for_upstream_failure(
-                                &mut downstream,
-                                &state,
-                                &mut in_flight,
-                            ).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(DownstreamMessage::Close(frame))) => {
-                        let upstream_frame = frame.map(downstream_close_to_upstream);
-                        let _ = downstream.flush().await;
-                        close_after_client_disconnect(
-                            &mut upstream,
-                            &state,
-                            &mut in_flight,
-                            upstream_frame,
-                        ).await;
-                        return;
-                    }
-                    Some(Err(_)) | None => {
-                        close_after_client_disconnect(
-                            &mut upstream,
-                            &state,
-                            &mut in_flight,
-                            None,
-                        ).await;
-                        return;
-                    }
+            ConnectionEnd::ClientDisconnect(frame) => {
+                self.finalize_active(FinalStatus::Canceled).await;
+                let _ = self.upstream.send(UpstreamMessage::Close(frame)).await;
+            }
+            ConnectionEnd::ClientProtocolError => {
+                self.finalize_active(FinalStatus::Canceled).await;
+                let reason = "Binary application messages are unsupported";
+                let _ = self
+                    .upstream
+                    .send(UpstreamMessage::Close(Some(UpstreamCloseFrame {
+                        code: CloseCode::Unsupported,
+                        reason: reason.into(),
+                    })))
+                    .await;
+                self.close_downstream(1003, reason).await;
+            }
+            ConnectionEnd::UpstreamFailure => {
+                self.finalize_active(FinalStatus::UpstreamError).await;
+                self.close_downstream(1011, "Upstream WebSocket failure")
+                    .await;
+            }
+            ConnectionEnd::UpstreamClosed(frame) => {
+                let normal = frame
+                    .as_ref()
+                    .is_none_or(|frame| matches!(frame.code, CloseCode::Normal | CloseCode::Away));
+                if self.active.is_some() || !normal {
+                    self.finalize_active(FinalStatus::UpstreamError).await;
+                    self.close_downstream(1011, "Upstream WebSocket failure")
+                        .await;
+                } else {
+                    let _ = self
+                        .downstream
+                        .send(DownstreamMessage::Close(
+                            frame.map(upstream_close_to_downstream),
+                        ))
+                        .await;
                 }
             }
-            upstream_message = upstream.next() => {
-                match upstream_message {
-                    Some(Ok(UpstreamMessage::Text(text))) => {
-                        let event = match serde_json::from_str::<Value>(text.as_str()) {
-                            Ok(event) => event,
-                            Err(_) => {
-                                close_for_upstream_failure(
-                                    &mut downstream,
-                                    &state,
-                                    &mut in_flight,
-                                ).await;
-                                return;
-                            }
-                        };
-                        if event.get("type").and_then(Value::as_str).is_none() {
-                            close_for_upstream_failure(
-                                &mut downstream,
-                                &state,
-                                &mut in_flight,
-                            ).await;
-                            return;
-                        }
-                        let terminal = match parse_terminal_payload(event) {
-                            Ok(terminal) => terminal,
-                            Err(_) => {
-                                close_for_upstream_failure(
-                                    &mut downstream,
-                                    &state,
-                                    &mut in_flight,
-                                ).await;
-                                return;
-                            }
-                        };
-                        if let Some(terminal) = terminal {
-                            let Some(active) = in_flight.take() else {
-                                close_for_upstream_failure(
-                                    &mut downstream,
-                                    &state,
-                                    &mut in_flight,
-                                ).await;
-                                return;
-                            };
-                            let request_id = active.request_id;
-                            let status = match terminal.kind {
-                                TerminalKind::Completed => FinalStatus::Completed,
-                                TerminalKind::Incomplete => FinalStatus::Incomplete,
-                                TerminalKind::Failed | TerminalKind::Error => {
-                                    FinalStatus::UpstreamError
-                                }
-                            };
-                            let usage = terminal.usage.map(|usage| BillableUsage {
-                                input_tokens: usage.input_tokens,
-                                cached_input_tokens: usage.cached_input_tokens,
-                                output_tokens: usage.output_tokens,
-                                rates: active.rates,
-                            });
-                            if state
-                                .store
-                                .finalize_request(
-                                    request_id,
-                                    status,
-                                    None,
-                                    usage,
-                                )
-                                .await
-                                .is_err()
-                            {
-                                let _ = state
-                                    .store
-                                    .finalize_request(
-                                        request_id,
-                                        FinalStatus::UpstreamError,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                send_downstream_close(
-                                    &mut downstream,
-                                    1011,
-                                    "Internal WebSocket accounting failure",
-                                ).await;
-                                let _ = upstream.send(UpstreamMessage::Close(None)).await;
-                                return;
-                            }
-                        }
-                        if downstream
-                            .send(DownstreamMessage::Text(text.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            close_after_client_disconnect(
-                                &mut upstream,
-                                &state,
-                                &mut in_flight,
-                                None,
-                            ).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(UpstreamMessage::Binary(_))) | Some(Ok(UpstreamMessage::Frame(_))) => {
-                        close_for_upstream_failure(
-                            &mut downstream,
-                            &state,
-                            &mut in_flight,
-                        ).await;
-                        return;
-                    }
-                    Some(Ok(UpstreamMessage::Ping(payload))) => {
-                        if downstream.send(DownstreamMessage::Ping(payload)).await.is_err() {
-                            close_after_client_disconnect(
-                                &mut upstream,
-                                &state,
-                                &mut in_flight,
-                                None,
-                            ).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(UpstreamMessage::Pong(payload))) => {
-                        if downstream.send(DownstreamMessage::Pong(payload)).await.is_err() {
-                            close_after_client_disconnect(
-                                &mut upstream,
-                                &state,
-                                &mut in_flight,
-                                None,
-                            ).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(UpstreamMessage::Close(frame))) => {
-                        let normal_close = frame
-                            .as_ref()
-                            .is_none_or(|frame| matches!(frame.code, CloseCode::Normal | CloseCode::Away));
-                        let _ = upstream.flush().await;
-                        if in_flight.is_some() {
-                            close_for_upstream_failure(
-                                &mut downstream,
-                                &state,
-                                &mut in_flight,
-                            ).await;
-                        } else if normal_close {
-                            let downstream_frame = frame.map(upstream_close_to_downstream);
-                            let _ = downstream
-                                .send(DownstreamMessage::Close(downstream_frame))
-                                .await;
-                        } else {
-                            send_downstream_close(
-                                &mut downstream,
-                                1011,
-                                "Upstream WebSocket failure",
-                            )
-                            .await;
-                        }
-                        return;
-                    }
-                    Some(Err(_)) | None => {
-                        close_for_upstream_failure(
-                            &mut downstream,
-                            &state,
-                            &mut in_flight,
-                        ).await;
-                        return;
-                    }
-                }
+            ConnectionEnd::InternalFailure => {
+                self.finalize_active(FinalStatus::InternalError).await;
+                let _ = self.upstream.send(UpstreamMessage::Close(None)).await;
+                self.close_downstream(1011, "Internal WebSocket failure")
+                    .await;
+            }
+            ConnectionEnd::AccountingFailure => {
+                self.close_downstream(1011, "Internal WebSocket accounting failure")
+                    .await;
+                let _ = self.upstream.send(UpstreamMessage::Close(None)).await;
             }
         }
+    }
+
+    async fn finalize_active(&mut self, status: FinalStatus) {
+        if let Some(active) = self.active.take() {
+            let _ = self
+                .state
+                .store
+                .finalize_request(active.request_id, status, None, None)
+                .await;
+        }
+    }
+
+    async fn close_downstream(&mut self, code: u16, reason: &'static str) {
+        let _ = self
+            .downstream
+            .send(DownstreamMessage::Close(Some(DownstreamCloseFrame {
+                code,
+                reason: reason.into(),
+            })))
+            .await;
     }
 }
 
@@ -608,79 +566,6 @@ async fn record_rejection(
         }
         Admission::WeeklyQuotaExceeded(_) => Ok(()),
     }
-}
-
-async fn send_downstream_json(downstream: &mut WebSocket, value: Value) -> Result<(), ()> {
-    downstream
-        .send(DownstreamMessage::Text(value.to_string().into()))
-        .await
-        .map_err(|_| ())
-}
-
-async fn finalize_active(state: &AppState, active: &mut Option<InFlight>, status: FinalStatus) {
-    if let Some(active) = active.take() {
-        let _ = state
-            .store
-            .finalize_request(active.request_id, status, None, None)
-            .await;
-    }
-}
-
-async fn close_after_client_disconnect(
-    upstream: &mut UpstreamWebSocket,
-    state: &AppState,
-    active: &mut Option<InFlight>,
-    frame: Option<UpstreamCloseFrame>,
-) {
-    finalize_active(state, active, FinalStatus::Canceled).await;
-    let _ = upstream.send(UpstreamMessage::Close(frame)).await;
-}
-
-async fn close_for_client_protocol_error(
-    downstream: &mut WebSocket,
-    upstream: &mut UpstreamWebSocket,
-    state: &AppState,
-    active: &mut Option<InFlight>,
-    reason: &'static str,
-) {
-    finalize_active(state, active, FinalStatus::Canceled).await;
-    let upstream_frame = UpstreamCloseFrame {
-        code: CloseCode::Unsupported,
-        reason: reason.into(),
-    };
-    let _ = upstream
-        .send(UpstreamMessage::Close(Some(upstream_frame)))
-        .await;
-    send_downstream_close(downstream, 1003, reason).await;
-}
-
-async fn close_for_upstream_failure(
-    downstream: &mut WebSocket,
-    state: &AppState,
-    active: &mut Option<InFlight>,
-) {
-    finalize_active(state, active, FinalStatus::UpstreamError).await;
-    send_downstream_close(downstream, 1011, "Upstream WebSocket failure").await;
-}
-
-async fn close_for_internal_error(
-    downstream: &mut WebSocket,
-    upstream: &mut UpstreamWebSocket,
-    state: &AppState,
-    active: &mut Option<InFlight>,
-) {
-    finalize_active(state, active, FinalStatus::InternalError).await;
-    let _ = upstream.send(UpstreamMessage::Close(None)).await;
-    send_downstream_close(downstream, 1011, "Internal WebSocket failure").await;
-}
-
-async fn send_downstream_close(downstream: &mut WebSocket, code: u16, reason: &'static str) {
-    let _ = downstream
-        .send(DownstreamMessage::Close(Some(DownstreamCloseFrame {
-            code,
-            reason: reason.into(),
-        })))
-        .await;
 }
 
 fn downstream_close_to_upstream(frame: DownstreamCloseFrame) -> UpstreamCloseFrame {
