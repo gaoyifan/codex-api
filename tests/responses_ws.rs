@@ -552,7 +552,7 @@ output_usd_per_million = "6.00"
 
 fn relay_command(config_path: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codex-api"));
-    command.arg("--config").arg(config_path);
+    command.arg("--config").arg(config_path).arg("serve");
     command
 }
 

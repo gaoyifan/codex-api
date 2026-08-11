@@ -291,6 +291,7 @@ output_usd_per_million = "6.00"
         let mut child = Command::new(env!("CARGO_BIN_EXE_codex-api"))
             .arg("--config")
             .arg(&config_path)
+            .arg("serve")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)

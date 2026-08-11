@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 mod auth;
 mod chat;
+mod cli;
 mod config;
 mod credentials;
 mod error;
@@ -33,6 +34,11 @@ impl Clock for SystemClock {
     fn now(&self) -> time::OffsetDateTime {
         time::OffsetDateTime::now_utc()
     }
+}
+
+/// Parses and executes the `codex-api` command-line interface.
+pub async fn run_cli() -> anyhow::Result<()> {
+    cli::run().await
 }
 
 /// Starts the relay from a TOML configuration file.

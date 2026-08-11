@@ -243,6 +243,7 @@ output_usd_per_million = "6.00"
         command
             .arg("--config")
             .arg(&config_path)
+            .arg("serve")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

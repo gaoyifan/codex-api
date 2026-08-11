@@ -293,6 +293,7 @@ fn write_auth_seed(path: &Path, access_token: &str) {
 fn spawn_binary(args: &[&str]) -> Child {
     Command::new(binary())
         .args(args)
+        .env_remove("CODEX_API_CONFIG")
         .env_remove("RUST_LOG")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -350,7 +351,7 @@ async fn expect_startup_failure(args: &[&str]) -> CapturedOutput {
 
 async fn start_service(fixture: &Fixture) -> ServiceProcess {
     let config = fixture.config_path.to_str().expect("UTF-8 config path");
-    let mut child = spawn_binary(&["--config", config]);
+    let mut child = spawn_binary(&["--config", config, "serve"]);
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
         if tokio::net::TcpStream::connect(fixture.listen_address)
@@ -390,17 +391,21 @@ fn assert_error_mentions(output: &CapturedOutput, expected: &str) {
 }
 
 #[tokio::test]
-async fn cli_requires_an_explicit_config_path() {
-    let output = expect_startup_failure(&[]).await;
-    assert_error_mentions(&output, "--config");
+async fn cli_uses_the_system_default_config_path() {
+    let output = expect_startup_failure(&["serve"]).await;
+    assert_error_mentions(&output, "/etc/codex-api/config.toml");
 }
 
 #[tokio::test]
 async fn missing_configuration_file_fails_before_startup() {
     let directory = tempfile::tempdir().expect("create fixture directory");
     let missing = directory.path().join("does-not-exist.toml");
-    let output =
-        expect_startup_failure(&["--config", missing.to_str().expect("UTF-8 missing path")]).await;
+    let output = expect_startup_failure(&[
+        "--config",
+        missing.to_str().expect("UTF-8 missing path"),
+        "serve",
+    ])
+    .await;
     assert_error_mentions(&output, "config");
 }
 
@@ -462,6 +467,7 @@ async fn missing_required_configuration_fields_fail_before_listening() {
         let output = expect_startup_failure(&[
             "--config",
             fixture.config_path.to_str().expect("UTF-8 config path"),
+            "serve",
         ])
         .await;
         assert_error_mentions(&output, expected_error);
@@ -523,6 +529,7 @@ async fn unknown_fields_are_rejected_at_every_configuration_level() {
         let output = expect_startup_failure(&[
             "--config",
             fixture.config_path.to_str().expect("UTF-8 config path"),
+            "serve",
         ])
         .await;
         assert_error_mentions(&output, unknown_field);
@@ -560,6 +567,7 @@ async fn invalid_api_key_definitions_are_rejected() {
         let output = expect_startup_failure(&[
             "--config",
             fixture.config_path.to_str().expect("UTF-8 config path"),
+            "serve",
         ])
         .await;
         assert_error_mentions(&output, expected_error);
@@ -586,6 +594,7 @@ async fn api_key_secrets_with_ascii_whitespace_are_rejected_before_listening() {
         let output = expect_startup_failure(&[
             "--config",
             fixture.config_path.to_str().expect("UTF-8 config path"),
+            "serve",
         ])
         .await;
         assert_error_mentions(&output, "secret");
@@ -633,6 +642,7 @@ async fn invalid_decimal_prices_and_limits_are_rejected() {
         let output = expect_startup_failure(&[
             "--config",
             fixture.config_path.to_str().expect("UTF-8 config path"),
+            "serve",
         ])
         .await;
         assert!(
@@ -649,6 +659,7 @@ async fn unreadable_or_invalid_auth_seed_fails_before_listening() {
     let output = expect_startup_failure(&[
         "--config",
         fixture.config_path.to_str().expect("UTF-8 config path"),
+        "serve",
     ])
     .await;
     assert_error_mentions(&output, "auth");
@@ -658,6 +669,7 @@ async fn unreadable_or_invalid_auth_seed_fails_before_listening() {
     let output = expect_startup_failure(&[
         "--config",
         fixture.config_path.to_str().expect("UTF-8 config path"),
+        "serve",
     ])
     .await;
     assert_error_mentions(&output, "auth");
@@ -671,6 +683,7 @@ async fn unreadable_or_invalid_auth_seed_fails_before_listening() {
     let output = expect_startup_failure(&[
         "--config",
         fixture.config_path.to_str().expect("UTF-8 config path"),
+        "serve",
     ])
     .await;
     assert_error_mentions(&output, "auth");
@@ -692,6 +705,7 @@ async fn malformed_listen_address_and_uncreatable_sqlite_path_fail_startup() {
     let output = expect_startup_failure(&[
         "--config",
         fixture.config_path.to_str().expect("UTF-8 config path"),
+        "serve",
     ])
     .await;
     assert_error_mentions(&output, "listen");
@@ -710,6 +724,7 @@ async fn malformed_listen_address_and_uncreatable_sqlite_path_fail_startup() {
     let output = expect_startup_failure(&[
         "--config",
         fixture.config_path.to_str().expect("UTF-8 config path"),
+        "serve",
     ])
     .await;
     assert_error_mentions(&output, "sqlite");
@@ -727,6 +742,7 @@ async fn downstream_websockets_cannot_be_enabled_when_upstream_lacks_support() {
     let output = expect_startup_failure(&[
         "--config",
         fixture.config_path.to_str().expect("UTF-8 config path"),
+        "serve",
     ])
     .await;
     assert_error_mentions(&output, "websocket");
@@ -744,6 +760,7 @@ async fn startup_errors_and_logs_never_reveal_configured_secrets() {
     let output = expect_startup_failure(&[
         "--config",
         fixture.config_path.to_str().expect("UTF-8 config path"),
+        "serve",
     ])
     .await;
     let rendered = output.combined();
