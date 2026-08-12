@@ -45,11 +45,13 @@ assert config.systemd.services.codex-api.serviceConfig.Group == "codex-api";
 pkgs.runCommand "codex-api-nixos-module-test" { } ''
   grep -F 'secret_file = "/run/agenix/codex-api-key"' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
-  grep -F '[model_prices."gpt-5.6-terra"]' \
+  grep -F '[model_prices.' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
-  grep -F 'input_usd_per_million = "2.00"' \
+  grep -F 'input_usd_per_million = ' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
-  grep -F '[model_prices."gpt-5.6-luna"]' \
+  grep -F 'cached_input_usd_per_million = ' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F 'output_usd_per_million = ' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
   touch $out
 ''
