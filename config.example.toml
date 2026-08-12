@@ -20,6 +20,11 @@ weekly_limit_usd = "10.00"
 id = "unlimited-client"
 secret = "sk-local-change-this-too"
 
+[model_prices."gpt-5.6-terra"]
+input_usd_per_million = "2.00"
+cached_input_usd_per_million = "0.20"
+output_usd_per_million = "12.00"
+
 [model_prices."gpt-5.6-luna"]
 input_usd_per_million = "0.20"
 cached_input_usd_per_million = "0.02"

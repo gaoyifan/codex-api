@@ -25,11 +25,6 @@ let
                 secret_file = "/run/agenix/codex-api-key";
               }
             ];
-            model_prices.test = {
-              input_usd_per_million = "1.00";
-              cached_input_usd_per_million = "0.10";
-              output_usd_per_million = "6.00";
-            };
           };
         };
       }
@@ -49,6 +44,12 @@ assert config.systemd.services.codex-api.serviceConfig.User == "codex-api";
 assert config.systemd.services.codex-api.serviceConfig.Group == "codex-api";
 pkgs.runCommand "codex-api-nixos-module-test" { } ''
   grep -F 'secret_file = "/run/agenix/codex-api-key"' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F '[model_prices."gpt-5.6-terra"]' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F 'input_usd_per_million = "2.00"' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F '[model_prices."gpt-5.6-luna"]' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
   touch $out
 ''

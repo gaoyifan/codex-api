@@ -137,15 +137,14 @@ el2 host module under `~/nix/nixos/hosts/el2/` can use this shape:
         id = "client-a";
         secret_file = config.age.secrets.codex-api-key.path;
       }];
-      model_prices."gpt-5.6-luna" = {
-        input_usd_per_million = "0.20";
-        cached_input_usd_per_million = "0.02";
-        output_usd_per_million = "1.20";
-      };
     };
   };
 }
 ```
+
+The NixOS module supplies the current Standard short-context prices for the
+GPT-5.6 Sol, Terra, and Luna models by default. Set `settings.model_prices`
+only when overriding that table deliberately.
 
 If `user` or `group` is changed from `codex-api`, define that account outside
 this module and grant it read access to the configured secret files, plus write
