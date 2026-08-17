@@ -1,3 +1,7 @@
+# Optional. When a key's weekly soft limit is exhausted, rewrite every request
+# to this model until the hard limit is reached.
+fallback_model = "example-model"
+
 [server]
 listen = "127.0.0.1:8080"
 enable_websockets = true
@@ -15,6 +19,8 @@ supports_websockets = true
 id = "client-a"
 secret = "sk-local-change-me"
 weekly_limit_usd = "10.00"
+# Optional hard stop for limited keys. Defaults to "600.00".
+# hard_limit_usd = "600.00"
 
 [[api_keys]]
 id = "unlimited-client"

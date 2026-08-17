@@ -41,6 +41,7 @@ in
 
   config = lib.mkIf cfg.enable {
     # Standard short-context prices: https://developers.openai.com/api/docs/pricing
+    services.codex-api.settings.fallback_model = lib.mkDefault "gpt-5.6-luna";
     services.codex-api.settings.model_prices = lib.mkDefault {
       "gpt-5.6-sol" = {
         input_usd_per_million = "5.00";

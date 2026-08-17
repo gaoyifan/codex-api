@@ -9,10 +9,14 @@ use anyhow::{Context, anyhow, bail};
 use rust_decimal::Decimal;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, de};
+use serde_json::Value;
 use url::Url;
+
+use crate::store::ModelRates;
 
 const DEFAULT_UPSTREAM_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const DEFAULT_HARD_LIMIT_USD: &str = "600.00";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +24,8 @@ pub(crate) struct Config {
     pub(crate) server: ServerConfig,
     pub(crate) state: StateConfig,
     pub(crate) upstream: UpstreamConfig,
+    #[serde(default)]
+    pub(crate) fallback_model: Option<String>,
     pub(crate) api_keys: Vec<ApiKeyConfig>,
     pub(crate) model_prices: BTreeMap<String, ModelPrice>,
 }
@@ -61,6 +67,8 @@ pub(crate) struct ApiKeyConfig {
     pub(crate) id: String,
     pub(crate) secret: SecretString,
     pub(crate) weekly_limit_usd: Option<Decimal>,
+    /// Present only when `weekly_limit_usd` is set. Defaults to 600.00.
+    pub(crate) hard_limit_usd: Option<Decimal>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +79,8 @@ struct ApiKeyConfigInput {
     secret_file: Option<PathBuf>,
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
     weekly_limit_usd: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    hard_limit_usd: Option<Decimal>,
 }
 
 impl<'de> Deserialize<'de> for ApiKeyConfig {
@@ -107,10 +117,26 @@ impl<'de> Deserialize<'de> for ApiKeyConfig {
             }
         };
 
+        let hard_limit_usd = match (input.weekly_limit_usd, input.hard_limit_usd) {
+            (None, Some(_)) => {
+                return Err(de::Error::custom(
+                    "API key hard_limit_usd requires weekly_limit_usd",
+                ));
+            }
+            (None, None) => None,
+            (Some(_), Some(hard)) => Some(hard),
+            (Some(_), None) => Some(
+                DEFAULT_HARD_LIMIT_USD
+                    .parse()
+                    .expect("default hard limit is valid"),
+            ),
+        };
+
         Ok(Self {
             id: input.id,
             secret,
             weekly_limit_usd: input.weekly_limit_usd,
+            hard_limit_usd,
         })
     }
 }
@@ -122,6 +148,7 @@ impl fmt::Debug for ApiKeyConfig {
             .field("id", &self.id)
             .field("secret", &"[REDACTED]")
             .field("weekly_limit_usd", &self.weekly_limit_usd)
+            .field("hard_limit_usd", &self.hard_limit_usd)
             .finish()
     }
 }
@@ -199,6 +226,24 @@ impl Config {
             {
                 bail!("configuration API key weekly_limit_usd must be non-negative");
             }
+            if api_key
+                .hard_limit_usd
+                .is_some_and(|limit| limit < Decimal::ZERO)
+            {
+                bail!("configuration API key hard_limit_usd must be non-negative");
+            }
+            if let (Some(soft), Some(hard)) = (api_key.weekly_limit_usd, api_key.hard_limit_usd) {
+                if self.fallback_model.is_some() && hard <= soft {
+                    bail!(
+                        "configuration API key hard_limit_usd must be greater than weekly_limit_usd when fallback_model is set"
+                    );
+                }
+                if hard < soft {
+                    bail!(
+                        "configuration API key hard_limit_usd must be greater than or equal to weekly_limit_usd"
+                    );
+                }
+            }
         }
 
         if self.model_prices.is_empty() {
@@ -219,7 +264,43 @@ impl Config {
             }
         }
 
+        if let Some(fallback_model) = &self.fallback_model {
+            if fallback_model.is_empty() {
+                bail!("configuration fallback_model must not be empty");
+            }
+            if !self.model_prices.contains_key(fallback_model) {
+                bail!(
+                    "configuration fallback_model {fallback_model:?} is not present in model_prices"
+                );
+            }
+        }
+
         Ok(())
+    }
+
+    pub(crate) fn model_rates(&self, model: &str) -> Option<ModelRates> {
+        self.model_prices.get(model).map(|price| ModelRates {
+            input_usd_per_million: price.input_usd_per_million,
+            cached_input_usd_per_million: price.cached_input_usd_per_million,
+            output_usd_per_million: price.output_usd_per_million,
+        })
+    }
+
+    /// Rewrites `body.model` and `rates` to the configured fallback model.
+    /// Returns `false` if fallback is missing, unpriced, or `body` is not an object.
+    pub(crate) fn apply_fallback_model(&self, body: &mut Value, rates: &mut ModelRates) -> bool {
+        let Some(fallback) = self.fallback_model.as_deref() else {
+            return false;
+        };
+        let Some(fallback_rates) = self.model_rates(fallback) else {
+            return false;
+        };
+        let Some(object) = body.as_object_mut() else {
+            return false;
+        };
+        object.insert("model".to_owned(), Value::String(fallback.to_owned()));
+        *rates = fallback_rates;
+        true
     }
 }
 

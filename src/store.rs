@@ -91,6 +91,7 @@ pub(crate) struct RequestId(pub(crate) i64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Admission {
     Admitted(RequestId),
+    UseFallback(RequestId),
     WeeklyQuotaExceeded(RequestId),
 }
 
@@ -113,6 +114,21 @@ impl FinalStatus {
             Self::UpstreamError => "upstream_error",
             Self::Canceled => "canceled",
             Self::InternalError => "internal_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QuotaLimits {
+    pub(crate) weekly_limit_usd: Option<Decimal>,
+    pub(crate) hard_limit_usd: Option<Decimal>,
+}
+
+impl QuotaLimits {
+    pub(crate) fn unlimited() -> Self {
+        Self {
+            weekly_limit_usd: None,
+            hard_limit_usd: None,
         }
     }
 }
@@ -209,7 +225,8 @@ impl Store {
     pub(crate) async fn begin_request(
         &self,
         metadata: &RequestMetadata,
-        weekly_limit_usd: Option<Decimal>,
+        quota: QuotaLimits,
+        fallback_model: Option<&str>,
     ) -> Result<Admission, StoreError> {
         let now = self.clock.now().to_offset(UtcOffset::UTC);
         let requested_at_ms = timestamp_ms(now)?;
@@ -229,16 +246,12 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
 
-        let quota_exceeded = match weekly_limit_usd {
-            None => false,
-            Some(limit) => {
-                let limit_nano_usd = limit
-                    .checked_mul(Decimal::from(1_000_000_000_u64))
-                    .ok_or(StoreError::CostOutOfRange)?;
-                Decimal::from(spent_nano_usd) >= limit_nano_usd
-            }
-        };
-        let (status, finished_at_ms, duration_ms, http_status) = if quota_exceeded {
+        let spent = Decimal::from(spent_nano_usd);
+        let soft_exceeded = spend_meets_limit(spent, quota.weekly_limit_usd)?;
+        let hard_exceeded = spend_meets_limit(spent, quota.hard_limit_usd)?;
+        let rejected = hard_exceeded || (soft_exceeded && fallback_model.is_none());
+        let use_fallback = soft_exceeded && !rejected;
+        let (status, finished_at_ms, duration_ms, http_status) = if rejected {
             (
                 "rejected",
                 Some(requested_at_ms),
@@ -251,6 +264,11 @@ impl Store {
         } else {
             ("started", None, None, None)
         };
+        let effective_model = if use_fallback {
+            fallback_model.expect("fallback admission requires a fallback model")
+        } else {
+            metadata.model.as_str()
+        };
         let result = sqlx::query(
             "INSERT INTO request_ledger (requested_at_ms, finished_at_ms, api_key_id, model, \
                     reasoning_effort, api_protocol, transport, duration_ms, status, http_status) \
@@ -259,7 +277,7 @@ impl Store {
         .bind(requested_at_ms)
         .bind(finished_at_ms)
         .bind(&metadata.api_key_id)
-        .bind(&metadata.model)
+        .bind(effective_model)
         .bind(&metadata.reasoning_effort)
         .bind(metadata.api_protocol.as_str())
         .bind(metadata.transport.as_str())
@@ -269,8 +287,10 @@ impl Store {
         .execute(&self.pool)
         .await?;
         let request_id = RequestId(result.last_insert_rowid());
-        Ok(if quota_exceeded {
+        Ok(if rejected {
             Admission::WeeklyQuotaExceeded(request_id)
+        } else if use_fallback {
+            Admission::UseFallback(request_id)
         } else {
             Admission::Admitted(request_id)
         })
@@ -398,6 +418,21 @@ fn create_private_file(path: &Path) -> Result<(), StoreError> {
             Ok(())
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn spend_meets_limit(
+    spent_nano_usd: Decimal,
+    limit_usd: Option<Decimal>,
+) -> Result<bool, StoreError> {
+    match limit_usd {
+        None => Ok(false),
+        Some(limit) => {
+            let limit_nano_usd = limit
+                .checked_mul(Decimal::from(1_000_000_000_u64))
+                .ok_or(StoreError::CostOutOfRange)?;
+            Ok(spent_nano_usd >= limit_nano_usd)
+        }
     }
 }
 

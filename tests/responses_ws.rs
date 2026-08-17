@@ -35,6 +35,7 @@ const CLIENT_KEY: &str = "sk-local-client";
 const API_KEY_ID: &str = "client-a";
 const ACCOUNT_ID: &str = "account-test";
 const MODEL: &str = "gpt-5.6-luna";
+const FALLBACK_MODEL: &str = "gpt-5.6-fallback";
 const WS_BETA: &str = "responses_websockets=2026-02-06";
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TEST_TIMEOUT: Duration = Duration::from_secs(4);
@@ -404,6 +405,8 @@ struct RelayOptions {
     enable_websockets: bool,
     supports_websockets: bool,
     weekly_limit_usd: Option<&'static str>,
+    hard_limit_usd: Option<&'static str>,
+    fallback_model: Option<&'static str>,
     access_token: String,
     refresh_token: &'static str,
 }
@@ -414,6 +417,8 @@ impl RelayOptions {
             enable_websockets: true,
             supports_websockets: true,
             weekly_limit_usd: None,
+            hard_limit_usd: None,
+            fallback_model: None,
             access_token: jwt(json!({"exp": 4_102_444_800_u64})),
             refresh_token: "upstream-refresh-token",
         }
@@ -507,8 +512,29 @@ fn write_relay_files(upstream: &FakeUpstream, options: &RelayOptions) -> RelayFi
         .weekly_limit_usd
         .map(|limit| format!("weekly_limit_usd = \"{limit}\"\n"))
         .unwrap_or_default();
+    let hard_limit = options
+        .hard_limit_usd
+        .map(|limit| format!("hard_limit_usd = \"{limit}\"\n"))
+        .unwrap_or_default();
+    let fallback = options
+        .fallback_model
+        .map(|model| format!("fallback_model = \"{model}\"\n"))
+        .unwrap_or_default();
+    let fallback_prices = options
+        .fallback_model
+        .map(|model| {
+            format!(
+                r#"
+[model_prices."{model}"]
+input_usd_per_million = "0.10"
+cached_input_usd_per_million = "0.01"
+output_usd_per_million = "0.20"
+"#
+            )
+        })
+        .unwrap_or_default();
     let config = format!(
-        r#"[server]
+        r#"{fallback}[server]
 listen = "{listen_addr}"
 enable_websockets = {enable_websockets}
 
@@ -524,12 +550,12 @@ supports_websockets = {supports_websockets}
 [[api_keys]]
 id = "{api_key_id}"
 secret = "{client_key}"
-{weekly_limit}
+{weekly_limit}{hard_limit}
 [model_prices."{model}"]
 input_usd_per_million = "1.00"
 cached_input_usd_per_million = "0.10"
 output_usd_per_million = "6.00"
-"#,
+{fallback_prices}"#,
         enable_websockets = options.enable_websockets,
         database_path = database_path.display(),
         base_url = upstream.base_url(),
@@ -1674,6 +1700,117 @@ async fn quota_is_checked_per_operation_and_rejections_keep_the_socket_open() {
         ]
     );
     assert_eq!(upstream.connection_count(), 1);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn soft_quota_exhaustion_rewrites_websocket_creates_to_the_fallback_model() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            weekly_limit_usd: Some("0.000001"),
+            hard_limit_usd: Some("600.00"),
+            fallback_model: Some(FALLBACK_MODEL),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    send_json(&mut socket, &response_create("primary model", None)).await;
+    let first = upstream.expect_text(connection.id).await;
+    assert_eq!(first["model"], MODEL);
+    let first_terminal = response_completed("resp-primary", 1, 0, 0);
+    connection.send_json(first_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, first_terminal);
+
+    send_json(&mut socket, &response_create("should fall back", None)).await;
+    let second = upstream.expect_text(connection.id).await;
+    assert_eq!(second["model"], FALLBACK_MODEL);
+    let second_terminal = response_completed("resp-fallback", 1, 0, 0);
+    connection.send_json(second_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, second_terminal);
+
+    let options = SqliteConnectOptions::new().filename(&relay.database_path);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("open websocket fallback logs");
+    let models = sqlx::query("SELECT model FROM request_logs ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("read fallback models")
+        .into_iter()
+        .map(|row| row.get::<String, _>("model"))
+        .collect::<Vec<_>>();
+    assert_eq!(models, [MODEL.to_owned(), FALLBACK_MODEL.to_owned()]);
+
+    socket.close(None).await.expect("close downstream socket");
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_quota_exhaustion_rejects_websocket_creates_after_fallback() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            weekly_limit_usd: Some("0.000001"),
+            hard_limit_usd: Some("0.00000105"),
+            fallback_model: Some(FALLBACK_MODEL),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+
+    send_json(&mut socket, &response_create("primary model", None)).await;
+    let first = upstream.expect_text(connection.id).await;
+    assert_eq!(first["model"], MODEL);
+    let first_terminal = response_completed("resp-primary", 1, 0, 0);
+    connection.send_json(first_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, first_terminal);
+
+    send_json(&mut socket, &response_create("fallback once", None)).await;
+    let second = upstream.expect_text(connection.id).await;
+    assert_eq!(second["model"], FALLBACK_MODEL);
+    let second_terminal = response_completed("resp-fallback", 1, 0, 0);
+    connection.send_json(second_terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, second_terminal);
+
+    send_json(&mut socket, &response_create("hard stop", None)).await;
+    let error = receive_json(&mut socket).await;
+    assert_responses_error(&error, "weekly_quota_exceeded", None);
+
+    let rows = request_log_rows(&relay.database_path, 3).await;
+    assert_eq!(
+        rows,
+        vec![
+            ("completed".to_string(), "websocket".to_string(), true),
+            ("completed".to_string(), "websocket".to_string(), true),
+            ("rejected".to_string(), "websocket".to_string(), true),
+        ]
+    );
 
     socket.close(None).await.expect("close downstream socket");
     let _ = upstream.expect_close(connection.id).await;

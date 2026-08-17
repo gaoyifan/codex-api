@@ -24,7 +24,7 @@ use crate::{
     sse::{SseRead, SseReader},
     state::AppState,
     store::{
-        Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, RequestId, RequestMetadata,
+        Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, QuotaLimits, RequestMetadata,
         Transport,
     },
 };
@@ -51,7 +51,7 @@ pub(crate) async fn responses(
         .pointer("/reasoning/effort")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let rates = match model_rates(&state, &model) {
+    let mut rates = match state.config.model_rates(&model) {
         Some(rates) => rates,
         None => {
             reject_request(
@@ -66,7 +66,7 @@ pub(crate) async fn responses(
         }
     };
 
-    let upstream_body = match normalize_responses_request(parsed) {
+    let mut upstream_body = match normalize_responses_request(parsed) {
         Ok(body) => body,
         Err(error) => {
             reject_request(
@@ -80,7 +80,7 @@ pub(crate) async fn responses(
             return Err(error);
         }
     };
-    let request_id = admit_request(
+    let admission = admit_request(
         &state,
         &identity,
         model,
@@ -89,6 +89,19 @@ pub(crate) async fn responses(
         Transport::HttpSse,
     )
     .await?;
+    let request_id = match admission {
+        Admission::Admitted(request_id) => request_id,
+        Admission::UseFallback(request_id) => {
+            if !state
+                .config
+                .apply_fallback_model(&mut upstream_body, &mut rates)
+            {
+                return Err(ApiError::internal());
+            }
+            request_id
+        }
+        Admission::WeeklyQuotaExceeded(_) => unreachable!("quota rejection becomes an error"),
+    };
     let mut request = PendingRequest::new(
         Arc::clone(&state.store),
         request_id,
@@ -143,7 +156,7 @@ pub(crate) async fn chat_completions(
         .get("reasoning_effort")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if model_rates(&state, &tentative_model).is_none() {
+    if state.config.model_rates(&tentative_model).is_none() {
         reject_request(
             &state,
             &identity,
@@ -154,7 +167,7 @@ pub(crate) async fn chat_completions(
         .await?;
         return Err(ApiError::invalid("model", "model is not configured"));
     }
-    let converted = match chat::convert_request(parsed) {
+    let mut converted = match chat::convert_request(parsed) {
         Ok(converted) => converted,
         Err(error) => {
             reject_request(
@@ -171,16 +184,32 @@ pub(crate) async fn chat_completions(
             ));
         }
     };
-    let rates = model_rates(&state, &converted.model).expect("model was admitted above");
-    let request_id = admit_request(
+    let mut rates = state
+        .config
+        .model_rates(&converted.model)
+        .expect("model was admitted above");
+    let admission = admit_request(
         &state,
         &identity,
-        converted.model,
-        converted.reasoning_effort,
+        converted.model.clone(),
+        converted.reasoning_effort.clone(),
         ApiProtocol::ChatCompletions,
         Transport::HttpSse,
     )
     .await?;
+    let request_id = match admission {
+        Admission::Admitted(request_id) => request_id,
+        Admission::UseFallback(request_id) => {
+            if !state
+                .config
+                .apply_fallback_model(&mut converted.upstream_request, &mut rates)
+            {
+                return Err(ApiError::internal());
+            }
+            request_id
+        }
+        Admission::WeeklyQuotaExceeded(_) => unreachable!("quota rejection becomes an error"),
+    };
     let mut request = PendingRequest::new(
         Arc::clone(&state.store),
         request_id,
@@ -477,16 +506,13 @@ fn requested_string(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_owned)
 }
 
-fn model_rates(state: &AppState, model: &str) -> Option<ModelRates> {
-    state
-        .config
-        .model_prices
-        .get(model)
-        .map(|price| ModelRates {
-            input_usd_per_million: price.input_usd_per_million,
-            cached_input_usd_per_million: price.cached_input_usd_per_million,
-            output_usd_per_million: price.output_usd_per_million,
-        })
+fn billable_usage(usage: Usage, rates: ModelRates) -> BillableUsage {
+    BillableUsage {
+        input_tokens: usage.input_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        output_tokens: usage.output_tokens,
+        rates,
+    }
 }
 
 async fn admit_request(
@@ -496,7 +522,7 @@ async fn admit_request(
     reasoning_effort: Option<String>,
     api_protocol: ApiProtocol,
     transport: Transport,
-) -> Result<RequestId, ApiError> {
+) -> Result<Admission, ApiError> {
     let metadata = RequestMetadata {
         api_key_id: identity.id.clone(),
         model,
@@ -506,12 +532,16 @@ async fn admit_request(
     };
     match state
         .store
-        .begin_request(&metadata, identity.weekly_limit_usd)
+        .begin_request(
+            &metadata,
+            identity.quota,
+            state.config.fallback_model.as_deref(),
+        )
         .await
         .map_err(|_| ApiError::internal())?
     {
-        Admission::Admitted(request_id) => Ok(request_id),
         Admission::WeeklyQuotaExceeded(_) => Err(ApiError::quota_exceeded()),
+        admission => Ok(admission),
     }
 }
 
@@ -531,12 +561,14 @@ async fn reject_request(
     };
     let request_id = match state
         .store
-        .begin_request(&metadata, None)
+        .begin_request(&metadata, QuotaLimits::unlimited(), None)
         .await
         .map_err(|_| ApiError::internal())?
     {
         Admission::Admitted(request_id) => request_id,
-        Admission::WeeklyQuotaExceeded(_) => unreachable!("an unlimited ledger entry was rejected"),
+        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded(_) => {
+            unreachable!("an unlimited ledger entry was rejected")
+        }
     };
     state
         .store
@@ -593,11 +625,3 @@ async fn upstream_error_response(
         .map_err(|_| ApiError::internal())
 }
 
-fn billable_usage(usage: Usage, rates: ModelRates) -> BillableUsage {
-    BillableUsage {
-        input_tokens: usage.input_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        output_tokens: usage.output_tokens,
-        rates,
-    }
-}

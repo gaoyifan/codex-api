@@ -300,19 +300,23 @@ async fn quota_lists_every_configured_key_for_the_current_utc_week() {
         "API KEY",
         "SPENT USD",
         "LIMIT USD",
+        "HARD USD",
         "REMAINING USD",
         "STATUS",
         "client-a",
         "1.000000000",
         "blocked",
+        "599",
         "client-unlimited",
         "2.500000000",
         "unlimited",
         "client-available",
         "0.250000000",
         "available",
+        "599.75",
         "client-empty",
         "0.000000000",
+        "600",
     ] {
         assert!(
             stdout.contains(expected),
@@ -334,6 +338,50 @@ async fn quota_lists_every_configured_key_for_the_current_utc_week() {
     assert!(
         !stdout.contains("9.000000000"),
         "previous week leaked into quota:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn quota_reports_fallback_status_when_soft_limit_is_exhausted_with_fallback_model() {
+    let fixture = Fixture::new().await;
+    let config = std::fs::read_to_string(&fixture.config_path).expect("read CLI config");
+    std::fs::write(
+        &fixture.config_path,
+        format!("fallback_model = \"gpt-query\"\n{config}"),
+    )
+    .expect("enable fallback model for quota CLI");
+    let now = OffsetDateTime::now_utc();
+    let week_start = (now.date()
+        - Duration::days(i64::from(now.weekday().number_days_from_monday())))
+    .midnight()
+    .assume_utc();
+    let week_start_ms = week_start.unix_timestamp() * 1_000;
+    fixture
+        .execute(&format!(
+            "INSERT INTO request_ledger (requested_at_ms, api_key_id, model, api_protocol, \
+             transport, cost_nano_usd, status) VALUES \
+             ({}, 'client-available', 'gpt-query', 'responses', 'http_sse', 500000000, 'completed')",
+            week_start_ms + 1_000,
+        ))
+        .await;
+
+    let output = fixture
+        .command("quota")
+        .output()
+        .expect("run quota command");
+    assert!(
+        output.status.success(),
+        "quota failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 quota output");
+    assert!(
+        stdout.contains("fallback"),
+        "expected fallback status in:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("599.5"),
+        "expected remaining hard budget in:\n{stdout}"
     );
 }
 

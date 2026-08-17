@@ -55,9 +55,14 @@ input/cached-input/output tokens in thousands, exact USD cost, duration, and
 status. Null accounting values display as `—`.
 
 `quota` lists every configured API key in configuration order for the current
-UTC week beginning Monday at 00:00, including spend, limit, remaining amount,
-and `unlimited`, `available`, or `blocked` status. It sums non-null persisted
-cost values exactly; a limited key is blocked at or above its limit.
+UTC week beginning Monday at 00:00, including spend, soft limit, hard limit,
+remaining hard-limit headroom, and `unlimited`, `available`, `fallback`, or
+`blocked` status. It sums non-null persisted cost values exactly. A limited key
+is `available` below its soft limit, `fallback` between soft and hard when
+`fallback_model` is configured, and `blocked` at or above the hard limit (or at
+or above the soft limit when no `fallback_model` is configured). Remaining is
+always relative to the hard limit for limited keys (zero only when hard spend
+is exhausted).
 
 Both queries load configuration but open the existing SQLite database
 read-only. They do not create or migrate it, initialize ChatGPT credentials,
@@ -76,6 +81,8 @@ credential files.
 Configuration is read once at startup. Changes require a restart. Provide a redacted `config.example.toml` with this shape:
 
 ```toml
+fallback_model = "example-model" # optional; rewrite target after soft quota
+
 [server]
 listen = "127.0.0.1:8080"
 enable_websockets = true
@@ -92,7 +99,8 @@ supports_websockets = true
 [[api_keys]]
 id = "client-a"
 secret_file = "/run/agenix/codex-api-key"
-weekly_limit_usd = "10.00" # optional; omission means unlimited
+weekly_limit_usd = "10.00" # optional soft weekly limit; omission means unlimited
+# hard_limit_usd = "600.00" # optional; defaults to 600.00 when weekly_limit_usd is set
 
 [model_prices.example-model]
 input_usd_per_million = "1.00"
@@ -107,6 +115,8 @@ Configuration rules:
 - API key secrets remain in configuration or their referenced files and in
   memory only; never persist them to SQLite.
 - `model_prices` is also the model allowlist. Every request must name an exact configured model so every request log has a deterministic cost, including requests made with an unlimited key.
+- Optional top-level `fallback_model` must be non-empty and name a model present in `model_prices`. When a limited key's soft weekly spend is exhausted, requests are rewritten to this model until the hard weekly limit is reached.
+- Limited keys may set `hard_limit_usd` (default `600.00`, must be >= `weekly_limit_usd`). When `fallback_model` is set, hard must be strictly greater than soft so a fallback window exists. Unlimited keys must not set `hard_limit_usd`.
 - Money values are decimal strings and must be non-negative.
 - Reject unknown configuration fields so configuration typos fail before the server starts listening.
 - If downstream WebSockets are enabled while upstream WebSockets are unsupported, fail startup.
@@ -219,9 +229,10 @@ The weekly window begins Monday at 00:00 UTC. Attribute cost to the week in whic
 Admission behavior:
 
 - An unlimited key is always admitted after validation.
-- A limited key is admitted while committed current-week spend is strictly below its configured limit.
-- The admitted request may push the total over the limit.
-- Later requests receive an OpenAI-style HTTP `429` error with code `weekly_quota_exceeded`.
+- A limited key is admitted with the requested model while committed current-week spend is strictly below its soft `weekly_limit_usd`.
+- Once soft spend is exhausted, if `fallback_model` is configured and committed spend is still below `hard_limit_usd`, admit the request but rewrite the upstream model (and billing rates) to `fallback_model`. The ledger stores the effective model.
+- Once hard spend is exhausted, or soft spend is exhausted without a configured `fallback_model`, later requests receive an OpenAI-style HTTP `429` error with code `weekly_quota_exceeded`.
+- The admitted request may push the total over a limit.
 - Concurrent requests independently observe committed spend. Do not invent reservations based on unknown future token usage.
 - For an upgraded WebSocket, check quota before every `response.create`. A rejected operation receives a standard Responses `error` event and the connection stays open.
 - Charge any terminal response that reports usage, including incomplete or failed responses. Failed/error responses without reported usage have a null cost; completed and incomplete terminal responses must report usage. Once the relay receives an upstream terminal outcome, preserve that status and accounting even if the downstream disconnects before delivery; record `canceled` only while the upstream operation is still awaiting an outcome.
@@ -426,7 +437,7 @@ After the test suite is complete, sub-agents may implement separate config/state
 
 - `logs` defaults to the latest 20 rows in reverse ledger order and renders the documented compact columns and null markers
 - key, model, status, inclusive `since`, exclusive `until`, and positive limit filters work independently and together; invalid filters fail with actionable errors
-- `quota` lists all configured keys in order and reports exact current-UTC-week spend, limits, remaining amounts, and unlimited/available/blocked state
+- `quota` lists all configured keys in order and reports exact current-UTC-week spend, soft/hard limits, remaining hard-limit headroom, and unlimited/available/fallback/blocked state
 - both commands work while the relay owns a WAL database, make no network requests, do not initialize credentials, do not modify or create state, and never reveal secrets
 
 ### Downstream authentication

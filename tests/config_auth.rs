@@ -653,6 +653,61 @@ async fn invalid_decimal_prices_and_limits_are_rejected() {
 }
 
 #[tokio::test]
+async fn fallback_and_hard_limit_configuration_rules_are_enforced() {
+    let cases = [
+        (
+            "hard below soft",
+            "weekly_limit_usd = \"10.00\"",
+            "weekly_limit_usd = \"10.00\"\nhard_limit_usd = \"1.00\"",
+            "hard_limit_usd",
+        ),
+        (
+            "hard equals soft with fallback",
+            "[server]",
+            "fallback_model = \"test-model\"\n[server]",
+            "hard_limit_usd",
+        ),
+        (
+            "hard without soft",
+            "secret = \"sk-local-second-secret\"",
+            "secret = \"sk-local-second-secret\"\nhard_limit_usd = \"1.00\"",
+            "hard_limit_usd",
+        ),
+        (
+            "unknown fallback model",
+            "[server]",
+            "fallback_model = \"missing-model\"\n[server]",
+            "fallback_model",
+        ),
+    ];
+
+    for (name, old, new, expected_error) in cases {
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        let mut base = std::fs::read_to_string(&fixture.config_path).expect("read base config");
+        if name == "hard equals soft with fallback" {
+            // Default hard is 600; pin soft == hard with fallback present.
+            base = base.replacen(
+                "weekly_limit_usd = \"10.00\"",
+                "weekly_limit_usd = \"10.00\"\nhard_limit_usd = \"10.00\"",
+                1,
+            );
+        }
+        fixture.write_config(&base.replacen(old, new, 1));
+        let output = expect_startup_failure(&[
+            "--config",
+            fixture.config_path.to_str().expect("UTF-8 config path"),
+            "serve",
+        ])
+        .await;
+        assert!(
+            !output.status.success(),
+            "invalid fallback/hard-limit case {name} was accepted"
+        );
+        assert_error_mentions(&output, expected_error);
+    }
+}
+
+#[tokio::test]
 async fn unreadable_or_invalid_auth_seed_fails_before_listening() {
     let fixture = Fixture::new("http://127.0.0.1:9");
     std::fs::remove_file(&fixture.auth_path).expect("remove auth seed");

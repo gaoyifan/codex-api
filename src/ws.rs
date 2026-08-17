@@ -15,8 +15,8 @@ use crate::error::{ApiError, websocket_error};
 use crate::responses_terminal::{TerminalKind, parse_terminal_payload};
 use crate::state::AppState;
 use crate::store::{
-    Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, RequestId, RequestMetadata,
-    StoreError, Transport,
+    Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, QuotaLimits, RequestId,
+    RequestMetadata, StoreError, Transport,
 };
 use crate::upstream_ws::{UpstreamWebSocket, connect_upstream_websocket};
 
@@ -184,7 +184,7 @@ impl WsSession {
                     .await;
             }
         };
-        let prepared = match prepare_request(value, &self.state, &self.identity) {
+        let mut prepared = match prepare_request(value, &self.state, &self.identity) {
             Ok(prepared) => prepared,
             Err((value, validation)) => {
                 return self
@@ -203,7 +203,11 @@ impl WsSession {
         let admission = match self
             .state
             .store
-            .begin_request(&prepared.metadata, self.identity.weekly_limit_usd)
+            .begin_request(
+                &prepared.metadata,
+                self.identity.quota,
+                self.state.config.fallback_model.as_deref(),
+            )
             .await
         {
             Ok(admission) => admission,
@@ -211,6 +215,16 @@ impl WsSession {
         };
         let request_id = match admission {
             Admission::Admitted(request_id) => request_id,
+            Admission::UseFallback(request_id) => {
+                if !self
+                    .state
+                    .config
+                    .apply_fallback_model(&mut prepared.payload, &mut prepared.rates)
+                {
+                    return Some(ConnectionEnd::InternalFailure);
+                }
+                request_id
+            }
             Admission::WeeklyQuotaExceeded(_) => {
                 return self
                     .send_error(websocket_error(
@@ -460,14 +474,10 @@ fn prepare_request(
                 message: "response.create requires a model",
             })?
             .to_owned();
-        let price = state
-            .config
-            .model_prices
-            .get(&model)
-            .ok_or(ValidationError {
-                param: "model",
-                message: "The requested model is not configured",
-            })?;
+        let rates = state.config.model_rates(&model).ok_or(ValidationError {
+            param: "model",
+            message: "The requested model is not configured",
+        })?;
         if object.contains_key("stream") {
             return Err(ValidationError {
                 param: "stream",
@@ -501,11 +511,6 @@ fn prepare_request(
             .and_then(|reasoning| reasoning.get("effort"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let rates = ModelRates {
-            input_usd_per_million: price.input_usd_per_million,
-            cached_input_usd_per_million: price.cached_input_usd_per_million,
-            output_usd_per_million: price.output_usd_per_million,
-        };
         if let Some(Value::String(input)) = object.get("input") {
             object.insert(
                 "input".to_owned(),
@@ -557,14 +562,18 @@ async fn record_rejection(
         api_protocol: ApiProtocol::Responses,
         transport: Transport::WebSocket,
     };
-    match state.store.begin_request(&metadata, None).await? {
+    match state
+        .store
+        .begin_request(&metadata, QuotaLimits::unlimited(), None)
+        .await?
+    {
         Admission::Admitted(request_id) => {
             state
                 .store
                 .finalize_request(request_id, FinalStatus::Rejected, None, None)
                 .await
         }
-        Admission::WeeklyQuotaExceeded(_) => Ok(()),
+        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded(_) => Ok(()),
     }
 }
 

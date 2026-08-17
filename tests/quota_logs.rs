@@ -37,6 +37,7 @@ const PROMPT: &str = "prompt-content-must-not-be-stored";
 const OUTPUT_SENTINEL: &str = "output-content-must-not-be-stored";
 const RAW_ERROR_SENTINEL: &str = "raw-upstream-error-must-not-be-stored";
 const MODEL: &str = "gpt-test";
+const FALLBACK_MODEL: &str = "fallback-test";
 const ROUND_MODEL: &str = "round-test";
 const HIGH_VALUE_MODEL: &str = "high-value-test";
 const TEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -91,11 +92,13 @@ enum Reply {
 #[derive(Clone)]
 struct UpstreamState {
     replies: Arc<Mutex<VecDeque<Reply>>>,
+    received_models: Arc<Mutex<Vec<String>>>,
 }
 
 struct FakeUpstream {
     addr: SocketAddr,
     task: JoinHandle<()>,
+    received_models: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeUpstream {
@@ -104,21 +107,31 @@ impl FakeUpstream {
             .await
             .expect("bind fake upstream");
         let addr = listener.local_addr().expect("fake upstream address");
+        let received_models = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/responses", post(upstream_response))
             .with_state(UpstreamState {
                 replies: Arc::new(Mutex::new(replies.into())),
+                received_models: Arc::clone(&received_models),
             });
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
                 .expect("serve fake upstream");
         });
-        Self { addr, task }
+        Self {
+            addr,
+            task,
+            received_models,
+        }
     }
 
     fn base_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    async fn received_models(&self) -> Vec<String> {
+        self.received_models.lock().await.clone()
     }
 }
 
@@ -130,7 +143,8 @@ impl Drop for FakeUpstream {
 
 async fn upstream_response(State(state): State<UpstreamState>, body: Bytes) -> Response<Body> {
     let request: Value = serde_json::from_slice(&body).expect("relay sent upstream JSON");
-    let model = request["model"].as_str().unwrap_or(MODEL);
+    let model = request["model"].as_str().unwrap_or(MODEL).to_owned();
+    state.received_models.lock().await.push(model.clone());
     let reply = state
         .replies
         .lock()
@@ -142,12 +156,12 @@ async fn upstream_response(State(state): State<UpstreamState>, body: Bytes) -> R
             event,
             status,
             usage,
-        } => terminal_response(model, event, status, &usage),
+        } => terminal_response(&model, event, status, &usage),
         Reply::BarrierTerminal { barrier, usage } => {
             timeout(TEST_TIMEOUT, barrier.wait())
                 .await
                 .expect("two admitted requests did not reach upstream");
-            terminal_response(model, "response.completed", "completed", &usage)
+            terminal_response(&model, "response.completed", "completed", &usage)
         }
         Reply::GatedTerminal {
             reached,
@@ -159,7 +173,7 @@ async fn upstream_response(State(state): State<UpstreamState>, body: Bytes) -> R
                 "sequence_number": 0,
                 "response": {"id": "resp_gated", "status": "in_progress"}
             });
-            let terminal = terminal_sse(model, "response.completed", "completed", &usage);
+            let terminal = terminal_sse(&model, "response.completed", "completed", &usage);
             let stream = async_stream::stream! {
                 yield Ok::<Bytes, Infallible>(Bytes::from(format!(
                     "event: response.created\ndata: {created}\n\n"
@@ -247,10 +261,21 @@ struct Fixture {
     database_path: PathBuf,
     upstream_base_url: String,
     weekly_limit: Option<String>,
+    hard_limit: Option<String>,
+    fallback_model: Option<String>,
 }
 
 impl Fixture {
     fn new(upstream: &FakeUpstream, weekly_limit: Option<&str>) -> Self {
+        Self::with_limits(upstream, weekly_limit, None, None)
+    }
+
+    fn with_limits(
+        upstream: &FakeUpstream,
+        weekly_limit: Option<&str>,
+        hard_limit: Option<&str>,
+        fallback_model: Option<&str>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("create ledger fixture");
         let config_path = directory.path().join("config.toml");
         let auth_path = directory.path().join("auth.json");
@@ -278,6 +303,8 @@ impl Fixture {
             database_path,
             upstream_base_url: upstream.base_url(),
             weekly_limit: weekly_limit.map(str::to_owned),
+            hard_limit: hard_limit.map(str::to_owned),
+            fallback_model: fallback_model.map(str::to_owned),
         }
     }
 
@@ -287,8 +314,18 @@ impl Fixture {
             .as_ref()
             .map(|value| format!("weekly_limit_usd = \"{value}\"\n"))
             .unwrap_or_default();
+        let hard = self
+            .hard_limit
+            .as_ref()
+            .map(|value| format!("hard_limit_usd = \"{value}\"\n"))
+            .unwrap_or_default();
+        let fallback = self
+            .fallback_model
+            .as_ref()
+            .map(|value| format!("fallback_model = \"{value}\"\n"))
+            .unwrap_or_default();
         let config = format!(
-            r#"[server]
+            r#"{fallback}[server]
 listen = "{listen}"
 enable_websockets = false
 
@@ -304,11 +341,16 @@ supports_websockets = false
 [[api_keys]]
 id = "{API_KEY_ID}"
 secret = "{api_key}"
-{limit}
+{limit}{hard}
 [model_prices."{MODEL}"]
 input_usd_per_million = "2.00"
 cached_input_usd_per_million = "0.50"
 output_usd_per_million = "4.00"
+
+[model_prices."{FALLBACK_MODEL}"]
+input_usd_per_million = "0.10"
+cached_input_usd_per_million = "0.01"
+output_usd_per_million = "0.20"
 
 [model_prices."{ROUND_MODEL}"]
 input_usd_per_million = "0.0005"
@@ -910,4 +952,152 @@ async fn backward_wall_clock_does_not_break_terminal_accounting_or_make_duration
         .expect("read finalized request log");
     assert_eq!(row.get::<String, _>("status"), "completed");
     assert_eq!(row.get::<i64, _>("duration_ms"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn soft_quota_exhaustion_rewrites_requests_to_the_fallback_model() {
+    let usage = Usage {
+        input: 1,
+        cached: 0,
+        output: 0,
+    };
+    let upstream = FakeUpstream::start(vec![
+        Reply::Terminal {
+            event: "response.completed",
+            status: "completed",
+            usage: usage.clone(),
+        },
+        Reply::Terminal {
+            event: "response.completed",
+            status: "completed",
+            usage,
+        },
+    ])
+    .await;
+    let fixture = Fixture::with_limits(
+        &upstream,
+        Some("0.000001"),
+        Some("600.00"),
+        Some(FALLBACK_MODEL),
+    );
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+
+    assert_eq!(
+        post_response(&relay, API_KEY, MODEL, json!(true)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_response(&relay, API_KEY, MODEL, json!(true)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        upstream.received_models().await,
+        vec![MODEL.to_owned(), FALLBACK_MODEL.to_owned()]
+    );
+
+    let mut database = open_database(&relay.database_path).await;
+    let rows = sqlx::query("SELECT model, cost_usd, status FROM request_logs ORDER BY id")
+        .fetch_all(&mut database)
+        .await
+        .expect("read fallback request logs");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<String, _>("model"), MODEL);
+    assert_eq!(rows[0].get::<String, _>("cost_usd"), "0.000002000");
+    assert_eq!(rows[0].get::<String, _>("status"), "completed");
+    assert_eq!(rows[1].get::<String, _>("model"), FALLBACK_MODEL);
+    assert_eq!(rows[1].get::<String, _>("cost_usd"), "0.000000100");
+    assert_eq!(rows[1].get::<String, _>("status"), "completed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_quota_exhaustion_rejects_after_fallback_spend() {
+    let usage = Usage {
+        input: 1,
+        cached: 0,
+        output: 0,
+    };
+    let upstream = FakeUpstream::start(vec![
+        Reply::Terminal {
+            event: "response.completed",
+            status: "completed",
+            usage: usage.clone(),
+        },
+        Reply::Terminal {
+            event: "response.completed",
+            status: "completed",
+            usage,
+        },
+    ])
+    .await;
+    let fixture = Fixture::with_limits(
+        &upstream,
+        Some("0.000001"),
+        Some("0.00000205"),
+        Some(FALLBACK_MODEL),
+    );
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+
+    assert_eq!(
+        post_response(&relay, API_KEY, MODEL, json!(true)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_response(&relay, API_KEY, MODEL, json!(true)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_response(&relay, API_KEY, MODEL, json!(true)).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        upstream.received_models().await,
+        vec![MODEL.to_owned(), FALLBACK_MODEL.to_owned()]
+    );
+
+    let mut database = open_database(&relay.database_path).await;
+    let statuses = sqlx::query("SELECT status FROM request_logs ORDER BY id")
+        .fetch_all(&mut database)
+        .await
+        .expect("read hard-quota statuses")
+        .into_iter()
+        .map(|row| row.get::<String, _>("status"))
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["completed", "completed", "rejected"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn soft_quota_without_fallback_model_rejects_like_before() {
+    let usage = Usage {
+        input: 1,
+        cached: 0,
+        output: 0,
+    };
+    let upstream = FakeUpstream::start(vec![Reply::Terminal {
+        event: "response.completed",
+        status: "completed",
+        usage,
+    }])
+    .await;
+    let fixture = Fixture::with_limits(&upstream, Some("0.000001"), Some("600.00"), None);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+
+    assert_eq!(
+        post_response(&relay, API_KEY, MODEL, json!(true)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_response(&relay, API_KEY, MODEL, json!(true)).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(upstream.received_models().await, vec![MODEL.to_owned()]);
+
+    let mut database = open_database(&relay.database_path).await;
+    let statuses = sqlx::query("SELECT status FROM request_logs ORDER BY id")
+        .fetch_all(&mut database)
+        .await
+        .expect("read soft-without-fallback statuses")
+        .into_iter()
+        .map(|row| row.get::<String, _>("status"))
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["completed", "rejected"]);
 }

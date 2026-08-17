@@ -1,14 +1,17 @@
 use axum::http::{HeaderMap, header::AUTHORIZATION};
-use rust_decimal::Decimal;
 use secrecy::ExposeSecret;
 use subtle::ConstantTimeEq;
 
-use crate::{config::Config, error::ApiError};
+use crate::{
+    config::Config,
+    error::ApiError,
+    store::QuotaLimits,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClientIdentity {
     pub(crate) id: String,
-    pub(crate) weekly_limit_usd: Option<Decimal>,
+    pub(crate) quota: QuotaLimits,
 }
 
 pub(crate) fn authenticate(
@@ -38,7 +41,10 @@ pub(crate) fn authenticate(
     matched
         .map(|candidate| ClientIdentity {
             id: candidate.id.clone(),
-            weekly_limit_usd: candidate.weekly_limit_usd,
+            quota: QuotaLimits {
+                weekly_limit_usd: candidate.weekly_limit_usd,
+                hard_limit_usd: candidate.hard_limit_usd,
+            },
         })
         .ok_or_else(ApiError::invalid_api_key)
 }

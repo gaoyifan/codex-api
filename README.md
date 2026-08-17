@@ -87,6 +87,10 @@ See [config.example.toml](config.example.toml). Important rules:
 - Decimal prices and limits must be quoted strings and non-negative.
 - `model_prices` is the exact model allowlist.
 - Omitting `weekly_limit_usd` makes a key unlimited.
+- Limited keys get a weekly soft limit (`weekly_limit_usd`) and a hard limit
+  (`hard_limit_usd`, default `600.00`). When soft spend is exhausted and
+  `fallback_model` is set, requests are rewritten to that model until hard
+  spend is reached. Without `fallback_model`, soft exhaustion rejects as before.
 - Enabling downstream WebSockets requires `upstream.supports_websockets = true`.
 - Unknown fields fail startup, which makes configuration typos visible.
 
@@ -206,9 +210,13 @@ request to one nano-USD:
 ```
 
 Rates are USD per million tokens. A limited key is admitted while committed
-spend in the current Monday 00:00 UTC window is below its limit. An admitted
-request may cross the limit; later operations receive
-`weekly_quota_exceeded`. Concurrent requests observe committed spend only.
+spend in the current Monday 00:00 UTC window is below its soft
+`weekly_limit_usd`. Once soft spend is exhausted, if `fallback_model` is
+configured, later requests are rewritten to that model and billed at its rates
+until committed spend reaches `hard_limit_usd` (default `600.00`). Past the hard
+limit, or past the soft limit when no fallback model is configured, operations
+receive `weekly_quota_exceeded`. An admitted request may cross a limit;
+concurrent requests observe committed spend only.
 
 The stable read-only SQLite view `request_logs` contains request metadata,
 tokens, cost, duration, and status. It never contains prompts, outputs, API key
@@ -256,8 +264,9 @@ transport, input/cached-input/output tokens in thousands, exact USD cost,
 duration, and status. Missing accounting values are shown as `—`.
 
 `quota` prints every configured API key in configuration order for the current
-UTC week, beginning Monday at 00:00. It shows exact spend, configured limit,
-remaining allowance, and `unlimited`, `available`, or `blocked` status:
+UTC week, beginning Monday at 00:00. It shows exact spend, soft limit, hard
+limit, remaining hard-limit headroom, and `unlimited`, `available`, `fallback`,
+or `blocked` status:
 
 ```bash
 codex-api quota
