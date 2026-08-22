@@ -217,16 +217,12 @@ impl WsSession {
         let request_id = match admission {
             Admission::Admitted(request_id) => request_id,
             Admission::UseFallback(request_id) => {
-                if !self
-                    .state
+                self.state
                     .config
-                    .apply_fallback_model(&mut prepared.payload, &mut prepared.rates)
-                {
-                    return Some(ConnectionEnd::InternalFailure);
-                }
+                    .apply_fallback_model(&mut prepared.payload, &mut prepared.rates);
                 request_id
             }
-            Admission::WeeklyQuotaExceeded(_) => {
+            Admission::WeeklyQuotaExceeded => {
                 return self
                     .send_error(websocket_error(
                         "weekly_quota_exceeded",
@@ -574,7 +570,7 @@ async fn record_rejection(
                 .finalize_request(request_id, FinalStatus::Rejected, None, None)
                 .await
         }
-        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded(_) => Ok(()),
+        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded => Ok(()),
     }
 }
 

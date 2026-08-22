@@ -92,15 +92,12 @@ pub(crate) async fn responses(
     let request_id = match admission {
         Admission::Admitted(request_id) => request_id,
         Admission::UseFallback(request_id) => {
-            if !state
+            state
                 .config
-                .apply_fallback_model(&mut upstream_body, &mut rates)
-            {
-                return Err(ApiError::internal());
-            }
+                .apply_fallback_model(&mut upstream_body, &mut rates);
             request_id
         }
-        Admission::WeeklyQuotaExceeded(_) => unreachable!("quota rejection becomes an error"),
+        Admission::WeeklyQuotaExceeded => unreachable!("quota rejection becomes an error"),
     };
     let mut request = PendingRequest::new(
         Arc::clone(&state.store),
@@ -200,15 +197,12 @@ pub(crate) async fn chat_completions(
     let request_id = match admission {
         Admission::Admitted(request_id) => request_id,
         Admission::UseFallback(request_id) => {
-            if !state
+            state
                 .config
-                .apply_fallback_model(&mut converted.upstream_request, &mut rates)
-            {
-                return Err(ApiError::internal());
-            }
+                .apply_fallback_model(&mut converted.upstream_request, &mut rates);
             request_id
         }
-        Admission::WeeklyQuotaExceeded(_) => unreachable!("quota rejection becomes an error"),
+        Admission::WeeklyQuotaExceeded => unreachable!("quota rejection becomes an error"),
     };
     let mut request = PendingRequest::new(
         Arc::clone(&state.store),
@@ -668,7 +662,7 @@ async fn admit_request(
         .await
         .map_err(|_| ApiError::internal())?
     {
-        Admission::WeeklyQuotaExceeded(_) => Err(ApiError::quota_exceeded()),
+        Admission::WeeklyQuotaExceeded => Err(ApiError::quota_exceeded()),
         admission => Ok(admission),
     }
 }
@@ -694,7 +688,7 @@ async fn reject_request(
         .map_err(|_| ApiError::internal())?
     {
         Admission::Admitted(request_id) => request_id,
-        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded(_) => {
+        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded => {
             unreachable!("an unlimited ledger entry was rejected")
         }
     };

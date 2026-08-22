@@ -92,7 +92,7 @@ pub(crate) struct RequestId(pub(crate) i64);
 pub(crate) enum Admission {
     Admitted(RequestId),
     UseFallback(RequestId),
-    WeeklyQuotaExceeded(RequestId),
+    WeeklyQuotaExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,7 +288,7 @@ impl Store {
         .await?;
         let request_id = RequestId(result.last_insert_rowid());
         Ok(if rejected {
-            Admission::WeeklyQuotaExceeded(request_id)
+            Admission::WeeklyQuotaExceeded
         } else if use_fallback {
             Admission::UseFallback(request_id)
         } else {

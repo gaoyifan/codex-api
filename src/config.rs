@@ -286,21 +286,19 @@ impl Config {
         })
     }
 
-    /// Rewrites `body.model` and `rates` to the configured fallback model.
-    /// Returns `false` if fallback is missing, unpriced, or `body` is not an object.
-    pub(crate) fn apply_fallback_model(&self, body: &mut Value, rates: &mut ModelRates) -> bool {
-        let Some(fallback) = self.fallback_model.as_deref() else {
-            return false;
-        };
-        let Some(fallback_rates) = self.model_rates(fallback) else {
-            return false;
-        };
-        let Some(object) = body.as_object_mut() else {
-            return false;
-        };
+    pub(crate) fn apply_fallback_model(&self, body: &mut Value, rates: &mut ModelRates) {
+        let fallback = self
+            .fallback_model
+            .as_deref()
+            .expect("fallback admission requires a configured fallback model");
+        let fallback_rates = self
+            .model_rates(fallback)
+            .expect("configured fallback model must have prices");
+        let object = body
+            .as_object_mut()
+            .expect("validated upstream request must be an object");
         object.insert("model".to_owned(), Value::String(fallback.to_owned()));
         *rates = fallback_rates;
-        true
     }
 }
 
