@@ -3,7 +3,7 @@ use std::{convert::Infallible, sync::Arc};
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
@@ -25,10 +25,81 @@ use crate::{
     sse::{SseRead, SseReader},
     state::AppState,
     store::{
-        Admission, ApiProtocol, BillableUsage, EffectiveModel, FinalStatus, ModelCandidates,
-        ModelRates, RequestContext, RequestId, Transport,
+        Admission, ApiProtocol, BillableUsage, EffectiveModel, FinalStatus, ModelAccess,
+        ModelCandidates, ModelRates, RequestContext, RequestId, Transport,
     },
 };
+
+pub(crate) async fn models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let identity = authenticate(&headers, &state.config)?;
+    let data = available_models(&state, &identity).await?;
+    Ok(Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+    })))
+}
+
+pub(crate) async fn model(
+    State(state): State<Arc<AppState>>,
+    Path(model): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let identity = authenticate(&headers, &state.config)?;
+    available_models(&state, &identity)
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(model.as_str()))
+        .map(Json)
+        .ok_or_else(|| ApiError::model_not_found(&model))
+}
+
+async fn available_models(
+    state: &AppState,
+    identity: &ClientIdentity,
+) -> Result<Vec<Value>, ApiError> {
+    let access = state
+        .store
+        .model_access(
+            &identity.id,
+            identity.quota,
+            state.config.fallback_model.is_some(),
+        )
+        .await
+        .map_err(|_| ApiError::internal())?;
+    if access == ModelAccess::Blocked {
+        return Ok(Vec::new());
+    }
+
+    let upstream_models = tokio::select! {
+        biased;
+        _ = state.shutdown.cancelled() => return Err(ApiError::shutdown()),
+        result = state.upstream_http.models() => {
+            result.map_err(|_| ApiError::gateway("Upstream models request failed"))?
+        }
+    };
+    let fallback_model = state.config.fallback_model.as_deref();
+    Ok(upstream_models
+        .into_iter()
+        .filter_map(|model| {
+            let mut object = model.as_object()?.clone();
+            let slug = object.get("slug")?.as_str()?.to_owned();
+            if object.get("visibility").and_then(Value::as_str) != Some("list")
+                || !state.config.model_prices.contains_key(&slug)
+                || (access == ModelAccess::FallbackOnly && fallback_model != Some(slug.as_str()))
+            {
+                return None;
+            }
+            object.insert("id".to_owned(), Value::String(slug));
+            object.insert("object".to_owned(), Value::String("model".to_owned()));
+            object.insert("created".to_owned(), Value::from(0));
+            object.insert("owned_by".to_owned(), Value::String("openai".to_owned()));
+            Some(Value::Object(object))
+        })
+        .collect())
+}
 
 pub(crate) async fn responses(
     State(state): State<Arc<AppState>>,

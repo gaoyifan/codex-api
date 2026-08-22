@@ -95,6 +95,13 @@ pub(crate) enum Admission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ModelAccess {
+    All,
+    FallbackOnly,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FinalStatus {
     Completed,
     Incomplete,
@@ -231,23 +238,9 @@ impl Store {
     ) -> Result<Admission, StoreError> {
         let now = self.clock.now().to_offset(UtcOffset::UTC);
         let requested_at_ms = timestamp_ms(now)?;
-        let week_start_ms = timestamp_ms(monday_start(now))?;
-        let next_week_ms = week_start_ms
-            .checked_add(604_800_000)
-            .ok_or(StoreError::TimestampOutOfRange)?;
-
-        let spent_nano_usd: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(cost_nano_usd), 0) FROM request_ledger \
-             WHERE api_key_id = ? AND cost_nano_usd IS NOT NULL \
-               AND requested_at_ms >= ? AND requested_at_ms < ?",
-        )
-        .bind(&context.api_key_id)
-        .bind(week_start_ms)
-        .bind(next_week_ms)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let spent = Decimal::from(spent_nano_usd);
+        let spent = self
+            .current_week_spend_nano_usd(&context.api_key_id, now)
+            .await?;
         let soft_exceeded = spend_meets_limit(spent, quota.weekly_limit_usd)?;
         let hard_exceeded = spend_meets_limit(spent, quota.hard_limit_usd)?;
         let rejected = hard_exceeded || (soft_exceeded && candidates.fallback.is_none());
@@ -298,6 +291,54 @@ impl Store {
                 effective_model,
             }
         })
+    }
+
+    pub(crate) async fn model_access(
+        &self,
+        api_key_id: &str,
+        quota: QuotaLimits,
+        has_fallback: bool,
+    ) -> Result<ModelAccess, StoreError> {
+        if quota.weekly_limit_usd.is_none() {
+            return Ok(ModelAccess::All);
+        }
+
+        let spent = self
+            .current_week_spend_nano_usd(api_key_id, self.clock.now())
+            .await?;
+        if spend_meets_limit(spent, quota.hard_limit_usd)? {
+            return Ok(ModelAccess::Blocked);
+        }
+        if spend_meets_limit(spent, quota.weekly_limit_usd)? {
+            return Ok(if has_fallback {
+                ModelAccess::FallbackOnly
+            } else {
+                ModelAccess::Blocked
+            });
+        }
+        Ok(ModelAccess::All)
+    }
+
+    async fn current_week_spend_nano_usd(
+        &self,
+        api_key_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Decimal, StoreError> {
+        let week_start_ms = timestamp_ms(monday_start(now))?;
+        let next_week_ms = week_start_ms
+            .checked_add(604_800_000)
+            .ok_or(StoreError::TimestampOutOfRange)?;
+        let spent_nano_usd: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_nano_usd), 0) FROM request_ledger \
+             WHERE api_key_id = ? AND cost_nano_usd IS NOT NULL \
+               AND requested_at_ms >= ? AND requested_at_ms < ?",
+        )
+        .bind(api_key_id)
+        .bind(week_start_ms)
+        .bind(next_week_ms)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Decimal::from(spent_nano_usd))
     }
 
     pub(crate) async fn record_rejection(

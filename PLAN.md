@@ -554,4 +554,4 @@ Deliver:
 - README with configuration, explicit serve and query commands, API examples, quota semantics, request-log schema, and live-test command
 - `.gitignore` excluding credentials, SQLite databases, WAL/SHM files, and build output
 
-Do not add TLS termination, Docker packaging, configuration reload, registration/login, management APIs, `/v1/models`, multi-account scheduling, log cleanup, speculative retries, feature flags, compatibility layers, or other unrequested protocol coverage in v1.
+Do not add TLS termination, Docker packaging, configuration reload, registration/login, management APIs, multi-account scheduling, log cleanup, speculative retries, feature flags, compatibility layers, or other unrequested protocol coverage in v1.

@@ -2,7 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::{Router, routing::post};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing_subscriber::EnvFilter;
@@ -71,7 +74,7 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
             &config.upstream.auth_file,
             config.upstream.oauth_token_url.clone(),
             http_client.clone(),
-            clock,
+            Arc::clone(&clock),
         )
         .await
         .context("failed to initialize ChatGPT authentication")?,
@@ -80,6 +83,7 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
         http_client,
         &config.upstream.base_url,
         Arc::clone(&credentials),
+        clock,
     );
     let shutdown = CancellationToken::new();
     let pending_requests = TaskTracker::new();
@@ -102,6 +106,8 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
     let router = Router::new()
         .route("/v1/responses", responses)
         .route("/v1/chat/completions", post(http_api::chat_completions))
+        .route("/v1/models", get(http_api::models))
+        .route("/v1/models/{model}", get(http_api::model))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await

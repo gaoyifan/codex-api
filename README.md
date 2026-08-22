@@ -5,8 +5,8 @@ exposes a deliberately limited OpenAI-compatible API, uses static downstream
 Bearer keys from TOML, and keeps credentials, request accounting, and weekly
 quota state in SQLite.
 
-It does not provide registration, login, user management, billing, model
-discovery, a management UI, multi-account scheduling, or transport fallbacks.
+It does not provide registration, login, user management, billing, a
+management UI, multi-account scheduling, or transport fallbacks.
 
 ## Public API
 
@@ -20,12 +20,23 @@ discovery, a management UI, multi-account scheduling, or transport fallbacks.
 - `GET /v1/responses` with WebSocket Upgrade is available when both WebSocket
   configuration switches are enabled. Each downstream socket owns exactly one
   upstream socket and supports sequential `response.create` operations.
+- `GET /v1/models` and `GET /v1/models/{model}` expose the currently usable
+  Codex models in OpenAI-compatible shapes. Codex metadata such as
+  `context_window` is retained on each model object.
 
 All endpoints require:
 
 ```text
 Authorization: Bearer <configured-static-key>
 ```
+
+The models endpoint fetches the authenticated Codex catalog and caches a
+successful result in memory for one hour. It returns only upstream models with
+`visibility = "list"` that also have a local `model_prices` entry. A key below
+its soft limit sees that full intersection; a key in fallback state sees only
+`fallback_model`; a blocked key sees an empty list. Models queries do not write
+request logs or consume quota. An unavailable single model returns
+`model_not_found`.
 
 HTTP Responses and Chat requests always use upstream HTTP/SSE. Downstream
 WebSockets always use an upstream WebSocket; the service never bridges or falls
@@ -88,7 +99,9 @@ See [config.example.toml](config.example.toml). Important rules:
 - API key IDs and resolved secrets must be non-empty and unique. Set exactly
   one of `secret` or `secret_file` for each key.
 - Decimal prices and limits must be quoted strings and non-negative.
-- `model_prices` is the exact model allowlist.
+- `model_prices` supplies deterministic billing rates and bounds the models
+  this relay may expose or forward. The models API additionally requires the
+  model to be visible in the live Codex catalog.
 - A model's optional `max_reasoning_effort` caps higher requested levels after
   fallback selection; logs record the effective model and level.
 - Omitting `weekly_limit_usd` makes a key unlimited.
@@ -206,7 +219,8 @@ close the socket with code 1003.
 
 ## Accounting and weekly limits
 
-Every authenticated operation gets a ledger row. Invalid API keys do not.
+Every authenticated generation operation gets a ledger row. Models queries and
+invalid API keys do not.
 Prices are calculated with decimal arithmetic, then rounded half-up once per
 request to one nano-USD:
 

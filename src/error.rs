@@ -45,6 +45,16 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn model_not_found(model: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error_type: "invalid_request_error",
+            code: "model_not_found",
+            param: Some("model".to_owned()),
+            message: format!("The model {model:?} does not exist or is not available"),
+        }
+    }
+
     pub(crate) fn gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
