@@ -42,21 +42,21 @@ in
   config = lib.mkIf cfg.enable {
     # Standard short-context prices: https://developers.openai.com/api/docs/pricing
     services.codex-api.settings.fallback_model = lib.mkDefault "gpt-5.6-luna";
-    services.codex-api.settings.model_prices = lib.mkDefault {
+    services.codex-api.settings.model_prices = {
       "gpt-5.6-sol" = {
-        input_usd_per_million = "5.00";
-        cached_input_usd_per_million = "0.50";
-        output_usd_per_million = "30.00";
+        input_usd_per_million = lib.mkDefault "5.00";
+        cached_input_usd_per_million = lib.mkDefault "0.50";
+        output_usd_per_million = lib.mkDefault "30.00";
       };
       "gpt-5.6-terra" = {
-        input_usd_per_million = "2.00";
-        cached_input_usd_per_million = "0.20";
-        output_usd_per_million = "12.00";
+        input_usd_per_million = lib.mkDefault "2.00";
+        cached_input_usd_per_million = lib.mkDefault "0.20";
+        output_usd_per_million = lib.mkDefault "12.00";
       };
       "gpt-5.6-luna" = {
-        input_usd_per_million = "0.20";
-        cached_input_usd_per_million = "0.02";
-        output_usd_per_million = "1.20";
+        input_usd_per_million = lib.mkDefault "0.20";
+        cached_input_usd_per_million = lib.mkDefault "0.02";
+        output_usd_per_million = lib.mkDefault "1.20";
       };
     };
 

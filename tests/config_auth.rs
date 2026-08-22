@@ -606,7 +606,7 @@ async fn api_key_secrets_with_ascii_whitespace_are_rejected_before_listening() {
 }
 
 #[tokio::test]
-async fn invalid_decimal_prices_and_limits_are_rejected() {
+async fn invalid_prices_and_limits_are_rejected() {
     let cases = [
         (
             "negative weekly limit",
@@ -633,6 +633,11 @@ async fn invalid_decimal_prices_and_limits_are_rejected() {
             "output_usd_per_million = \"6.00\"",
             "output_usd_per_million = 6.00",
         ),
+        (
+            "invalid reasoning effort limit",
+            "output_usd_per_million = \"6.00\"",
+            "output_usd_per_million = \"6.00\"\nmax_reasoning_effort = \"extreme\"",
+        ),
     ];
 
     for (name, old, new) in cases {
@@ -647,7 +652,7 @@ async fn invalid_decimal_prices_and_limits_are_rejected() {
         .await;
         assert!(
             !output.status.success(),
-            "invalid money case {name} was accepted"
+            "invalid configuration case {name} was accepted"
         );
     }
 }

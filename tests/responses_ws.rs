@@ -555,6 +555,7 @@ secret = "{client_key}"
 input_usd_per_million = "1.00"
 cached_input_usd_per_million = "0.10"
 output_usd_per_million = "6.00"
+max_reasoning_effort = "high"
 {fallback_prices}"#,
         enable_websockets = options.enable_websockets,
         database_path = database_path.display(),
@@ -1760,16 +1761,21 @@ async fn soft_quota_exhaustion_rewrites_websocket_creates_to_the_fallback_model(
     let _ = upstream.expect_handshake().await;
     let connection = upstream.expect_connection().await;
 
-    send_json(&mut socket, &response_create("primary model", None)).await;
+    let mut request = response_create("primary model", None);
+    request["reasoning"]["effort"] = json!("ultra");
+    send_json(&mut socket, &request).await;
     let first = upstream.expect_text(connection.id).await;
     assert_eq!(first["model"], MODEL);
+    assert_eq!(first["reasoning"]["effort"], "high");
     let first_terminal = response_completed("resp-primary", 1, 0, 0);
     connection.send_json(first_terminal.clone());
     assert_eq!(receive_json(&mut socket).await, first_terminal);
 
-    send_json(&mut socket, &response_create("should fall back", None)).await;
+    request["input"][0]["content"][0]["text"] = json!("should fall back");
+    send_json(&mut socket, &request).await;
     let second = upstream.expect_text(connection.id).await;
     assert_eq!(second["model"], FALLBACK_MODEL);
+    assert_eq!(second["reasoning"]["effort"], "ultra");
     let second_terminal = response_completed("resp-fallback", 1, 0, 0);
     connection.send_json(second_terminal.clone());
     assert_eq!(receive_json(&mut socket).await, second_terminal);
@@ -1780,14 +1786,18 @@ async fn soft_quota_exhaustion_rewrites_websocket_creates_to_the_fallback_model(
         .connect_with(options)
         .await
         .expect("open websocket fallback logs");
-    let models = sqlx::query("SELECT model FROM request_logs ORDER BY id")
-        .fetch_all(&pool)
-        .await
-        .expect("read fallback models")
-        .into_iter()
-        .map(|row| row.get::<String, _>("model"))
-        .collect::<Vec<_>>();
-    assert_eq!(models, [MODEL.to_owned(), FALLBACK_MODEL.to_owned()]);
+    let calls: Vec<(String, String)> =
+        sqlx::query_as("SELECT model, reasoning_effort FROM request_logs ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("read fallback models");
+    assert_eq!(
+        calls,
+        [
+            (MODEL.to_owned(), "high".to_owned()),
+            (FALLBACK_MODEL.to_owned(), "ultra".to_owned()),
+        ]
+    );
 
     socket.close(None).await.expect("close downstream socket");
     let _ = upstream.expect_close(connection.id).await;

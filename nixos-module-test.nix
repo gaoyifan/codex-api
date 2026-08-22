@@ -19,6 +19,7 @@ let
             server.listen = "127.0.0.1:8080";
             state.path = "/var/lib/codex-api/state.sqlite3";
             upstream.auth_file = "/run/agenix/codex-api-auth";
+            model_prices."gpt-5.6-sol".max_reasoning_effort = "high";
             api_keys = [
               {
                 id = "test";
@@ -54,6 +55,8 @@ pkgs.runCommand "codex-api-nixos-module-test" { } ''
   grep -F 'cached_input_usd_per_million = ' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
   grep -F 'output_usd_per_million = ' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F 'max_reasoning_effort = "high"' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
   touch $out
 ''

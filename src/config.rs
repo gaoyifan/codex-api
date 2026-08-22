@@ -12,11 +12,14 @@ use serde::{Deserialize, Deserializer, de};
 use serde_json::Value;
 use url::Url;
 
-use crate::store::ModelRates;
+use crate::store::{EffectiveModel, ModelCandidates, ModelRates};
 
 const DEFAULT_UPSTREAM_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_HARD_LIMIT_USD: &str = "600.00";
+const REASONING_EFFORTS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -162,6 +165,8 @@ pub(crate) struct ModelPrice {
     pub(crate) cached_input_usd_per_million: Decimal,
     #[serde(deserialize_with = "deserialize_decimal")]
     pub(crate) output_usd_per_million: Decimal,
+    #[serde(default)]
+    max_reasoning_effort: Option<String>,
 }
 
 impl Config {
@@ -262,6 +267,13 @@ impl Config {
             if price.output_usd_per_million < Decimal::ZERO {
                 bail!("configuration model {model:?} output price must be non-negative");
             }
+            if price
+                .max_reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| reasoning_effort_rank(effort).is_none())
+            {
+                bail!("configuration model {model:?} has an invalid max_reasoning_effort");
+            }
         }
 
         if let Some(fallback_model) = &self.fallback_model {
@@ -278,28 +290,67 @@ impl Config {
         Ok(())
     }
 
-    pub(crate) fn model_rates(&self, model: &str) -> Option<ModelRates> {
-        self.model_prices.get(model).map(|price| ModelRates {
-            input_usd_per_million: price.input_usd_per_million,
-            cached_input_usd_per_million: price.cached_input_usd_per_million,
-            output_usd_per_million: price.output_usd_per_million,
+    pub(crate) fn model_candidates(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Option<ModelCandidates> {
+        Some(ModelCandidates {
+            primary: self.effective_model(model, reasoning_effort)?,
+            fallback: self.fallback_model.as_deref().map(|fallback| {
+                self.effective_model(fallback, reasoning_effort)
+                    .expect("configured fallback model must have prices")
+            }),
         })
     }
 
-    pub(crate) fn apply_fallback_model(&self, body: &mut Value, rates: &mut ModelRates) {
-        let fallback = self
-            .fallback_model
-            .as_deref()
-            .expect("fallback admission requires a configured fallback model");
-        let fallback_rates = self
-            .model_rates(fallback)
-            .expect("configured fallback model must have prices");
-        let object = body
-            .as_object_mut()
-            .expect("validated upstream request must be an object");
-        object.insert("model".to_owned(), Value::String(fallback.to_owned()));
-        *rates = fallback_rates;
+    fn effective_model(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Option<EffectiveModel> {
+        let price = self.model_prices.get(model)?;
+        let reasoning_effort = reasoning_effort.map(|requested| {
+            let Some(maximum) = price.max_reasoning_effort.as_deref() else {
+                return requested.to_owned();
+            };
+            match reasoning_effort_rank(requested) {
+                Some(rank) if rank > reasoning_effort_rank(maximum).expect("validated limit") => {
+                    maximum.to_owned()
+                }
+                _ => requested.to_owned(),
+            }
+        });
+        Some(EffectiveModel {
+            model: model.to_owned(),
+            reasoning_effort,
+            rates: ModelRates {
+                input_usd_per_million: price.input_usd_per_million,
+                cached_input_usd_per_million: price.cached_input_usd_per_million,
+                output_usd_per_million: price.output_usd_per_million,
+            },
+        })
     }
+}
+
+pub(crate) fn apply_effective_request(body: &mut Value, effective_model: &EffectiveModel) {
+    let object = body
+        .as_object_mut()
+        .expect("validated upstream request must be an object");
+    object.insert(
+        "model".to_owned(),
+        Value::String(effective_model.model.clone()),
+    );
+    if let Some(reasoning_effort) = &effective_model.reasoning_effort {
+        *body
+            .pointer_mut("/reasoning/effort")
+            .expect("effective reasoning effort came from this request") =
+            Value::String(reasoning_effort.clone());
+    }
+}
+
+fn reasoning_effort_rank(value: &str) -> Option<usize> {
+    REASONING_EFFORTS.iter().position(|effort| *effort == value)
 }
 
 fn deserialize_url<'de, D>(deserializer: D) -> Result<Url, D::Error>

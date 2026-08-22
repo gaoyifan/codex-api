@@ -535,7 +535,7 @@ fn convert_reasoning_effort(value: Value) -> Result<Option<String>, ChatError> {
         )
     })?;
     match effort {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => {
             Ok(Some(effort.to_owned()))
         }
         _ => Err(ChatError::invalid(

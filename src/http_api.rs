@@ -19,13 +19,14 @@ use request::PendingRequest;
 use crate::{
     auth::{ClientIdentity, authenticate},
     chat::{self, ChatErrorKind, TerminalStatus},
+    config::apply_effective_request,
     error::ApiError,
     responses_terminal::{TerminalKind, Usage},
     sse::{SseRead, SseReader},
     state::AppState,
     store::{
-        Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, QuotaLimits,
-        RequestMetadata, Transport,
+        Admission, ApiProtocol, BillableUsage, EffectiveModel, FinalStatus, ModelCandidates,
+        ModelRates, RequestContext, RequestId, Transport,
     },
 };
 
@@ -51,8 +52,11 @@ pub(crate) async fn responses(
         .pointer("/reasoning/effort")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let mut rates = match state.config.model_rates(&model) {
-        Some(rates) => rates,
+    let candidates = match state
+        .config
+        .model_candidates(&model, reasoning_effort.as_deref())
+    {
+        Some(candidates) => candidates,
         None => {
             reject_request(
                 &state,
@@ -80,25 +84,16 @@ pub(crate) async fn responses(
             return Err(error);
         }
     };
-    let admission = admit_request(
+    let (request_id, effective_model) = admit_request(
         &state,
         &identity,
-        model,
-        reasoning_effort,
+        candidates,
         ApiProtocol::Responses,
         Transport::HttpSse,
     )
     .await?;
-    let request_id = match admission {
-        Admission::Admitted(request_id) => request_id,
-        Admission::UseFallback(request_id) => {
-            state
-                .config
-                .apply_fallback_model(&mut upstream_body, &mut rates);
-            request_id
-        }
-        Admission::WeeklyQuotaExceeded => unreachable!("quota rejection becomes an error"),
-    };
+    apply_effective_request(&mut upstream_body, &effective_model);
+    let rates = effective_model.rates;
     let mut request = PendingRequest::new(
         Arc::clone(&state.store),
         request_id,
@@ -153,7 +148,11 @@ pub(crate) async fn chat_completions(
         .get("reasoning_effort")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if state.config.model_rates(&tentative_model).is_none() {
+    if state
+        .config
+        .model_candidates(&tentative_model, tentative_reasoning_effort.as_deref())
+        .is_none()
+    {
         reject_request(
             &state,
             &identity,
@@ -181,29 +180,20 @@ pub(crate) async fn chat_completions(
             ));
         }
     };
-    let mut rates = state
+    let candidates = state
         .config
-        .model_rates(&converted.model)
+        .model_candidates(&converted.model, converted.reasoning_effort.as_deref())
         .expect("model was admitted above");
-    let admission = admit_request(
+    let (request_id, effective_model) = admit_request(
         &state,
         &identity,
-        converted.model.clone(),
-        converted.reasoning_effort.clone(),
+        candidates,
         ApiProtocol::ChatCompletions,
         Transport::HttpSse,
     )
     .await?;
-    let request_id = match admission {
-        Admission::Admitted(request_id) => request_id,
-        Admission::UseFallback(request_id) => {
-            state
-                .config
-                .apply_fallback_model(&mut converted.upstream_request, &mut rates);
-            request_id
-        }
-        Admission::WeeklyQuotaExceeded => unreachable!("quota rejection becomes an error"),
-    };
+    apply_effective_request(&mut converted.upstream_request, &effective_model);
+    let rates = effective_model.rates;
     let mut request = PendingRequest::new(
         Arc::clone(&state.store),
         request_id,
@@ -640,30 +630,26 @@ fn billable_usage(usage: Usage, rates: ModelRates) -> BillableUsage {
 async fn admit_request(
     state: &AppState,
     identity: &ClientIdentity,
-    model: String,
-    reasoning_effort: Option<String>,
+    candidates: ModelCandidates,
     api_protocol: ApiProtocol,
     transport: Transport,
-) -> Result<Admission, ApiError> {
-    let metadata = RequestMetadata {
+) -> Result<(RequestId, EffectiveModel), ApiError> {
+    let context = RequestContext {
         api_key_id: identity.id.clone(),
-        model,
-        reasoning_effort,
         api_protocol,
         transport,
     };
     match state
         .store
-        .begin_request(
-            &metadata,
-            identity.quota,
-            state.config.fallback_model.as_deref(),
-        )
+        .begin_request(&context, identity.quota, candidates)
         .await
         .map_err(|_| ApiError::internal())?
     {
         Admission::WeeklyQuotaExceeded => Err(ApiError::quota_exceeded()),
-        admission => Ok(admission),
+        Admission::Admitted {
+            request_id,
+            effective_model,
+        } => Ok((request_id, effective_model)),
     }
 }
 
@@ -674,31 +660,18 @@ async fn reject_request(
     reasoning_effort: Option<String>,
     api_protocol: ApiProtocol,
 ) -> Result<(), ApiError> {
-    let metadata = RequestMetadata {
+    let context = RequestContext {
         api_key_id: identity.id.clone(),
-        model: model.to_owned(),
-        reasoning_effort,
         api_protocol,
         transport: Transport::HttpSse,
     };
-    let request_id = match state
-        .store
-        .begin_request(&metadata, QuotaLimits::unlimited(), None)
-        .await
-        .map_err(|_| ApiError::internal())?
-    {
-        Admission::Admitted(request_id) => request_id,
-        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded => {
-            unreachable!("an unlimited ledger entry was rejected")
-        }
-    };
     state
         .store
-        .finalize_request(
-            request_id,
-            FinalStatus::Rejected,
+        .record_rejection(
+            &context,
+            model,
+            reasoning_effort.as_deref(),
             Some(StatusCode::BAD_REQUEST.as_u16()),
-            None,
         )
         .await
         .map_err(|_| ApiError::internal())

@@ -214,6 +214,7 @@ secret = "{API_KEY}"
 input_usd_per_million = "1.00"
 cached_input_usd_per_million = "0.10"
 output_usd_per_million = "6.00"
+max_reasoning_effort = "high"
 "#,
             database_path.display(),
             upstream.base_url(),
@@ -512,17 +513,18 @@ async fn chat_completions_forwards_the_codex_header_allowlist() {
 }
 
 #[tokio::test]
-async fn reasoning_effort_accepts_null_as_omitted_and_forwards_max() {
-    let upstream = ScriptedUpstream::start(vec![
-        UpstreamReply::events(vec![completed_event(
-            "resp_null_reasoning",
-            text_output("null"),
-        )]),
-        UpstreamReply::events(vec![completed_event(
-            "resp_max_reasoning",
-            text_output("max"),
-        )]),
-    ])
+async fn reasoning_effort_accepts_null_and_caps_high_levels() {
+    let upstream = ScriptedUpstream::start(
+        ["null", "medium", "xhigh", "max", "ultra"]
+            .into_iter()
+            .map(|effort| {
+                UpstreamReply::events(vec![completed_event(
+                    &format!("resp_{effort}_reasoning"),
+                    text_output(effort),
+                )])
+            })
+            .collect(),
+    )
     .await;
     let relay = TestRelay::start(&upstream).await;
 
@@ -531,15 +533,28 @@ async fn reasoning_effort_accepts_null_as_omitted_and_forwards_max() {
     let (status, body) = response_json(relay.post(&omitted).await).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    let mut maximum = minimal_request();
-    maximum["reasoning_effort"] = json!("max");
-    let (status, body) = response_json(relay.post(&maximum).await).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
+    for effort in ["medium", "xhigh", "max", "ultra"] {
+        let mut request = minimal_request();
+        request["reasoning_effort"] = json!(effort);
+        let (status, body) = response_json(relay.post(&request).await).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+    }
 
     let sent = upstream.requests().await;
-    assert_eq!(sent.len(), 2);
+    assert_eq!(sent.len(), 5);
     assert!(sent[0].get("reasoning").is_none());
-    assert_eq!(sent[1]["reasoning"], json!({"effort": "max"}));
+    assert_eq!(sent[1]["reasoning"], json!({"effort": "medium"}));
+    for request in &sent[2..] {
+        assert_eq!(request["reasoning"], json!({"effort": "high"}));
+    }
+
+    let mut database = relay.database().await;
+    let logged: String =
+        sqlx::query_scalar("SELECT reasoning_effort FROM request_logs ORDER BY id DESC LIMIT 1")
+            .fetch_one(&mut database)
+            .await
+            .unwrap();
+    assert_eq!(logged, "high");
 }
 
 #[tokio::test]

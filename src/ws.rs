@@ -11,12 +11,13 @@ use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame as UpstreamClose
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::auth::{ClientIdentity, authenticate};
+use crate::config::apply_effective_request;
 use crate::error::{ApiError, websocket_error};
 use crate::responses_terminal::{TerminalKind, parse_terminal_payload};
 use crate::state::AppState;
 use crate::store::{
-    Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, QuotaLimits, RequestId,
-    RequestMetadata, StoreError, Transport,
+    Admission, ApiProtocol, BillableUsage, FinalStatus, ModelCandidates, ModelRates,
+    RequestContext, RequestId, StoreError, Transport,
 };
 use crate::upstream_ws::{UpstreamWebSocket, connect_upstream_websocket};
 
@@ -27,8 +28,8 @@ struct InFlight {
 
 struct PreparedRequest {
     payload: Value,
-    metadata: RequestMetadata,
-    rates: ModelRates,
+    context: RequestContext,
+    candidates: ModelCandidates,
 }
 
 struct ValidationError {
@@ -204,24 +205,17 @@ impl WsSession {
         let admission = match self
             .state
             .store
-            .begin_request(
-                &prepared.metadata,
-                self.identity.quota,
-                self.state.config.fallback_model.as_deref(),
-            )
+            .begin_request(&prepared.context, self.identity.quota, prepared.candidates)
             .await
         {
             Ok(admission) => admission,
             Err(_) => return Some(ConnectionEnd::InternalFailure),
         };
-        let request_id = match admission {
-            Admission::Admitted(request_id) => request_id,
-            Admission::UseFallback(request_id) => {
-                self.state
-                    .config
-                    .apply_fallback_model(&mut prepared.payload, &mut prepared.rates);
-                request_id
-            }
+        let (request_id, effective_model) = match admission {
+            Admission::Admitted {
+                request_id,
+                effective_model,
+            } => (request_id, effective_model),
             Admission::WeeklyQuotaExceeded => {
                 return self
                     .send_error(websocket_error(
@@ -252,6 +246,7 @@ impl WsSession {
                 .await;
         }
 
+        apply_effective_request(&mut prepared.payload, &effective_model);
         if self
             .upstream
             .send(UpstreamMessage::Text(prepared.payload.to_string().into()))
@@ -267,7 +262,7 @@ impl WsSession {
         }
         self.active = Some(InFlight {
             request_id,
-            rates: prepared.rates,
+            rates: effective_model.rates,
         });
         None
     }
@@ -471,10 +466,17 @@ fn prepare_request(
                 message: "response.create requires a model",
             })?
             .to_owned();
-        let rates = state.config.model_rates(&model).ok_or(ValidationError {
-            param: "model",
-            message: "The requested model is not configured",
-        })?;
+        let reasoning_effort = object
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str);
+        let candidates = state
+            .config
+            .model_candidates(&model, reasoning_effort)
+            .ok_or(ValidationError {
+                param: "model",
+                message: "The requested model is not configured",
+            })?;
         if object.contains_key("stream") {
             return Err(ValidationError {
                 param: "stream",
@@ -503,11 +505,6 @@ fn prepare_request(
             });
         }
 
-        let reasoning_effort = object
-            .get("reasoning")
-            .and_then(|reasoning| reasoning.get("effort"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
         if let Some(Value::String(input)) = object.get("input") {
             object.insert(
                 "input".to_owned(),
@@ -520,20 +517,18 @@ fn prepare_request(
         }
         object.insert("store".to_owned(), Value::Bool(false));
         object.insert("stream".to_owned(), Value::Bool(true));
-        Ok((model, reasoning_effort, rates))
+        Ok(candidates)
     })();
 
     match validation {
-        Ok((model, reasoning_effort, rates)) => Ok(PreparedRequest {
+        Ok(candidates) => Ok(PreparedRequest {
             payload: value,
-            metadata: RequestMetadata {
+            context: RequestContext {
                 api_key_id: identity.id.clone(),
-                model,
-                reasoning_effort,
                 api_protocol: ApiProtocol::Responses,
                 transport: Transport::WebSocket,
             },
-            rates,
+            candidates,
         }),
         Err(error) => Err((value, error)),
     }
@@ -544,34 +539,26 @@ async fn record_rejection(
     identity: &ClientIdentity,
     value: &Value,
 ) -> Result<(), StoreError> {
-    let metadata = RequestMetadata {
+    let context = RequestContext {
         api_key_id: identity.id.clone(),
-        model: value
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        reasoning_effort: value
-            .get("reasoning")
-            .and_then(|reasoning| reasoning.get("effort"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
         api_protocol: ApiProtocol::Responses,
         transport: Transport::WebSocket,
     };
-    match state
+    state
         .store
-        .begin_request(&metadata, QuotaLimits::unlimited(), None)
-        .await?
-    {
-        Admission::Admitted(request_id) => {
-            state
-                .store
-                .finalize_request(request_id, FinalStatus::Rejected, None, None)
-                .await
-        }
-        Admission::UseFallback(_) | Admission::WeeklyQuotaExceeded => Ok(()),
-    }
+        .record_rejection(
+            &context,
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            value
+                .get("reasoning")
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str),
+            None,
+        )
+        .await
 }
 
 fn downstream_close_to_upstream(frame: DownstreamCloseFrame) -> UpstreamCloseFrame {

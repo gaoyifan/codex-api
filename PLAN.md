@@ -106,6 +106,7 @@ weekly_limit_usd = "10.00" # optional soft weekly limit; omission means unlimite
 input_usd_per_million = "1.00"
 cached_input_usd_per_million = "0.10"
 output_usd_per_million = "6.00"
+max_reasoning_effort = "high" # optional
 ```
 
 Configuration rules:
@@ -115,6 +116,7 @@ Configuration rules:
 - API key secrets remain in configuration or their referenced files and in
   memory only; never persist them to SQLite.
 - `model_prices` is also the model allowlist. Every request must name an exact configured model so every request log has a deterministic cost, including requests made with an unlimited key.
+- A model's optional `max_reasoning_effort` caps higher requested levels after fallback selection and before forwarding; request logs store the effective model and level. The supported order is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. The NixOS module defaults GPT-5.6 Sol to `high`.
 - Optional top-level `fallback_model` must be non-empty and name a model present in `model_prices`. When a limited key's soft weekly spend is exhausted, requests are rewritten to this model until the hard weekly limit is reached.
 - Limited keys may set `hard_limit_usd` (default `600.00`, must be >= `weekly_limit_usd`). When `fallback_model` is set, hard must be strictly greater than soft so a fallback window exists. Unlimited keys must not set `hard_limit_usd`.
 - Money values are decimal strings and must be non-negative.

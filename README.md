@@ -89,6 +89,8 @@ See [config.example.toml](config.example.toml). Important rules:
   one of `secret` or `secret_file` for each key.
 - Decimal prices and limits must be quoted strings and non-negative.
 - `model_prices` is the exact model allowlist.
+- A model's optional `max_reasoning_effort` caps higher requested levels after
+  fallback selection; logs record the effective model and level.
 - Omitting `weekly_limit_usd` makes a key unlimited.
 - Limited keys get a weekly soft limit (`weekly_limit_usd`) and a hard limit
   (`hard_limit_usd`, default `600.00`). When soft spend is exhausted and
@@ -150,8 +152,9 @@ el2 host module under `~/nix/nixos/hosts/el2/` can use this shape:
 ```
 
 The NixOS module supplies the current Standard short-context prices for the
-GPT-5.6 Sol, Terra, and Luna models by default. Set `settings.model_prices`
-only when overriding that table deliberately.
+GPT-5.6 Sol, Terra, and Luna models by default, and caps Sol reasoning effort
+at `high`. Set `settings.model_prices` only when overriding that table
+deliberately.
 
 If `user` or `group` is changed from `codex-api`, define that account outside
 this module and grant it read access to the configured secret files, plus write

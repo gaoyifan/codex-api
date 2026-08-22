@@ -281,6 +281,7 @@ secret = "{DOWNSTREAM_KEY}"
 input_usd_per_million = "1.00"
 cached_input_usd_per_million = "0.10"
 output_usd_per_million = "6.00"
+max_reasoning_effort = "high"
 "#,
             state_path.display(),
             auth_path.display(),
@@ -493,7 +494,7 @@ async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
         }],
         "instructions": "Be concise",
         "stream": true,
-        "reasoning": {"effort": "low", "summary": "auto"},
+        "reasoning": {"effort": "ultra", "summary": "auto"},
         "tools": [{
             "type": "function",
             "name": "weather",
@@ -575,6 +576,7 @@ async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
 
     let mut expected = downstream_body;
     expected["store"] = json!(false);
+    expected["reasoning"]["effort"] = json!("high");
     assert_eq!(captured.body, expected);
 }
 

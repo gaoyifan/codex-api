@@ -77,10 +77,8 @@ impl Transport {
     }
 }
 
-pub(crate) struct RequestMetadata {
+pub(crate) struct RequestContext {
     pub(crate) api_key_id: String,
-    pub(crate) model: String,
-    pub(crate) reasoning_effort: Option<String>,
     pub(crate) api_protocol: ApiProtocol,
     pub(crate) transport: Transport,
 }
@@ -88,10 +86,11 @@ pub(crate) struct RequestMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestId(pub(crate) i64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Admission {
-    Admitted(RequestId),
-    UseFallback(RequestId),
+    Admitted {
+        request_id: RequestId,
+        effective_model: EffectiveModel,
+    },
     WeeklyQuotaExceeded,
 }
 
@@ -124,20 +123,22 @@ pub(crate) struct QuotaLimits {
     pub(crate) hard_limit_usd: Option<Decimal>,
 }
 
-impl QuotaLimits {
-    pub(crate) fn unlimited() -> Self {
-        Self {
-            weekly_limit_usd: None,
-            hard_limit_usd: None,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct ModelRates {
     pub(crate) input_usd_per_million: Decimal,
     pub(crate) cached_input_usd_per_million: Decimal,
     pub(crate) output_usd_per_million: Decimal,
+}
+
+pub(crate) struct EffectiveModel {
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) rates: ModelRates,
+}
+
+pub(crate) struct ModelCandidates {
+    pub(crate) primary: EffectiveModel,
+    pub(crate) fallback: Option<EffectiveModel>,
 }
 
 #[derive(Clone, Copy)]
@@ -224,9 +225,9 @@ impl Store {
 
     pub(crate) async fn begin_request(
         &self,
-        metadata: &RequestMetadata,
+        context: &RequestContext,
         quota: QuotaLimits,
-        fallback_model: Option<&str>,
+        candidates: ModelCandidates,
     ) -> Result<Admission, StoreError> {
         let now = self.clock.now().to_offset(UtcOffset::UTC);
         let requested_at_ms = timestamp_ms(now)?;
@@ -240,7 +241,7 @@ impl Store {
              WHERE api_key_id = ? AND cost_nano_usd IS NOT NULL \
                AND requested_at_ms >= ? AND requested_at_ms < ?",
         )
-        .bind(&metadata.api_key_id)
+        .bind(&context.api_key_id)
         .bind(week_start_ms)
         .bind(next_week_ms)
         .fetch_one(&self.pool)
@@ -249,14 +250,14 @@ impl Store {
         let spent = Decimal::from(spent_nano_usd);
         let soft_exceeded = spend_meets_limit(spent, quota.weekly_limit_usd)?;
         let hard_exceeded = spend_meets_limit(spent, quota.hard_limit_usd)?;
-        let rejected = hard_exceeded || (soft_exceeded && fallback_model.is_none());
+        let rejected = hard_exceeded || (soft_exceeded && candidates.fallback.is_none());
         let use_fallback = soft_exceeded && !rejected;
         let (status, finished_at_ms, duration_ms, http_status) = if rejected {
             (
                 "rejected",
                 Some(requested_at_ms),
                 Some(0_i64),
-                match metadata.transport {
+                match context.transport {
                     Transport::HttpSse => Some(429_i64),
                     Transport::WebSocket => None,
                 },
@@ -265,9 +266,11 @@ impl Store {
             ("started", None, None, None)
         };
         let effective_model = if use_fallback {
-            fallback_model.expect("fallback admission requires a fallback model")
+            candidates
+                .fallback
+                .expect("fallback admission requires a fallback candidate")
         } else {
-            metadata.model.as_str()
+            candidates.primary
         };
         let result = sqlx::query(
             "INSERT INTO request_ledger (requested_at_ms, finished_at_ms, api_key_id, model, \
@@ -276,11 +279,11 @@ impl Store {
         )
         .bind(requested_at_ms)
         .bind(finished_at_ms)
-        .bind(&metadata.api_key_id)
-        .bind(effective_model)
-        .bind(&metadata.reasoning_effort)
-        .bind(metadata.api_protocol.as_str())
-        .bind(metadata.transport.as_str())
+        .bind(&context.api_key_id)
+        .bind(&effective_model.model)
+        .bind(&effective_model.reasoning_effort)
+        .bind(context.api_protocol.as_str())
+        .bind(context.transport.as_str())
         .bind(duration_ms)
         .bind(status)
         .bind(http_status)
@@ -289,11 +292,38 @@ impl Store {
         let request_id = RequestId(result.last_insert_rowid());
         Ok(if rejected {
             Admission::WeeklyQuotaExceeded
-        } else if use_fallback {
-            Admission::UseFallback(request_id)
         } else {
-            Admission::Admitted(request_id)
+            Admission::Admitted {
+                request_id,
+                effective_model,
+            }
         })
+    }
+
+    pub(crate) async fn record_rejection(
+        &self,
+        context: &RequestContext,
+        model: &str,
+        reasoning_effort: Option<&str>,
+        http_status: Option<u16>,
+    ) -> Result<(), StoreError> {
+        let requested_at_ms = timestamp_ms(self.clock.now().to_offset(UtcOffset::UTC))?;
+        sqlx::query(
+            "INSERT INTO request_ledger (requested_at_ms, finished_at_ms, api_key_id, model, \
+                    reasoning_effort, api_protocol, transport, duration_ms, status, http_status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'rejected', ?)",
+        )
+        .bind(requested_at_ms)
+        .bind(requested_at_ms)
+        .bind(&context.api_key_id)
+        .bind(model)
+        .bind(reasoning_effort)
+        .bind(context.api_protocol.as_str())
+        .bind(context.transport.as_str())
+        .bind(http_status.map(i64::from))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn finalize_request(
