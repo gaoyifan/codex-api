@@ -12,8 +12,11 @@ discovery, a management UI, multi-account scheduling, or transport fallbacks.
 
 - `POST /v1/responses` accepts only explicit `"stream": true` and returns a
   Responses SSE stream.
-- `POST /v1/chat/completions` accepts only non-streaming requests, consumes the
-  upstream Responses stream, and returns one Chat Completion JSON object.
+- `POST /v1/chat/completions` accepts non-streaming requests and text-only
+  streaming requests, translating the upstream Responses stream into Chat
+  Completions JSON or SSE. `response_format` is translated to Responses
+  `text.format`. `max_completion_tokens` is validated but cannot be enforced by
+  the ChatGPT Codex upstream, so it is not forwarded.
 - `GET /v1/responses` with WebSocket Upgrade is available when both WebSocket
   configuration switches are enabled. Each downstream socket owns exactly one
   upstream socket and supports sequential `response.create` operations.
@@ -176,10 +179,11 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 The Chat compatibility layer supports ordered system, developer, user, and
 assistant text; function tools and tool calls; tool results; `tool_choice`;
-`parallel_tool_calls`; and `reasoning_effort`. Unsupported fields are rejected
-instead of being silently dropped. In particular, the private ChatGPT Codex
-endpoint rejects Responses `max_output_tokens`, so this relay also rejects it
-and Chat `max_completion_tokens`/`max_tokens`.
+`parallel_tool_calls`; and `reasoning_effort`. System messages are joined with
+newlines and sent as the Responses `instructions` field. Unsupported fields are
+rejected instead of being silently dropped. In particular, the private ChatGPT
+Codex endpoint rejects Responses `max_output_tokens`, so this relay also rejects
+it and Chat `max_completion_tokens`/`max_tokens`.
 
 For WebSocket mode, connect to `ws://host/v1/responses`, provide the same Bearer
 header, and send text frames such as:

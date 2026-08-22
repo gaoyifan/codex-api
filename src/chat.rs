@@ -59,12 +59,143 @@ pub struct ConvertedRequest {
     pub upstream_request: Value,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    pub stream: bool,
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalStatus {
     Completed,
     Incomplete,
+}
+
+pub struct ChatStreamConverter {
+    id: Option<String>,
+    created: Option<i64>,
+    model: Option<String>,
+    include_usage: bool,
+}
+
+pub struct ConvertedStreamTerminal {
+    pub chunks: Vec<Value>,
+    pub usage: Usage,
+    pub status: TerminalStatus,
+}
+
+impl ChatStreamConverter {
+    pub fn new(include_usage: bool) -> Self {
+        Self {
+            id: None,
+            created: None,
+            model: None,
+            include_usage,
+        }
+    }
+
+    pub fn convert_event(&mut self, event: &Value) -> Result<Option<Value>, ChatError> {
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.created") => {
+                let response = event
+                    .get("response")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| ChatError::upstream("response.created is missing response"))?;
+                self.capture_metadata(response)?;
+                Ok(Some(self.chunk(
+                    json!({"role": "assistant", "content": ""}),
+                    None,
+                )?))
+            }
+            Some("response.output_text.delta") => {
+                let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                    ChatError::upstream("response.output_text.delta.delta must be a string")
+                })?;
+                Ok(Some(self.chunk(json!({"content": delta}), None)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn convert_terminal(
+        &mut self,
+        terminal: &TerminalEvent,
+    ) -> Result<ConvertedStreamTerminal, ChatError> {
+        let status = match terminal.kind {
+            TerminalKind::Completed => TerminalStatus::Completed,
+            TerminalKind::Incomplete => TerminalStatus::Incomplete,
+            TerminalKind::Failed | TerminalKind::Error => {
+                return Err(ChatError::upstream(format!(
+                    "upstream emitted {} instead of a completion",
+                    terminal.kind.event_name()
+                )));
+            }
+        };
+        let response = terminal
+            .payload
+            .get("response")
+            .and_then(Value::as_object)
+            .ok_or_else(|| ChatError::upstream("terminal event is missing its response object"))?;
+        self.capture_metadata(response)?;
+        let usage = terminal
+            .usage
+            .ok_or_else(|| ChatError::upstream("terminal response is missing usage"))?;
+        let finish_reason = match status {
+            TerminalStatus::Completed => "stop",
+            TerminalStatus::Incomplete => incomplete_finish_reason(response)?,
+        };
+        let mut chunks = vec![self.chunk(json!({}), Some(finish_reason))?];
+        if self.include_usage {
+            chunks.push(self.usage_chunk(usage)?);
+        }
+        Ok(ConvertedStreamTerminal {
+            chunks,
+            usage,
+            status,
+        })
+    }
+
+    fn capture_metadata(&mut self, response: &Map<String, Value>) -> Result<(), ChatError> {
+        self.id = Some(upstream_string(response, "id", "response")?.to_owned());
+        self.created = Some(upstream_integer(response, "created_at", "response")?);
+        self.model = Some(upstream_string(response, "model", "response")?.to_owned());
+        Ok(())
+    }
+
+    fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> Result<Value, ChatError> {
+        let (id, created, model) = self.metadata()?;
+        Ok(json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "logprobs": null,
+                "finish_reason": finish_reason
+            }]
+        }))
+    }
+
+    fn usage_chunk(&self, usage: Usage) -> Result<Value, ChatError> {
+        let (id, created, model) = self.metadata()?;
+        Ok(json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": chat_usage(usage)
+        }))
+    }
+
+    fn metadata(&self) -> Result<(&str, i64, &str), ChatError> {
+        match (&self.id, self.created, &self.model) {
+            (Some(id), Some(created), Some(model)) => Ok((id, created, model)),
+            _ => Err(ChatError::upstream(
+                "upstream emitted Chat content before response metadata",
+            )),
+        }
+    }
 }
 
 /// The public Chat Completion plus accounting metadata from the same terminal
@@ -89,18 +220,21 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
         .remove("messages")
         .ok_or_else(|| ChatError::invalid("messages", "messages is required"))?;
 
-    match request.remove("stream") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
-        Some(Value::Bool(true)) => {
+    let stream = match request.remove("stream") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => {
             return Err(ChatError::invalid(
                 "stream",
-                "streaming Chat Completions are not supported",
+                "stream must be a boolean or null",
             ));
         }
-        Some(_) => {
-            return Err(ChatError::invalid("stream", "stream must be false or null"));
-        }
-    }
+    };
+    let include_usage = request
+        .remove("stream_options")
+        .map(|value| convert_stream_options(value, stream))
+        .transpose()?
+        .unwrap_or(false);
 
     match request.remove("n") {
         None | Some(Value::Null) => {}
@@ -111,6 +245,12 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
     }
 
     let tools = request.remove("tools").map(convert_tools).transpose()?;
+    if stream && tools.is_some() {
+        return Err(ChatError::invalid(
+            "tools",
+            "tools are not supported with streaming Chat Completions",
+        ));
+    }
     let tool_choice = request
         .remove("tool_choice")
         .map(convert_tool_choice)
@@ -124,14 +264,25 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
         .map(convert_reasoning_effort)
         .transpose()?
         .flatten();
+    if let Some(value) = request.remove("max_completion_tokens") {
+        validate_ignored_completion_limit(value)?;
+    }
+    let text = request
+        .remove("response_format")
+        .map(convert_response_format)
+        .transpose()?
+        .flatten();
     reject_unknown_request_fields(&request, "request")?;
-    let input = convert_messages(messages)?;
+    let (instructions, input) = convert_messages(messages)?;
 
     let mut upstream = Map::new();
     upstream.insert("model".into(), Value::String(model.clone()));
     upstream.insert("input".into(), Value::Array(input));
     upstream.insert("stream".into(), Value::Bool(true));
     upstream.insert("store".into(), Value::Bool(false));
+    if let Some(instructions) = instructions {
+        upstream.insert("instructions".into(), Value::String(instructions));
+    }
     if let Some(tools) = tools {
         upstream.insert("tools".into(), tools);
     }
@@ -147,11 +298,16 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
     if let Some(reasoning_effort) = reasoning_effort.as_ref() {
         upstream.insert("reasoning".into(), json!({"effort": reasoning_effort}));
     }
+    if let Some(text) = text {
+        upstream.insert("text".into(), text);
+    }
 
     Ok(ConvertedRequest {
         upstream_request: Value::Object(upstream),
         model,
         reasoning_effort,
+        stream,
+        include_usage,
     })
 }
 
@@ -239,23 +395,27 @@ pub fn convert_terminal_event(terminal: &TerminalEvent) -> Result<ConvertedTermi
             "logprobs": null,
             "finish_reason": finish_reason
         }],
-        "usage": {
-            "prompt_tokens": usage.input_tokens,
-            "prompt_tokens_details": {
-                "cached_tokens": usage.cached_input_tokens
-            },
-            "completion_tokens": usage.output_tokens,
-            "completion_tokens_details": {
-                "reasoning_tokens": usage.reasoning_tokens
-            },
-            "total_tokens": usage.total_tokens
-        }
+        "usage": chat_usage(usage)
     });
 
     Ok(ConvertedTerminal {
         chat_completion,
         usage,
         status: terminal_status,
+    })
+}
+
+fn chat_usage(usage: Usage) -> Value {
+    json!({
+        "prompt_tokens": usage.input_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens
+        },
+        "completion_tokens": usage.output_tokens,
+        "completion_tokens_details": {
+            "reasoning_tokens": usage.reasoning_tokens
+        },
+        "total_tokens": usage.total_tokens
     })
 }
 
@@ -281,6 +441,69 @@ fn request_bool(value: Value, param: &str) -> Result<bool, ChatError> {
     value
         .as_bool()
         .ok_or_else(|| ChatError::invalid(param, format!("{param} must be a boolean")))
+}
+
+fn convert_stream_options(value: Value, stream: bool) -> Result<bool, ChatError> {
+    if !stream {
+        return Err(ChatError::invalid(
+            "stream_options",
+            "stream_options requires stream to be true",
+        ));
+    }
+    let mut options = into_request_object(value, "stream_options")?;
+    let include_usage = options
+        .remove("include_usage")
+        .map(|value| request_bool(value, "stream_options.include_usage"))
+        .transpose()?
+        .unwrap_or(false);
+    reject_unknown_request_fields(&options, "stream_options")?;
+    Ok(include_usage)
+}
+
+fn validate_ignored_completion_limit(value: Value) -> Result<(), ChatError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if value.as_u64().is_some_and(|limit| limit > 0) {
+        return Ok(());
+    }
+    Err(ChatError::invalid(
+        "max_completion_tokens",
+        "max_completion_tokens must be a positive integer or null",
+    ))
+}
+
+fn convert_response_format(value: Value) -> Result<Option<Value>, ChatError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let mut response_format = into_request_object(value, "response_format")?;
+    let format_type = take_request_string(&mut response_format, "type", "response_format.type")?;
+    let format = match format_type.as_str() {
+        "text" | "json_object" => {
+            reject_unknown_request_fields(&response_format, "response_format")?;
+            json!({"type": format_type})
+        }
+        "json_schema" => {
+            let schema = response_format.remove("json_schema").ok_or_else(|| {
+                ChatError::invalid(
+                    "response_format.json_schema",
+                    "response_format.json_schema is required",
+                )
+            })?;
+            reject_unknown_request_fields(&response_format, "response_format")?;
+            let mut schema = into_request_object(schema, "response_format.json_schema")?;
+            schema.insert("type".into(), Value::String("json_schema".into()));
+            Value::Object(schema)
+        }
+        _ => {
+            return Err(ChatError::invalid(
+                "response_format.type",
+                "unsupported response_format.type",
+            ));
+        }
+    };
+    Ok(Some(json!({"format": format})))
 }
 
 fn reject_unknown_request_fields(
@@ -322,7 +545,7 @@ fn convert_reasoning_effort(value: Value) -> Result<Option<String>, ChatError> {
     }
 }
 
-fn convert_messages(value: Value) -> Result<Vec<Value>, ChatError> {
+fn convert_messages(value: Value) -> Result<(Option<String>, Vec<Value>), ChatError> {
     let messages = value
         .as_array()
         .ok_or_else(|| ChatError::invalid("messages", "messages must be an array"))?;
@@ -333,6 +556,7 @@ fn convert_messages(value: Value) -> Result<Vec<Value>, ChatError> {
         ));
     }
 
+    let mut system_messages = Vec::new();
     let mut input = Vec::new();
     for (index, value) in messages.iter().enumerate() {
         let context = format!("messages[{index}]");
@@ -342,7 +566,15 @@ fn convert_messages(value: Value) -> Result<Vec<Value>, ChatError> {
             .ok_or_else(|| ChatError::invalid(&context, format!("{context} must be an object")))?;
         let role = take_request_string(&mut message, "role", &format!("{context}.role"))?;
         match role.as_str() {
-            "system" | "developer" | "user" => {
+            "system" => {
+                let content_param = format!("{context}.content");
+                let content = message.remove("content").ok_or_else(|| {
+                    ChatError::invalid(&content_param, format!("{content_param} is required"))
+                })?;
+                reject_unknown_request_fields(&message, &context)?;
+                system_messages.push(parse_text_parts(content, &content_param)?.join("\n"));
+            }
+            "developer" | "user" => {
                 let content_param = format!("{context}.content");
                 let content = message.remove("content").ok_or_else(|| {
                     ChatError::invalid(&content_param, format!("{content_param} is required"))
@@ -371,7 +603,8 @@ fn convert_messages(value: Value) -> Result<Vec<Value>, ChatError> {
             }
         }
     }
-    Ok(input)
+    let instructions = (!system_messages.is_empty()).then(|| system_messages.join("\n"));
+    Ok((instructions, input))
 }
 
 fn convert_assistant_message(

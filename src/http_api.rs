@@ -229,6 +229,30 @@ pub(crate) async fn chat_completions(
         return Err(ApiError::gateway("Upstream request failed"));
     }
 
+    if converted.stream {
+        request.response_started(StatusCode::OK);
+        let (sender, receiver) = mpsc::channel::<Bytes>(16);
+        state.pending_requests.spawn(forward_chat_stream(
+            request,
+            rates,
+            upstream,
+            sender,
+            state.shutdown.clone(),
+            converted.include_usage,
+        ));
+        let body_stream = stream::unfold(receiver, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|bytes| (Ok::<Bytes, Infallible>(bytes), receiver))
+        });
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(body_stream))
+            .expect("static streaming response is valid"));
+    }
+
     let converted_terminal = match read_chat_terminal(upstream, &state.shutdown).await {
         Ok(terminal) => terminal,
         Err(ChatStreamError::Shutdown) => {
@@ -280,6 +304,108 @@ pub(crate) async fn chat_completions(
         ));
     }
     Ok(Json(converted_terminal.chat_completion).into_response())
+}
+
+async fn forward_chat_stream(
+    mut request: PendingRequest,
+    rates: ModelRates,
+    upstream: reqwest::Response,
+    sender: mpsc::Sender<Bytes>,
+    shutdown: CancellationToken,
+    include_usage: bool,
+) {
+    let mut reader = SseReader::new(upstream.bytes_stream());
+    let mut converter = chat::ChatStreamConverter::new(include_usage);
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                let _ = request
+                    .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
+                    .await;
+                return;
+            }
+            _ = sender.closed() => {
+                let _ = request
+                    .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
+                    .await;
+                return;
+            }
+            next = reader.next() => next,
+        };
+        let event = match next {
+            Ok(SseRead::Event(event)) => event,
+            Ok(SseRead::Eof) | Err(_) => {
+                let _ = request
+                    .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
+                    .await;
+                return;
+            }
+        };
+        if let Some(terminal) = event.terminal() {
+            let converted = match converter.convert_terminal(terminal) {
+                Ok(converted) => converted,
+                Err(_) => {
+                    let _ = request
+                        .finish_terminal(
+                            FinalStatus::UpstreamError,
+                            StatusCode::OK,
+                            StatusCode::OK,
+                            terminal.usage.map(|usage| billable_usage(usage, rates)),
+                        )
+                        .await;
+                    return;
+                }
+            };
+            let status = match converted.status {
+                TerminalStatus::Completed => FinalStatus::Completed,
+                TerminalStatus::Incomplete => FinalStatus::Incomplete,
+            };
+            if request
+                .finish_terminal(
+                    status,
+                    StatusCode::OK,
+                    StatusCode::OK,
+                    Some(billable_usage(converted.usage, rates)),
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for chunk in converted.chunks {
+                if sender.send(chat_sse_bytes(&chunk)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = sender.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+            continue;
+        };
+        let chunk = match converter.convert_event(&value) {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                let _ = request
+                    .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
+                    .await;
+                return;
+            }
+        };
+        if let Some(chunk) = chunk
+            && sender.send(chat_sse_bytes(&chunk)).await.is_err()
+        {
+            let _ = request
+                .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
+                .await;
+            return;
+        }
+    }
+}
+
+fn chat_sse_bytes(value: &Value) -> Bytes {
+    Bytes::from(format!("data: {value}\n\n"))
 }
 
 enum ChatStreamError {

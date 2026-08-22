@@ -422,6 +422,69 @@ async fn accepts_only_the_documented_non_streaming_defaults() {
 }
 
 #[tokio::test]
+async fn streams_chat_text_and_terminal_usage() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![
+        json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_stream",
+                "created_at": 1_753_000_123,
+                "model": MODEL
+            }
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "delta": "Hello"
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 2,
+            "delta": " world"
+        }),
+        completed_event("resp_stream", text_output("Hello world")),
+    ])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_completion_tokens": 1024,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+
+    let response = relay.post(&request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let body = response.text().await.unwrap();
+    assert!(body.ends_with("data: [DONE]\n\n"), "body: {body}");
+    let chunks = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str::<Value>(data).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "Hello");
+    assert_eq!(chunks[2]["choices"][0]["delta"]["content"], " world");
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "stop");
+    assert!(chunks[3].get("usage").is_none());
+    assert!(chunks[4]["choices"].as_array().unwrap().is_empty());
+    assert_eq!(chunks[4]["usage"]["prompt_tokens"], 13);
+    assert_eq!(chunks[4]["usage"]["completion_tokens"], 8);
+
+    let sent = upstream.requests().await;
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].get("max_completion_tokens").is_none());
+    assert!(sent[0].get("stream_options").is_none());
+}
+
+#[tokio::test]
 async fn chat_completions_forwards_the_codex_header_allowlist() {
     let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![completed_event(
         "resp_headers",
@@ -492,7 +555,10 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": "system string"},
-            {"role": "system", "content": [{"type": "text", "text": "system part"}]},
+            {"role": "system", "content": [
+                {"type": "text", "text": "system part one"},
+                {"type": "text", "text": "system part two"}
+            ]},
             {"role": "developer", "content": "developer string"},
             {"role": "developer", "content": [
                 {"type": "text", "text": "developer part one"},
@@ -546,6 +612,20 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
         "tool_choice": {"type": "function", "function": {"name": "weather"}},
         "parallel_tool_calls": true,
         "reasoning_effort": "low",
+        "max_completion_tokens": 4096,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        },
         "stream": false,
         "n": 1
     });
@@ -560,6 +640,27 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
     assert_eq!(sent["store"], false);
     assert_eq!(sent["parallel_tool_calls"], true);
     assert_eq!(sent["reasoning"], json!({"effort": "low"}));
+    assert_eq!(
+        sent["instructions"],
+        "system string\nsystem part one\nsystem part two"
+    );
+    assert_eq!(
+        sent["text"],
+        json!({
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        })
+    );
+    assert!(sent.get("max_completion_tokens").is_none());
     assert_eq!(
         sent["tool_choice"],
         json!({"type": "function", "name": "weather"})
@@ -589,8 +690,6 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
     assert_eq!(
         sent["input"],
         json!([
-            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "system string"}]},
-            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "system part"}]},
             {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "developer string"}]},
             {"type": "message", "role": "developer", "content": [
                 {"type": "input_text", "text": "developer part one"},
@@ -606,7 +705,7 @@ async fn converts_all_supported_message_forms_tools_and_controls_in_order() {
             {"type": "function_call_output", "call_id": "call_time", "output": "12:00"}
         ])
     );
-    for chat_only_field in ["messages", "reasoning_effort", "n"] {
+    for chat_only_field in ["messages", "reasoning_effort", "max_completion_tokens", "n"] {
         assert!(
             sent.get(chat_only_field).is_none(),
             "Chat-only field {chat_only_field} leaked upstream: {sent}"
@@ -1413,7 +1512,6 @@ async fn rejects_every_unsupported_chat_category_before_accessing_upstream() {
     let relay = TestRelay::start(&upstream).await;
 
     let cases = vec![
-        ("streaming", json!({"stream": true})),
         ("zero choices", json!({"n": 0})),
         ("multiple choices", json!({"n": 2})),
         (
@@ -1427,10 +1525,6 @@ async fn rejects_every_unsupported_chat_category_before_accessing_upstream() {
         (
             "file content",
             json!({"messages": [{"role": "user", "content": [{"type": "file", "file": {"file_id": "file_1"}}]}]}),
-        ),
-        (
-            "structured output",
-            json!({"response_format": {"type": "json_object"}}),
         ),
         ("verbosity", json!({"verbosity": "low"})),
         (
@@ -1451,10 +1545,6 @@ async fn rejects_every_unsupported_chat_category_before_accessing_upstream() {
             json!({"tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "lookup"}]}}),
         ),
         ("deprecated max tokens", json!({"max_tokens": 50})),
-        (
-            "unsupported completion token limit",
-            json!({"max_completion_tokens": 50}),
-        ),
         (
             "unsupported Responses output token limit",
             json!({"max_output_tokens": 50}),
