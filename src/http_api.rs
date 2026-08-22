@@ -24,8 +24,8 @@ use crate::{
     sse::{SseRead, SseReader},
     state::AppState,
     store::{
-        Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, QuotaLimits, RequestMetadata,
-        Transport,
+        Admission, ApiProtocol, BillableUsage, FinalStatus, ModelRates, QuotaLimits,
+        RequestMetadata, Transport,
     },
 };
 
@@ -108,7 +108,7 @@ pub(crate) async fn responses(
         state.pending_requests.token(),
     );
 
-    let upstream = send_upstream(&state, &mut request, &upstream_body).await?;
+    let upstream = send_upstream(&state, &mut request, &upstream_body, &headers).await?;
     if !upstream.status().is_success() {
         return upstream_error_response(&mut request, state.shutdown.clone(), upstream).await;
     }
@@ -216,7 +216,8 @@ pub(crate) async fn chat_completions(
         state.pending_requests.token(),
     );
 
-    let upstream = send_upstream(&state, &mut request, &converted.upstream_request).await?;
+    let upstream =
+        send_upstream(&state, &mut request, &converted.upstream_request, &headers).await?;
     if !upstream.status().is_success() {
         request
             .finish(
@@ -336,6 +337,7 @@ async fn send_upstream(
     state: &AppState,
     request: &mut PendingRequest,
     body: &Value,
+    downstream_headers: &HeaderMap,
 ) -> Result<reqwest::Response, ApiError> {
     let result = tokio::select! {
         biased;
@@ -343,7 +345,7 @@ async fn send_upstream(
             request.finish(FinalStatus::Canceled, None, None).await?;
             return Err(ApiError::shutdown());
         }
-        result = state.upstream_http.send(body) => result,
+        result = state.upstream_http.send(body, downstream_headers) => result,
     };
     match result {
         Ok(response) => Ok(response),
@@ -624,4 +626,3 @@ async fn upstream_error_response(
         .body(Body::from(body))
         .map_err(|_| ApiError::internal())
 }
-

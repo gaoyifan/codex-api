@@ -579,6 +579,49 @@ async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
 }
 
 #[tokio::test]
+async fn responses_forwards_codex_headers_without_a_prompt_cache_key() {
+    let mut upstream =
+        FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
+            completed_sse(),
+        )])])
+        .await;
+    let relay = Relay::start(&upstream.base_url()).await;
+    let response = authorized_request(&client(), &relay)
+        .header(USER_AGENT, "codex-cli/downstream")
+        .header("originator", "Codex CLI")
+        .header("session_id", "session-123")
+        .header("x-codex-turn-state", "turn-state")
+        .header("x-oai-attestation", "must-not-pass")
+        .json(&json!({
+            "model": MODEL,
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("send Responses request");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("consume downstream stream");
+
+    let captured = upstream.next_request().await;
+    assert_eq!(
+        captured.headers.get(USER_AGENT).unwrap(),
+        "codex-cli/downstream"
+    );
+    assert_eq!(captured.headers.get("originator").unwrap(), "Codex CLI");
+    assert_eq!(captured.headers.get("session_id").unwrap(), "session-123");
+    assert_eq!(
+        captured.headers.get("x-codex-turn-state").unwrap(),
+        "turn-state"
+    );
+    assert!(!captured.headers.contains_key("x-oai-attestation"));
+    assert_eq!(
+        captured.headers.get(AUTHORIZATION).unwrap(),
+        "Bearer upstream-access-token"
+    );
+}
+
+#[tokio::test]
 async fn responses_delivers_the_first_event_before_upstream_finishes() {
     let created = json!({
         "type": "response.created",

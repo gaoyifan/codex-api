@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use http::StatusCode;
 use http::header::{AUTHORIZATION, USER_AGENT};
+use http::{HeaderMap, StatusCode};
 use http::{HeaderName, HeaderValue};
 use secrecy::ExposeSecret;
 use thiserror::Error;
@@ -12,6 +12,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use url::Url;
 
 use crate::credentials::{CredentialError, CredentialManager, CredentialSnapshot};
+use crate::upstream_headers::{
+    CODEX_ORIGINATOR, CODEX_USER_AGENT, CODEX_VERSION, codex_passthrough_headers,
+};
 
 const RESPONSES_PATH: &str = "responses";
 const OPENAI_BETA_HEADER: HeaderName = HeaderName::from_static("openai-beta");
@@ -19,10 +22,6 @@ const OPENAI_BETA_VALUE: &str = "responses_websockets=2026-02-06";
 const CHATGPT_ACCOUNT_ID_HEADER: HeaderName = HeaderName::from_static("chatgpt-account-id");
 const ORIGINATOR_HEADER: HeaderName = HeaderName::from_static("originator");
 const VERSION_HEADER: HeaderName = HeaderName::from_static("version");
-const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-const CODEX_VERSION: &str = "0.147.0";
-const CODEX_USER_AGENT: &str = "codex_cli_rs/0.147.0 (codex-api)";
-
 pub(crate) type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Error)]
@@ -54,19 +53,20 @@ pub(crate) enum UpstreamWebSocketError {
 pub(crate) async fn connect_upstream_websocket(
     base_url: &Url,
     credential_manager: Arc<CredentialManager>,
+    downstream_headers: &HeaderMap,
 ) -> Result<UpstreamWebSocket, UpstreamWebSocketError> {
     let credentials = credential_manager
         .credentials()
         .await
         .map_err(UpstreamWebSocketError::Credentials)?;
 
-    match connect_once(base_url, &credentials).await {
+    match connect_once(base_url, downstream_headers, &credentials).await {
         Err(UpstreamWebSocketError::AuthenticationRejected) => {
             let refreshed = credential_manager
                 .refresh_after_unauthorized(credentials.generation)
                 .await
                 .map_err(UpstreamWebSocketError::CredentialRefresh)?;
-            connect_once(base_url, &refreshed).await
+            connect_once(base_url, downstream_headers, &refreshed).await
         }
         result => result,
     }
@@ -74,6 +74,7 @@ pub(crate) async fn connect_upstream_websocket(
 
 async fn connect_once(
     base_url: &Url,
+    downstream_headers: &HeaderMap,
     credentials: &CredentialSnapshot,
 ) -> Result<UpstreamWebSocket, UpstreamWebSocketError> {
     let websocket_url = responses_websocket_url(base_url);
@@ -108,6 +109,9 @@ async fn connect_once(
     request
         .headers_mut()
         .insert(USER_AGENT, HeaderValue::from_static(CODEX_USER_AGENT));
+    request
+        .headers_mut()
+        .extend(codex_passthrough_headers(downstream_headers));
 
     connect_async(request)
         .await

@@ -18,6 +18,7 @@ mod responses_terminal;
 mod sse;
 mod state;
 mod store;
+mod upstream_headers;
 mod upstream_http;
 mod upstream_ws;
 mod ws;

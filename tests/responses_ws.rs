@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::ws::{CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket};
 use axum::extract::{Request, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -614,6 +614,14 @@ async fn connect_downstream(
     url: &str,
     authorization: Option<&str>,
 ) -> Result<ClientSocket, WsError> {
+    connect_downstream_with_headers(url, authorization, &[]).await
+}
+
+async fn connect_downstream_with_headers(
+    url: &str,
+    authorization: Option<&str>,
+    headers: &[(&'static str, &'static str)],
+) -> Result<ClientSocket, WsError> {
     let mut request = url
         .into_client_request()
         .expect("build downstream WebSocket request");
@@ -623,6 +631,12 @@ async fn connect_downstream(
             authorization
                 .parse()
                 .expect("valid downstream authorization header"),
+        );
+    }
+    for &(name, value) in headers {
+        request.headers_mut().insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
         );
     }
     timeout(TEST_TIMEOUT, connect_async(request))
@@ -946,9 +960,14 @@ async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normali
         },
     )
     .await;
-    let mut socket = connect_downstream(
+    let mut socket = connect_downstream_with_headers(
         &relay.websocket_url(),
         Some(&format!("Bearer {CLIENT_KEY}")),
+        &[
+            ("thread_id", "thread-123"),
+            ("x-codex-beta-features", "beta-one"),
+            ("x-oai-attestation", "must-not-pass"),
+        ],
     )
     .await
     .expect("upgrade downstream WebSocket");
@@ -988,6 +1007,19 @@ async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normali
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("codex_cli_rs/0.147.0 "))
     );
+    assert_eq!(
+        headers
+            .get("thread_id")
+            .and_then(|value| value.to_str().ok()),
+        Some("thread-123")
+    );
+    assert_eq!(
+        headers
+            .get("x-codex-beta-features")
+            .and_then(|value| value.to_str().ok()),
+        Some("beta-one")
+    );
+    assert!(!headers.contains_key("x-oai-attestation"));
     assert_ne!(
         headers
             .get("authorization")

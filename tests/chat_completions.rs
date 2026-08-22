@@ -15,7 +15,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
     routing::post,
 };
@@ -68,6 +68,7 @@ impl UpstreamReply {
 struct UpstreamState {
     replies: Mutex<VecDeque<UpstreamReply>>,
     requests: Mutex<Vec<Value>>,
+    latest_headers: Mutex<HeaderMap>,
     request_count: AtomicUsize,
 }
 
@@ -82,6 +83,7 @@ impl ScriptedUpstream {
         let state = Arc::new(UpstreamState {
             replies: Mutex::new(replies.into()),
             requests: Mutex::new(Vec::new()),
+            latest_headers: Mutex::new(HeaderMap::new()),
             request_count: AtomicUsize::new(0),
         });
         let app = Router::new()
@@ -115,10 +117,15 @@ impl Drop for ScriptedUpstream {
     }
 }
 
-async fn upstream_handler(State(state): State<Arc<UpstreamState>>, body: Bytes) -> Response<Body> {
+async fn upstream_handler(
+    State(state): State<Arc<UpstreamState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
     state.request_count.fetch_add(1, Ordering::SeqCst);
     let request = serde_json::from_slice(&body).unwrap_or(Value::Null);
     state.requests.lock().await.push(request);
+    *state.latest_headers.lock().await = headers;
 
     let reply = state.replies.lock().await.pop_front().unwrap_or_else(|| {
         UpstreamReply::Json(
@@ -412,6 +419,33 @@ async fn accepts_only_the_documented_non_streaming_defaults() {
         assert_eq!(request["store"], false);
         assert!(request.get("n").is_none());
     }
+}
+
+#[tokio::test]
+async fn chat_completions_forwards_the_codex_header_allowlist() {
+    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![completed_event(
+        "resp_headers",
+        text_output("done"),
+    )])])
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    let response = relay
+        .request(&minimal_request())
+        .header("x-openai-subagent", "reviewer")
+        .header("x-codex-installation-id", "must-not-pass")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = upstream.state.latest_headers.lock().await;
+    assert_eq!(headers.get("x-openai-subagent").unwrap(), "reviewer");
+    assert!(!headers.contains_key("x-codex-installation-id"));
+    assert_ne!(
+        headers.get(header::AUTHORIZATION).unwrap(),
+        format!("Bearer {API_KEY}").as_str()
+    );
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use http::HeaderMap;
 use http::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::{Response, StatusCode, header::HeaderValue};
 use secrecy::ExposeSecret;
@@ -7,9 +8,9 @@ use serde_json::Value;
 use url::Url;
 
 use crate::credentials::{CredentialError, CredentialManager, CredentialSnapshot};
-
-const CODEX_VERSION: &str = "0.147.0";
-const CODEX_USER_AGENT: &str = "codex_cli_rs/0.147.0 (codex-api)";
+use crate::upstream_headers::{
+    CODEX_ORIGINATOR, CODEX_USER_AGENT, CODEX_VERSION, codex_passthrough_headers,
+};
 
 pub(crate) struct UpstreamHttpClient {
     client: reqwest::Client,
@@ -35,13 +36,19 @@ impl UpstreamHttpClient {
         }
     }
 
-    pub(crate) async fn send(&self, body: &Value) -> Result<Response, UpstreamHttpError> {
+    pub(crate) async fn send(
+        &self,
+        body: &Value,
+        downstream_headers: &HeaderMap,
+    ) -> Result<Response, UpstreamHttpError> {
         let credential = self
             .credentials
             .credentials()
             .await
             .map_err(UpstreamHttpError::Credentials)?;
-        let response = self.send_once(body, &credential).await?;
+        let response = self
+            .send_once(body, downstream_headers, &credential)
+            .await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
@@ -51,7 +58,9 @@ impl UpstreamHttpClient {
             .refresh_after_unauthorized(credential.generation)
             .await
             .map_err(UpstreamHttpError::CredentialRefresh)?;
-        let response = self.send_once(body, &credential).await?;
+        let response = self
+            .send_once(body, downstream_headers, &credential)
+            .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             Err(UpstreamHttpError::AuthenticationRejected)
         } else {
@@ -62,6 +71,7 @@ impl UpstreamHttpClient {
     async fn send_once(
         &self,
         body: &Value,
+        downstream_headers: &HeaderMap,
         credential: &CredentialSnapshot,
     ) -> Result<Response, UpstreamHttpError> {
         let mut authorization = HeaderValue::from_str(&format!(
@@ -74,10 +84,11 @@ impl UpstreamHttpClient {
             .post(self.responses_url.clone())
             .header(AUTHORIZATION, authorization)
             .header("ChatGPT-Account-ID", &credential.account_id)
-            .header("originator", "codex_cli_rs")
+            .header("originator", CODEX_ORIGINATOR)
             .header("version", CODEX_VERSION)
             .header(USER_AGENT, CODEX_USER_AGENT)
             .header(ACCEPT, "text/event-stream")
+            .headers(codex_passthrough_headers(downstream_headers))
             .json(body)
             .send()
             .await

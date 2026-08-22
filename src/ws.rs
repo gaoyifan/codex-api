@@ -51,6 +51,7 @@ pub(crate) async fn responses_websocket(
         result = connect_upstream_websocket(
             &state.config.upstream.base_url,
             Arc::clone(&state.credentials),
+            &headers,
         ) => result,
     };
     let upstream = match upstream_result {

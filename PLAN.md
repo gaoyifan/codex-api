@@ -256,6 +256,8 @@ wss://chatgpt.com/backend-api/codex/responses
 
 Send the current access token as Bearer authentication and the configured account as `ChatGPT-Account-ID`. Mirror the stable headers required by the current official Codex client, including its originator, version/User-Agent behavior, SSE accept header, and the current Responses WebSocket beta header. Do not forward the downstream authorization header upstream.
 
+On Responses HTTP, Chat Completions, and WebSocket requests, forward downstream values for the New API Codex allowlist: `Originator`, `Session_id`, `Thread_id`, `Session-Id`, `Thread-Id`, `X-Client-Request-Id`, `User-Agent`, `X-Codex-Beta-Features`, `X-Codex-Turn-State`, `X-Codex-Turn-Metadata`, `X-Codex-Window-Id`, `X-Codex-Parent-Thread-Id`, `X-OpenAI-Subagent`, `X-OpenAI-Memgen-Request`, `X-ResponsesAPI-Include-Timing-Metrics`, and `X-OpenAI-Internal-Codex-Responses-Lite`. Apply this allowlist without a `prompt_cache_key` gate. Keep the relay defaults when `Originator` or `User-Agent` is absent, and do not forward `X-Codex-Installation-Id` or `X-OAI-Attestation`.
+
 Refresh behavior:
 
 - Decode the trusted access token's JWT payload to discover expiry; signature verification is not needed because this is expiry inspection, not authentication.
