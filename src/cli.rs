@@ -8,7 +8,10 @@ use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use rust_decimal::Decimal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
-use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{
+    Date, Duration as TimeDuration, OffsetDateTime,
+    format_description::{self, well_known::Rfc3339},
+};
 
 use crate::config::Config;
 
@@ -33,8 +36,8 @@ enum Command {
     Serve,
     /// Show recent request logs.
     Logs(LogsArgs),
-    /// Show current-week usage statistics for every configured API key.
-    Stat,
+    /// Show usage statistics for every configured API key.
+    Stat(StatArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -51,6 +54,14 @@ struct LogsArgs {
     since: Option<OffsetDateTime>,
     #[arg(long, value_parser = parse_rfc3339)]
     until: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, ClapArgs)]
+struct StatArgs {
+    #[arg(long, value_parser = parse_date)]
+    start_date: Option<Date>,
+    #[arg(long, value_parser = parse_date)]
+    end_date: Option<Date>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -84,7 +95,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     match args.command {
         Command::Serve => crate::run(&args.config).await,
         Command::Logs(logs) => print_logs(&args.config, logs).await,
-        Command::Stat => print_stat(&args.config).await,
+        Command::Stat(stat) => print_stat(&args.config, stat).await,
     }
 }
 
@@ -200,25 +211,35 @@ async fn open_read_only(path: &Path) -> anyhow::Result<SqlitePool> {
         .with_context(|| format!("failed to open SQLite state {}", path.display()))
 }
 
-async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
+async fn print_stat(config_path: &Path, args: StatArgs) -> anyhow::Result<()> {
+    let now = OffsetDateTime::now_utc();
+    let week_start =
+        now.date() - TimeDuration::days(i64::from(now.weekday().number_days_from_monday()));
+    let start_date = args.start_date.unwrap_or(week_start);
+    let end_date = args.end_date.unwrap_or(week_start + TimeDuration::days(6));
+    if start_date > end_date {
+        return Err(anyhow!(
+            "--start-date must be earlier than or equal to --end-date"
+        ));
+    }
+    let range_start = start_date.midnight().assume_utc();
+    let range_end = end_date
+        .next_day()
+        .ok_or_else(|| anyhow!("--end-date is out of range"))?
+        .midnight()
+        .assume_utc();
     let config = Config::load(config_path)?;
     let pool = open_read_only(&config.state.path).await?;
-    let now = OffsetDateTime::now_utc();
-    let week_start = (now.date()
-        - TimeDuration::days(i64::from(now.weekday().number_days_from_monday())))
-    .midnight()
-    .assume_utc();
-    let next_week = week_start + TimeDuration::days(7);
     let rows = sqlx::query(
         "SELECT api_key_id, input_tokens, cached_input_tokens, cost_usd FROM request_logs \
          WHERE julianday(requested_at) >= julianday(?) \
            AND julianday(requested_at) < julianday(?)",
     )
-    .bind(week_start.format(&Rfc3339)?)
-    .bind(next_week.format(&Rfc3339)?)
+    .bind(range_start.format(&Rfc3339)?)
+    .bind(range_end.format(&Rfc3339)?)
     .fetch_all(&pool)
     .await
-    .context("failed to query current-week quota usage")?;
+    .context("failed to query usage statistics")?;
     let mut spent_by_key = BTreeMap::<String, Decimal>::new();
     let mut tokens_by_key = BTreeMap::<String, (i64, i64)>::new();
     for row in rows {
@@ -230,7 +251,7 @@ async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
             let spent = spent_by_key.entry(api_key_id.clone()).or_default();
             *spent = spent
                 .checked_add(cost)
-                .ok_or_else(|| anyhow!("current-week quota spend is out of range"))?;
+                .ok_or_else(|| anyhow!("usage spend is out of range"))?;
         }
         if let Some(input_tokens) = row.try_get::<Option<i64>, _>("input_tokens")? {
             let cached_input_tokens = row
@@ -240,15 +261,15 @@ async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
             tokens.0 = tokens
                 .0
                 .checked_add(input_tokens)
-                .ok_or_else(|| anyhow!("current-week input token count is out of range"))?;
+                .ok_or_else(|| anyhow!("input token count is out of range"))?;
             tokens.1 = tokens
                 .1
                 .checked_add(cached_input_tokens)
-                .ok_or_else(|| anyhow!("current-week cached input token count is out of range"))?;
+                .ok_or_else(|| anyhow!("cached input token count is out of range"))?;
         }
     }
 
-    println!("Week starting {}", week_start.format(&Rfc3339)?);
+    println!("Date range {start_date} through {end_date}");
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -305,4 +326,10 @@ fn parse_rfc3339(value: &str) -> Result<OffsetDateTime, String> {
         return Err("timestamps must use whole-second precision".to_owned());
     }
     Ok(timestamp)
+}
+
+fn parse_date(value: &str) -> Result<Date, String> {
+    let format = format_description::parse_borrowed::<3>("[year]-[month]-[day]")
+        .expect("date format description is valid");
+    Date::parse(value, &format).map_err(|error| error.to_string())
 }

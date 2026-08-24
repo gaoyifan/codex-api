@@ -288,9 +288,13 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stat output");
-    let formatted_week = week_start.format(&Rfc3339).expect("format week start");
+    let week_end = week_start + Duration::days(6);
     assert!(
-        stdout.contains(&format!("Week starting {formatted_week}")),
+        stdout.contains(&format!(
+            "Date range {} through {}",
+            week_start.date(),
+            week_end.date()
+        )),
         "{stdout}"
     );
     for expected in [
@@ -355,6 +359,128 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
         assert!(
             !stdout.contains(removed),
             "found removed column in:\n{stdout}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stat_includes_both_ends_of_a_custom_date_range() {
+    let fixture = Fixture::new().await;
+    let start = OffsetDateTime::parse("2026-08-10T00:00:00Z", &Rfc3339)
+        .expect("parse range start")
+        .unix_timestamp()
+        * 1_000;
+    let end = OffsetDateTime::parse("2026-08-12T00:00:00Z", &Rfc3339)
+        .expect("parse day after range end")
+        .unix_timestamp()
+        * 1_000;
+    fixture
+        .execute(&format!(
+            "INSERT INTO request_ledger (requested_at_ms, api_key_id, model, api_protocol, \
+             transport, input_tokens, cached_input_tokens, cost_nano_usd, status) VALUES \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 100, 100, 1000000000, 'completed'), \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 100, 25, 2000000000, 'completed'), \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 300, 75, 3000000000, 'completed'), \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 100, 100, 4000000000, 'completed')",
+            start - 1_000,
+            start,
+            end - 1_000,
+            end,
+        ))
+        .await;
+
+    let output = fixture
+        .command("stat")
+        .args(["--start-date", "2026-08-10", "--end-date", "2026-08-11"])
+        .output()
+        .expect("run custom-range stat command");
+    assert!(
+        output.status.success(),
+        "stat failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stat output");
+    assert!(
+        stdout.contains("Date range 2026-08-10 through 2026-08-11"),
+        "{stdout}"
+    );
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("client-unlimited"))
+        .expect("client-unlimited table row");
+    assert!(row.contains("5.000000000"), "{row}");
+    assert!(row.contains("25.00%"), "{row}");
+}
+
+#[tokio::test]
+async fn stat_defaults_each_missing_date_to_the_current_week_boundary() {
+    let fixture = Fixture::new().await;
+    let now = OffsetDateTime::now_utc();
+    let monday = now.date() - Duration::days(i64::from(now.weekday().number_days_from_monday()));
+    let tuesday = monday + Duration::days(1);
+    let sunday = monday + Duration::days(6);
+    fixture
+        .execute(&format!(
+            "INSERT INTO request_ledger (requested_at_ms, api_key_id, model, api_protocol, \
+             transport, cost_nano_usd, status) VALUES \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 1000000000, 'completed'), \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 2000000000, 'completed'), \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 4000000000, 'completed')",
+            monday.midnight().assume_utc().unix_timestamp() * 1_000,
+            tuesday.midnight().assume_utc().unix_timestamp() * 1_000,
+            sunday.midnight().assume_utc().unix_timestamp() * 1_000,
+        ))
+        .await;
+
+    let end_only = fixture
+        .command("stat")
+        .args(["--end-date", &monday.to_string()])
+        .output()
+        .expect("run end-only stat command");
+    assert!(end_only.status.success());
+    let stdout = String::from_utf8(end_only.stdout).expect("UTF-8 end-only stat output");
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("client-unlimited"))
+        .expect("end-only table row");
+    assert!(row.contains("1.000000000"), "{row}");
+
+    let start_only = fixture
+        .command("stat")
+        .args(["--start-date", &tuesday.to_string()])
+        .output()
+        .expect("run start-only stat command");
+    assert!(start_only.status.success());
+    let stdout = String::from_utf8(start_only.stdout).expect("UTF-8 start-only stat output");
+    let row = stdout
+        .lines()
+        .find(|line| line.contains("client-unlimited"))
+        .expect("start-only table row");
+    assert!(row.contains("6.000000000"), "{row}");
+}
+
+#[tokio::test]
+async fn stat_rejects_invalid_dates_and_reversed_ranges() {
+    let fixture = Fixture::new().await;
+    let cases = [
+        (vec!["--start-date", "not-a-date"], "not-a-date"),
+        (vec!["--end-date", "2026-02-30"], "2026-02-30"),
+        (
+            vec!["--start-date", "2026-08-11", "--end-date", "2026-08-10"],
+            "--start-date must be earlier than or equal to --end-date",
+        ),
+    ];
+    for (args, expected) in cases {
+        let output = fixture
+            .command("stat")
+            .args(args)
+            .output()
+            .expect("run invalid stat command");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stat error");
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in: {stderr}"
         );
     }
 }

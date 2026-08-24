@@ -76,7 +76,7 @@ checkout without installing under `/etc`, use:
 export CODEX_API_CONFIG="$PWD/config.toml"
 codex-api serve
 codex-api logs
-codex-api stat
+codex-api stat [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD]
 ```
 
 `SIGINT` and `SIGTERM` stop new connections and cancel Responses, Chat, and
@@ -284,13 +284,15 @@ key ID, UTC request time, model and reasoning effort, API protocol and
 transport, input/cached-input/output tokens in thousands, exact USD cost,
 duration, and status. Missing accounting values are shown as `—`.
 
-`stat` prints every configured API key in configuration order for the current
-UTC week, beginning Monday at 00:00. It shows exact spend, the percentage of
-input tokens served from cache, and `unlimited`, `available`, `fallback`, or
-`blocked` status. Cache rate is shown as `—` when no input tokens were recorded:
+`stat` prints every configured API key in configuration order for a UTC date
+range. `--start-date` and `--end-date` are inclusive and may be specified
+independently; omitted values default to the current week's Monday and Sunday,
+respectively. It shows exact spend, the percentage of input tokens served from
+cache, and `unlimited`, `available`, `fallback`, or `blocked` status. Cache rate
+is shown as `—` when no input tokens were recorded:
 
 ```bash
-codex-api stat
+codex-api stat --start-date 2026-08-01 --end-date 2026-08-31
 ```
 
 Both query commands open the existing state database read-only. They do not

@@ -38,7 +38,7 @@ queries:
 
 ```text
 codex-api logs [--limit N] [--api-key-id ID] [--model MODEL] [--status STATUS] [--since RFC3339] [--until RFC3339]
-codex-api stat
+codex-api stat [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD]
 ```
 
 All commands resolve configuration in this order: explicit `--config`, the
@@ -54,11 +54,13 @@ API key ID, UTC time, model/reasoning, protocol/transport,
 input/cached-input/output tokens in thousands, exact USD cost, duration, and
 status. Null accounting values display as `—`.
 
-`stat` lists every configured API key in configuration order for the current
-UTC week beginning Monday at 00:00, including spend, cached input tokens as a
-percentage of total input tokens, and `unlimited`, `available`, `fallback`, or
-`blocked` status. Cache rate is `—` when no input tokens were recorded. It sums
-non-null persisted cost values exactly. A limited key
+`stat` lists every configured API key in configuration order for a UTC date
+range. Start and end dates are inclusive and may be specified independently;
+omitted values default to the current week's Monday and Sunday, respectively.
+The table includes spend, cached input tokens as a percentage of total input
+tokens, and `unlimited`, `available`, `fallback`, or `blocked` status. Cache
+rate is `—` when no input tokens were recorded. It sums non-null persisted cost
+values exactly. A limited key
 is `available` below its soft limit, `fallback` between soft and hard when
 `fallback_model` is configured, and `blocked` at or above the hard limit (or at
 or above the soft limit when no `fallback_model` is configured).
@@ -440,7 +442,7 @@ After the test suite is complete, sub-agents may implement separate config/state
 
 - `logs` defaults to the latest 20 rows in reverse ledger order and renders the documented compact columns and null markers
 - key, model, status, inclusive `since`, exclusive `until`, and positive limit filters work independently and together; invalid filters fail with actionable errors
-- `stat` lists all configured keys in order and reports exact current-UTC-week spend, cache rate, and unlimited/available/fallback/blocked state
+- `stat` lists all configured keys in order and reports exact spend, cache rate, and unlimited/available/fallback/blocked state for its default or requested inclusive UTC date range
 - both commands work while the relay owns a WAL database, make no network requests, do not initialize credentials, do not modify or create state, and never reveal secrets
 
 ### Downstream authentication
