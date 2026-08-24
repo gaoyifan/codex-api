@@ -210,9 +210,8 @@ async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
     .assume_utc();
     let next_week = week_start + TimeDuration::days(7);
     let rows = sqlx::query(
-        "SELECT api_key_id, cost_usd FROM request_logs \
-         WHERE cost_usd IS NOT NULL \
-           AND julianday(requested_at) >= julianday(?) \
+        "SELECT api_key_id, input_tokens, cached_input_tokens, cost_usd FROM request_logs \
+         WHERE julianday(requested_at) >= julianday(?) \
            AND julianday(requested_at) < julianday(?)",
     )
     .bind(week_start.format(&Rfc3339)?)
@@ -221,16 +220,32 @@ async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
     .await
     .context("failed to query current-week quota usage")?;
     let mut spent_by_key = BTreeMap::<String, Decimal>::new();
+    let mut tokens_by_key = BTreeMap::<String, (i64, i64)>::new();
     for row in rows {
         let api_key_id = row.try_get::<String, _>("api_key_id")?;
-        let cost = row
-            .try_get::<String, _>("cost_usd")?
-            .parse::<Decimal>()
-            .context("request_logs contains an invalid cost_usd value")?;
-        let spent = spent_by_key.entry(api_key_id).or_default();
-        *spent = spent
-            .checked_add(cost)
-            .ok_or_else(|| anyhow!("current-week quota spend is out of range"))?;
+        if let Some(cost) = row.try_get::<Option<String>, _>("cost_usd")? {
+            let cost = cost
+                .parse::<Decimal>()
+                .context("request_logs contains an invalid cost_usd value")?;
+            let spent = spent_by_key.entry(api_key_id.clone()).or_default();
+            *spent = spent
+                .checked_add(cost)
+                .ok_or_else(|| anyhow!("current-week quota spend is out of range"))?;
+        }
+        if let Some(input_tokens) = row.try_get::<Option<i64>, _>("input_tokens")? {
+            let cached_input_tokens = row
+                .try_get::<Option<i64>, _>("cached_input_tokens")?
+                .unwrap_or(0);
+            let tokens = tokens_by_key.entry(api_key_id).or_default();
+            tokens.0 = tokens
+                .0
+                .checked_add(input_tokens)
+                .ok_or_else(|| anyhow!("current-week input token count is out of range"))?;
+            tokens.1 = tokens
+                .1
+                .checked_add(cached_input_tokens)
+                .ok_or_else(|| anyhow!("current-week cached input token count is out of range"))?;
+        }
     }
 
     println!("Week starting {}", week_start.format(&Rfc3339)?);
@@ -238,13 +253,21 @@ async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
     table
         .load_preset(UTF8_FULL)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(["API KEY", "SPENT USD", "STATUS"]);
+        .set_header(["API KEY", "SPENT USD", "CACHE RATE", "STATUS"]);
     let fallback_configured = config.fallback_model.is_some();
     for api_key in &config.api_keys {
         let spent = spent_by_key
             .get(&api_key.id)
             .copied()
             .unwrap_or(Decimal::ZERO);
+        let cache_rate = match tokens_by_key.get(&api_key.id) {
+            Some((input_tokens, cached_input_tokens)) if *input_tokens > 0 => format!(
+                "{:.2}%",
+                Decimal::from(*cached_input_tokens) * Decimal::ONE_HUNDRED
+                    / Decimal::from(*input_tokens)
+            ),
+            _ => "—".to_owned(),
+        };
         let status = match (api_key.weekly_limit_usd, api_key.hard_limit_usd) {
             (None, _) => "unlimited",
             (Some(soft), Some(hard_limit)) => {
@@ -258,7 +281,12 @@ async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
             }
             (Some(_), None) => unreachable!("limited keys always have a hard limit"),
         };
-        table.add_row([api_key.id.clone(), format!("{spent:.9}"), status.to_owned()]);
+        table.add_row([
+            api_key.id.clone(),
+            format!("{spent:.9}"),
+            cache_rate,
+            status.to_owned(),
+        ]);
     }
     println!("{table}");
     Ok(())

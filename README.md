@@ -285,8 +285,9 @@ transport, input/cached-input/output tokens in thousands, exact USD cost,
 duration, and status. Missing accounting values are shown as `—`.
 
 `stat` prints every configured API key in configuration order for the current
-UTC week, beginning Monday at 00:00. It shows exact spend and `unlimited`,
-`available`, `fallback`, or `blocked` status:
+UTC week, beginning Monday at 00:00. It shows exact spend, the percentage of
+input tokens served from cache, and `unlimited`, `available`, `fallback`, or
+`blocked` status. Cache rate is shown as `—` when no input tokens were recorded:
 
 ```bash
 codex-api stat

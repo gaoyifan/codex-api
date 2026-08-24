@@ -267,12 +267,12 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
     fixture
         .execute(&format!(
             "INSERT INTO request_ledger (requested_at_ms, api_key_id, model, api_protocol, \
-             transport, cost_nano_usd, status) VALUES \
-             ({}, 'client-a', 'gpt-query', 'responses', 'http_sse', 1000000000, 'completed'), \
-             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 2500000000, 'completed'), \
-             ({}, 'client-available', 'gpt-query', 'responses', 'http_sse', 250000000, 'completed'), \
-             ({}, 'client-a', 'gpt-query', 'responses', 'http_sse', 9000000000, 'completed'), \
-             ({}, 'client-a', 'gpt-query', 'responses', 'http_sse', NULL, 'upstream_error')",
+             transport, input_tokens, cached_input_tokens, cost_nano_usd, status) VALUES \
+             ({}, 'client-a', 'gpt-query', 'responses', 'http_sse', 1000, 250, 1000000000, 'completed'), \
+             ({}, 'client-unlimited', 'gpt-query', 'responses', 'http_sse', 500, 250, 2500000000, 'completed'), \
+             ({}, 'client-available', 'gpt-query', 'responses', 'http_sse', 2000, 0, 250000000, 'completed'), \
+             ({}, 'client-a', 'gpt-query', 'responses', 'http_sse', 1000, 1000, 9000000000, 'completed'), \
+             ({}, 'client-a', 'gpt-query', 'responses', 'http_sse', NULL, NULL, NULL, 'upstream_error')",
             week_start_ms + 1_000,
             week_start_ms + 2_000,
             week_start_ms + 3_000,
@@ -296,6 +296,7 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
     for expected in [
         "API KEY",
         "SPENT USD",
+        "CACHE RATE",
         "STATUS",
         "client-a",
         "1.000000000",
@@ -326,6 +327,26 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
         client_a < unlimited && unlimited < available && available < empty,
         "{stdout}"
     );
+    let client_a_row = stdout
+        .lines()
+        .find(|line| line.contains("client-a"))
+        .expect("client-a table row");
+    assert!(client_a_row.contains("25.00%"), "{client_a_row}");
+    let unlimited_row = stdout
+        .lines()
+        .find(|line| line.contains("client-unlimited"))
+        .expect("client-unlimited table row");
+    assert!(unlimited_row.contains("50.00%"), "{unlimited_row}");
+    let available_row = stdout
+        .lines()
+        .find(|line| line.contains("client-available"))
+        .expect("client-available table row");
+    assert!(available_row.contains("0.00%"), "{available_row}");
+    let empty_row = stdout
+        .lines()
+        .find(|line| line.contains("client-empty"))
+        .expect("client-empty table row");
+    assert!(empty_row.contains('—'), "{empty_row}");
     assert!(
         !stdout.contains("9.000000000"),
         "previous week leaked into stat:\n{stdout}"
