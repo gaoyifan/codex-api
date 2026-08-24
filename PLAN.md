@@ -55,14 +55,12 @@ input/cached-input/output tokens in thousands, exact USD cost, duration, and
 status. Null accounting values display as `—`.
 
 `stat` lists every configured API key in configuration order for the current
-UTC week beginning Monday at 00:00, including spend, soft limit, hard limit,
-remaining hard-limit headroom, and `unlimited`, `available`, `fallback`, or
-`blocked` status. It sums non-null persisted cost values exactly. A limited key
+UTC week beginning Monday at 00:00, including spend and `unlimited`,
+`available`, `fallback`, or `blocked` status. It sums non-null persisted cost
+values exactly. A limited key
 is `available` below its soft limit, `fallback` between soft and hard when
 `fallback_model` is configured, and `blocked` at or above the hard limit (or at
-or above the soft limit when no `fallback_model` is configured). Remaining is
-always relative to the hard limit for limited keys (zero only when hard spend
-is exhausted).
+or above the soft limit when no `fallback_model` is configured).
 
 Both queries load configuration but open the existing SQLite database
 read-only. They do not create or migrate it, initialize ChatGPT credentials,
@@ -441,7 +439,7 @@ After the test suite is complete, sub-agents may implement separate config/state
 
 - `logs` defaults to the latest 20 rows in reverse ledger order and renders the documented compact columns and null markers
 - key, model, status, inclusive `since`, exclusive `until`, and positive limit filters work independently and together; invalid filters fail with actionable errors
-- `stat` lists all configured keys in order and reports exact current-UTC-week spend, soft/hard limits, remaining hard-limit headroom, and unlimited/available/fallback/blocked state
+- `stat` lists all configured keys in order and reports exact current-UTC-week spend and unlimited/available/fallback/blocked state
 - both commands work while the relay owns a WAL database, make no network requests, do not initialize credentials, do not modify or create state, and never reveal secrets
 
 ### Downstream authentication

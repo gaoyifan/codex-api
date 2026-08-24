@@ -238,60 +238,27 @@ async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
     table
         .load_preset(UTF8_FULL)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header([
-            "API KEY",
-            "SPENT USD",
-            "LIMIT USD",
-            "HARD USD",
-            "REMAINING USD",
-            "STATUS",
-        ]);
+        .set_header(["API KEY", "SPENT USD", "STATUS"]);
     let fallback_configured = config.fallback_model.is_some();
     for api_key in &config.api_keys {
         let spent = spent_by_key
             .get(&api_key.id)
             .copied()
             .unwrap_or(Decimal::ZERO);
-        let (limit, hard, remaining, status) = match (api_key.weekly_limit_usd, api_key.hard_limit_usd)
-        {
-            (None, _) => (
-                "—".to_owned(),
-                "—".to_owned(),
-                "—".to_owned(),
-                "unlimited",
-            ),
+        let status = match (api_key.weekly_limit_usd, api_key.hard_limit_usd) {
+            (None, _) => "unlimited",
             (Some(soft), Some(hard_limit)) => {
-                let remaining = if spent >= hard_limit {
-                    Decimal::ZERO
-                } else {
-                    hard_limit - spent
-                };
-                let status = if spent >= hard_limit
-                    || (spent >= soft && !fallback_configured)
-                {
+                if spent >= hard_limit || (spent >= soft && !fallback_configured) {
                     "blocked"
                 } else if spent >= soft {
                     "fallback"
                 } else {
                     "available"
-                };
-                (
-                    soft.normalize().to_string(),
-                    hard_limit.normalize().to_string(),
-                    remaining.normalize().to_string(),
-                    status,
-                )
+                }
             }
             (Some(_), None) => unreachable!("limited keys always have a hard limit"),
         };
-        table.add_row([
-            api_key.id.clone(),
-            format!("{spent:.9}"),
-            limit,
-            hard,
-            remaining,
-            status.to_owned(),
-        ]);
+        table.add_row([api_key.id.clone(), format!("{spent:.9}"), status.to_owned()]);
     }
     println!("{table}");
     Ok(())

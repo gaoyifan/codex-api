@@ -281,10 +281,7 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
         ))
         .await;
 
-    let output = fixture
-        .command("stat")
-        .output()
-        .expect("run stat command");
+    let output = fixture.command("stat").output().expect("run stat command");
     assert!(
         output.status.success(),
         "stat failed: {}",
@@ -299,24 +296,18 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
     for expected in [
         "API KEY",
         "SPENT USD",
-        "LIMIT USD",
-        "HARD USD",
-        "REMAINING USD",
         "STATUS",
         "client-a",
         "1.000000000",
         "blocked",
-        "599",
         "client-unlimited",
         "2.500000000",
         "unlimited",
         "client-available",
         "0.250000000",
         "available",
-        "599.75",
         "client-empty",
         "0.000000000",
-        "600",
     ] {
         assert!(
             stdout.contains(expected),
@@ -339,6 +330,12 @@ async fn stat_lists_every_configured_key_for_the_current_utc_week() {
         !stdout.contains("9.000000000"),
         "previous week leaked into stat:\n{stdout}"
     );
+    for removed in ["LIMIT USD", "HARD USD", "REMAINING USD"] {
+        assert!(
+            !stdout.contains(removed),
+            "found removed column in:\n{stdout}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -365,10 +362,7 @@ async fn stat_reports_fallback_status_when_soft_limit_is_exhausted_with_fallback
         ))
         .await;
 
-    let output = fixture
-        .command("stat")
-        .output()
-        .expect("run stat command");
+    let output = fixture.command("stat").output().expect("run stat command");
     assert!(
         output.status.success(),
         "stat failed: {}",
@@ -378,10 +372,6 @@ async fn stat_reports_fallback_status_when_soft_limit_is_exhausted_with_fallback
     assert!(
         stdout.contains("fallback"),
         "expected fallback status in:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("599.5"),
-        "expected remaining hard budget in:\n{stdout}"
     );
 }
 
