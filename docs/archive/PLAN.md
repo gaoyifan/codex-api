@@ -1,5 +1,8 @@
 # Simplified Codex API Relay Implementation Plan
 
+> Archived implementation plan. The README and executable tests describe the
+> current behavior.
+
 ## 1. Summary
 
 Build a Rust 2024 service named `codex-api` that relays requests to one ChatGPT Codex subscription. The service is configured entirely through TOML, stores mutable state and request accounting in SQLite, and has no users, registration, login, management UI, Redis, model discovery, or multi-account scheduling.

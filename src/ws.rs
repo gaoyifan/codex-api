@@ -67,26 +67,17 @@ pub(crate) async fn responses_websocket(
     websocket
         .on_upgrade(move |downstream| async move {
             let _websocket_task = websocket_task;
-            proxy_connection(downstream, upstream, state, identity).await;
+            WsSession {
+                downstream,
+                upstream,
+                state,
+                identity,
+                active: None,
+            }
+            .run()
+            .await;
         })
         .into_response()
-}
-
-async fn proxy_connection(
-    downstream: WebSocket,
-    upstream: UpstreamWebSocket,
-    state: Arc<AppState>,
-    identity: ClientIdentity,
-) {
-    WsSession {
-        downstream,
-        upstream,
-        state,
-        identity,
-        active: None,
-    }
-    .run()
-    .await;
 }
 
 struct WsSession {
