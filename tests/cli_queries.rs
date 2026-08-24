@@ -256,7 +256,7 @@ async fn logs_combines_common_filters_and_limits_newest_first() {
 }
 
 #[tokio::test]
-async fn quota_lists_every_configured_key_for_the_current_utc_week() {
+async fn stat_lists_every_configured_key_for_the_current_utc_week() {
     let fixture = Fixture::new().await;
     let now = OffsetDateTime::now_utc();
     let week_start = (now.date()
@@ -282,15 +282,15 @@ async fn quota_lists_every_configured_key_for_the_current_utc_week() {
         .await;
 
     let output = fixture
-        .command("quota")
+        .command("stat")
         .output()
-        .expect("run quota command");
+        .expect("run stat command");
     assert!(
         output.status.success(),
-        "quota failed: {}",
+        "stat failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).expect("UTF-8 quota output");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stat output");
     let formatted_week = week_start.format(&Rfc3339).expect("format week start");
     assert!(
         stdout.contains(&format!("Week starting {formatted_week}")),
@@ -337,19 +337,19 @@ async fn quota_lists_every_configured_key_for_the_current_utc_week() {
     );
     assert!(
         !stdout.contains("9.000000000"),
-        "previous week leaked into quota:\n{stdout}"
+        "previous week leaked into stat:\n{stdout}"
     );
 }
 
 #[tokio::test]
-async fn quota_reports_fallback_status_when_soft_limit_is_exhausted_with_fallback_model() {
+async fn stat_reports_fallback_status_when_soft_limit_is_exhausted_with_fallback_model() {
     let fixture = Fixture::new().await;
     let config = std::fs::read_to_string(&fixture.config_path).expect("read CLI config");
     std::fs::write(
         &fixture.config_path,
         format!("fallback_model = \"gpt-query\"\n{config}"),
     )
-    .expect("enable fallback model for quota CLI");
+    .expect("enable fallback model for stat CLI");
     let now = OffsetDateTime::now_utc();
     let week_start = (now.date()
         - Duration::days(i64::from(now.weekday().number_days_from_monday())))
@@ -366,15 +366,15 @@ async fn quota_reports_fallback_status_when_soft_limit_is_exhausted_with_fallbac
         .await;
 
     let output = fixture
-        .command("quota")
+        .command("stat")
         .output()
-        .expect("run quota command");
+        .expect("run stat command");
     assert!(
         output.status.success(),
-        "quota failed: {}",
+        "stat failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).expect("UTF-8 quota output");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stat output");
     assert!(
         stdout.contains("fallback"),
         "expected fallback status in:\n{stdout}"
@@ -465,7 +465,7 @@ async fn logs_rejects_invalid_filters_with_actionable_errors() {
 async fn query_commands_are_read_only_and_never_print_configured_secrets() {
     let fixture = Fixture::new().await;
     let before = std::fs::read(&fixture.database_path).expect("read database before queries");
-    for command in ["logs", "quota"] {
+    for command in ["logs", "stat"] {
         let output = fixture
             .command(command)
             .output()

@@ -38,7 +38,7 @@ queries:
 
 ```text
 codex-api logs [--limit N] [--api-key-id ID] [--model MODEL] [--status STATUS] [--since RFC3339] [--until RFC3339]
-codex-api quota
+codex-api stat
 ```
 
 All commands resolve configuration in this order: explicit `--config`, the
@@ -54,7 +54,7 @@ API key ID, UTC time, model/reasoning, protocol/transport,
 input/cached-input/output tokens in thousands, exact USD cost, duration, and
 status. Null accounting values display as `—`.
 
-`quota` lists every configured API key in configuration order for the current
+`stat` lists every configured API key in configuration order for the current
 UTC week beginning Monday at 00:00, including spend, soft limit, hard limit,
 remaining hard-limit headroom, and `unlimited`, `available`, `fallback`, or
 `blocked` status. It sums non-null persisted cost values exactly. A limited key
@@ -399,7 +399,7 @@ The test seams are fixed as follows:
 - restart-based observation for internal credential state
 - a controlled clock injected through the library `run_with_clock` boundary for
   expiry, duration, and week-boundary behavior; the binary uses the system clock
-- real binary processes for the human-oriented `logs` and `quota` query CLI
+- real binary processes for the human-oriented `logs` and `stat` query CLI
 - direct read-only SQL against the public `request_logs` view for scripted and
   custom inspection
 
@@ -441,7 +441,7 @@ After the test suite is complete, sub-agents may implement separate config/state
 
 - `logs` defaults to the latest 20 rows in reverse ledger order and renders the documented compact columns and null markers
 - key, model, status, inclusive `since`, exclusive `until`, and positive limit filters work independently and together; invalid filters fail with actionable errors
-- `quota` lists all configured keys in order and reports exact current-UTC-week spend, soft/hard limits, remaining hard-limit headroom, and unlimited/available/fallback/blocked state
+- `stat` lists all configured keys in order and reports exact current-UTC-week spend, soft/hard limits, remaining hard-limit headroom, and unlimited/available/fallback/blocked state
 - both commands work while the relay owns a WAL database, make no network requests, do not initialize credentials, do not modify or create state, and never reveal secrets
 
 ### Downstream authentication

@@ -76,7 +76,7 @@ checkout without installing under `/etc`, use:
 export CODEX_API_CONFIG="$PWD/config.toml"
 codex-api serve
 codex-api logs
-codex-api quota
+codex-api stat
 ```
 
 `SIGINT` and `SIGTERM` stop new connections and cancel Responses, Chat, and
@@ -284,13 +284,13 @@ key ID, UTC request time, model and reasoning effort, API protocol and
 transport, input/cached-input/output tokens in thousands, exact USD cost,
 duration, and status. Missing accounting values are shown as `—`.
 
-`quota` prints every configured API key in configuration order for the current
+`stat` prints every configured API key in configuration order for the current
 UTC week, beginning Monday at 00:00. It shows exact spend, soft limit, hard
 limit, remaining hard-limit headroom, and `unlimited`, `available`, `fallback`,
 or `blocked` status:
 
 ```bash
-codex-api quota
+codex-api stat
 ```
 
 Both query commands open the existing state database read-only. They do not

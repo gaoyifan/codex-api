@@ -33,8 +33,8 @@ enum Command {
     Serve,
     /// Show recent request logs.
     Logs(LogsArgs),
-    /// Show current-week quota usage for every configured API key.
-    Quota,
+    /// Show current-week usage statistics for every configured API key.
+    Stat,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -84,7 +84,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     match args.command {
         Command::Serve => crate::run(&args.config).await,
         Command::Logs(logs) => print_logs(&args.config, logs).await,
-        Command::Quota => print_quota(&args.config).await,
+        Command::Stat => print_stat(&args.config).await,
     }
 }
 
@@ -200,7 +200,7 @@ async fn open_read_only(path: &Path) -> anyhow::Result<SqlitePool> {
         .with_context(|| format!("failed to open SQLite state {}", path.display()))
 }
 
-async fn print_quota(config_path: &Path) -> anyhow::Result<()> {
+async fn print_stat(config_path: &Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     let pool = open_read_only(&config.state.path).await?;
     let now = OffsetDateTime::now_utc();
