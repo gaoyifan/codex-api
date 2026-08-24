@@ -61,9 +61,13 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
 
     let config = Arc::new(config::Config::load(config_path)?);
     let store = Arc::new(
-        store::Store::open(&config.state.path, Arc::clone(&clock))
-            .await
-            .context("failed to initialize SQLite state")?,
+        store::Store::open(
+            &config.state.path,
+            config.state.file_mode,
+            Arc::clone(&clock),
+        )
+        .await
+        .context("failed to initialize SQLite state")?,
     );
     let http_client = reqwest::Client::builder()
         .build()

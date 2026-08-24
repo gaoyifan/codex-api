@@ -2,11 +2,7 @@ use axum::http::{HeaderMap, header::AUTHORIZATION};
 use secrecy::ExposeSecret;
 use subtle::ConstantTimeEq;
 
-use crate::{
-    config::Config,
-    error::ApiError,
-    store::QuotaLimits,
-};
+use crate::{config::Config, error::ApiError, store::QuotaLimits};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClientIdentity {

@@ -8,6 +8,9 @@ enable_websockets = true
 
 [state]
 path = "./codex-api.sqlite3"
+# Optional. Defaults to "0600". Grant access only to trusted users because the
+# database contains ChatGPT credentials.
+file_mode = "0600"
 
 [upstream]
 base_url = "https://chatgpt.com/backend-api/codex"

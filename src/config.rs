@@ -17,6 +17,7 @@ use crate::store::{EffectiveModel, ModelCandidates, ModelRates};
 const DEFAULT_UPSTREAM_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_HARD_LIMIT_USD: &str = "600.00";
+const DEFAULT_STATE_FILE_MODE: u32 = 0o600;
 const REASONING_EFFORTS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
@@ -45,6 +46,11 @@ pub(crate) struct ServerConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateConfig {
     pub(crate) path: PathBuf,
+    #[serde(
+        default = "default_state_file_mode",
+        deserialize_with = "deserialize_file_mode"
+    )]
+    pub(crate) file_mode: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -376,6 +382,26 @@ where
     Option::<String>::deserialize(deserializer)?
         .map(|value| value.parse().map_err(de::Error::custom))
         .transpose()
+}
+
+fn deserialize_file_mode<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 4
+        || !value.starts_with('0')
+        || !value.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+    {
+        return Err(de::Error::custom(
+            "file mode must be a four-digit octal string such as \"0600\"",
+        ));
+    }
+    u32::from_str_radix(&value, 8).map_err(de::Error::custom)
+}
+
+fn default_state_file_mode() -> u32 {
+    DEFAULT_STATE_FILE_MODE
 }
 
 fn default_upstream_base_url() -> Url {

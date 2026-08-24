@@ -112,8 +112,11 @@ See [config.example.toml](config.example.toml). Important rules:
 - Enabling downstream WebSockets requires `upstream.supports_websockets = true`.
 - Unknown fields fail startup, which makes configuration typos visible.
 
-The service creates a new SQLite state file with mode `0600`, enables WAL, and
-uses a bounded busy timeout. Run a single service instance against a state file.
+The service creates the SQLite state file with `state.file_mode` and reapplies
+that mode on startup. It defaults to `"0600"`; grant access only to trusted
+users because the database contains ChatGPT credentials. The service enables
+WAL and uses a bounded busy timeout. Run a single service instance against a
+state file.
 
 ## NixOS module
 

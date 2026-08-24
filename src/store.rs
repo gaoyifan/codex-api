@@ -162,8 +162,12 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    pub(crate) async fn open(path: &Path, clock: Arc<dyn Clock>) -> Result<Self, StoreError> {
-        create_private_file(path)?;
+    pub(crate) async fn open(
+        path: &Path,
+        file_mode: u32,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, StoreError> {
+        prepare_state_file(path, file_mode)?;
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(false)
@@ -466,11 +470,13 @@ fn credential_from_row(row: &SqliteRow) -> Result<Credential, StoreError> {
     })
 }
 
-fn create_private_file(path: &Path) -> Result<(), StoreError> {
+fn prepare_state_file(path: &Path, file_mode: u32) -> Result<(), StoreError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    options.mode(file_mode);
+    #[cfg(not(unix))]
+    let _ = file_mode;
     match options.open(path) {
         Ok(file) => {
             drop(file);
@@ -485,7 +491,7 @@ fn create_private_file(path: &Path) -> Result<(), StoreError> {
                 .into());
             }
             #[cfg(unix)]
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(file_mode))?;
             Ok(())
         }
         Err(error) => Err(error.into()),

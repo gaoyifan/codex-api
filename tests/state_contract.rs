@@ -150,6 +150,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(upstream: &FakeUpstream) -> Self {
+        Self::with_state_file_mode(upstream, None)
+    }
+
+    fn with_state_file_mode(upstream: &FakeUpstream, file_mode: Option<&str>) -> Self {
         let directory = tempfile::tempdir().expect("create state-contract fixture directory");
         let auth_path = directory.path().join("auth.json");
         let database_path = directory.path().join("state.sqlite3");
@@ -177,6 +181,9 @@ impl Fixture {
         .expect("write state-contract auth seed");
 
         let upstream_base_url = upstream.base_url();
+        let file_mode = file_mode
+            .map(|mode| format!("file_mode = \"{mode}\"\n"))
+            .unwrap_or_default();
         let config = format!(
             r#"[server]
 listen = "{listen}"
@@ -184,6 +191,7 @@ enable_websockets = false
 
 [state]
 path = "{}"
+{file_mode}
 
 [upstream]
 base_url = "{upstream_base_url}"
@@ -382,6 +390,45 @@ async fn new_sqlite_main_file_is_owner_read_write_only() {
         .mode()
         & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_mode_is_applied_to_new_sqlite_main_file() {
+    let _test_guard = TEST_LOCK.lock().await;
+    let upstream = FakeUpstream::start(UpstreamBehavior::Hold).await;
+    let fixture = Fixture::with_state_file_mode(&upstream, Some("0640"));
+    assert!(!fixture.database_path.exists());
+
+    let _relay = RelayProcess::start(&fixture).await;
+
+    let mode = std::fs::metadata(&fixture.database_path)
+        .expect("read new SQLite main-file metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_mode_is_applied_to_existing_sqlite_main_file() {
+    let _test_guard = TEST_LOCK.lock().await;
+    let upstream = FakeUpstream::start(UpstreamBehavior::Hold).await;
+    let fixture = Fixture::with_state_file_mode(&upstream, Some("0640"));
+    std::fs::write(&fixture.database_path, []).expect("create existing SQLite main file");
+    std::fs::set_permissions(
+        &fixture.database_path,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("set existing SQLite main-file mode");
+
+    let _relay = RelayProcess::start(&fixture).await;
+
+    let mode = std::fs::metadata(&fixture.database_path)
+        .expect("read existing SQLite main-file metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
