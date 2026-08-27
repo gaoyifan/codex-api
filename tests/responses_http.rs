@@ -573,11 +573,92 @@ async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
             .and_then(|value| value.to_str().ok()),
         Some("application/json")
     );
+    assert_eq!(
+        captured
+            .headers
+            .get("session_id")
+            .and_then(|value| value.to_str().ok()),
+        Some("cache-test")
+    );
 
     let mut expected = downstream_body;
     expected["store"] = json!(false);
     expected["reasoning"]["effort"] = json!("high");
     assert_eq!(captured.body, expected);
+}
+
+#[tokio::test]
+async fn responses_preserves_explicit_session_id_over_prompt_cache_key() {
+    for header_name in ["session_id", "session-id"] {
+        let mut upstream =
+            FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
+                completed_sse(),
+            )])])
+            .await;
+        let relay = Relay::start(&upstream.base_url()).await;
+        let response = authorized_request(&client(), &relay)
+            .header(header_name, "explicit-session")
+            .json(&json!({
+                "model": MODEL,
+                "input": "hello",
+                "stream": true,
+                "prompt_cache_key": "cache-test"
+            }))
+            .send()
+            .await
+            .expect("send Responses request");
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.expect("consume downstream stream");
+
+        let captured = upstream.next_request().await;
+        assert_eq!(
+            captured
+                .headers
+                .get(header_name)
+                .and_then(|value| value.to_str().ok()),
+            Some("explicit-session")
+        );
+        if header_name == "session-id" {
+            assert!(!captured.headers.contains_key("session_id"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_does_not_derive_session_id_from_an_unusable_prompt_cache_key() {
+    for prompt_cache_key in [
+        None,
+        Some(Value::Null),
+        Some(json!(42)),
+        Some(json!("")),
+        Some(json!("invalid\nheader")),
+    ] {
+        let mut upstream =
+            FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
+                completed_sse(),
+            )])])
+            .await;
+        let relay = Relay::start(&upstream.base_url()).await;
+        let mut body = json!({
+            "model": MODEL,
+            "input": "hello",
+            "stream": true
+        });
+        if let Some(prompt_cache_key) = prompt_cache_key {
+            body["prompt_cache_key"] = prompt_cache_key;
+        }
+        let response = authorized_request(&client(), &relay)
+            .json(&body)
+            .send()
+            .await
+            .expect("send Responses request");
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.expect("consume downstream stream");
+
+        let captured = upstream.next_request().await;
+        assert!(!captured.headers.contains_key("session_id"));
+        assert!(!captured.headers.contains_key("session-id"));
+    }
 }
 
 #[tokio::test]
