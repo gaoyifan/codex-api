@@ -43,6 +43,11 @@ in
     # Standard short-context prices: https://developers.openai.com/api/docs/pricing
     services.codex-api.settings.fallback_model = lib.mkDefault "gpt-5.6-luna";
     services.codex-api.settings.model_prices = {
+      "gpt-6-astra" = {
+        input_usd_per_million = lib.mkDefault "10.00";
+        cached_input_usd_per_million = lib.mkDefault "1.00";
+        output_usd_per_million = lib.mkDefault "50.00";
+      };
       "gpt-5.6-sol" = {
         input_usd_per_million = lib.mkDefault "5.00";
         cached_input_usd_per_million = lib.mkDefault "0.50";

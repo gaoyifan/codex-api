@@ -46,6 +46,14 @@ assert config.systemd.services.codex-api.serviceConfig.Group == "codex-api";
 pkgs.runCommand "codex-api-nixos-module-test" { } ''
   grep -F 'fallback_model = "gpt-5.6-luna"' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F '[model_prices.gpt-6-astra]' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F 'input_usd_per_million = "10.00"' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F 'cached_input_usd_per_million = "1.00"' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
+  grep -F 'output_usd_per_million = "50.00"' \
+    ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
   grep -F 'secret_file = "/run/agenix/codex-api-key"' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
   grep -F '[model_prices.' \
