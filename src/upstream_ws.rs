@@ -174,6 +174,10 @@ fn normalize_responses_lite_fields(
     disable_tools: bool,
 ) {
     object.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
+    object.insert(
+        "type".to_owned(),
+        Value::String("response.create".to_owned()),
+    );
     object.insert("store".to_owned(), Value::Bool(false));
     object.insert("stream".to_owned(), Value::Bool(true));
     if disable_tools {
