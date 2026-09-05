@@ -117,6 +117,14 @@ impl UpstreamHttpClient {
         Ok(models)
     }
 
+    pub(crate) async fn model(&self, slug: &str) -> Result<Option<Value>, UpstreamHttpError> {
+        Ok(self
+            .models()
+            .await?
+            .into_iter()
+            .find(|model| model.get("slug").and_then(Value::as_str) == Some(slug)))
+    }
+
     pub(crate) async fn send(
         &self,
         body: &Value,

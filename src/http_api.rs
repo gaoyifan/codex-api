@@ -7,9 +7,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
-use futures_util::stream;
+use futures_util::{SinkExt, StreamExt, stream};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 use tokio_util::sync::CancellationToken;
 
 mod request;
@@ -21,13 +22,14 @@ use crate::{
     chat::{self, ChatErrorKind, TerminalStatus},
     config::apply_effective_request,
     error::ApiError,
-    responses_terminal::{TerminalKind, Usage},
+    responses_terminal::{TerminalKind, Usage, parse_terminal_payload},
     sse::{SseRead, SseReader},
     state::AppState,
     store::{
         Admission, ApiProtocol, BillableUsage, EffectiveModel, FinalStatus, ModelAccess,
         ModelCandidates, ModelRates, RequestContext, RequestId, Transport,
     },
+    upstream_ws::{connect_upstream_websocket, prepare_responses_lite},
 };
 
 pub(crate) async fn models(
@@ -170,6 +172,65 @@ pub(crate) async fn responses(
         request_id,
         state.pending_requests.token(),
     );
+
+    let upstream_model = if effective_model.model == "gpt-6-astra" {
+        state
+            .upstream_http
+            .model(&effective_model.model)
+            .await
+            .map_err(|_| ApiError::gateway("Upstream models request failed"))?
+    } else {
+        None
+    };
+    if let Some(upstream_model) = upstream_model
+        && upstream_model
+            .get("use_responses_lite")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        let mut upstream = connect_upstream_websocket(
+            &state.config.upstream.base_url,
+            Arc::clone(&state.credentials),
+            &headers,
+        )
+        .await
+        .map_err(|_| ApiError::gateway("Failed to connect to the upstream WebSocket"))?;
+        prepare_responses_lite(
+            &mut upstream,
+            &mut upstream_body,
+            &upstream_model,
+            &format!("codex-api-{}", request_id.0),
+        )
+        .await
+        .map_err(|_| ApiError::gateway("Failed to prepare the upstream Responses session"))?;
+        upstream
+            .send(UpstreamMessage::Text(upstream_body.to_string().into()))
+            .await
+            .map_err(|_| ApiError::gateway("Failed to send the upstream WebSocket request"))?;
+
+        request.response_started(StatusCode::OK);
+        let (sender, receiver) = mpsc::channel::<Bytes>(16);
+        state
+            .pending_requests
+            .spawn(forward_websocket_responses_stream(
+                request,
+                rates,
+                upstream,
+                sender,
+                state.shutdown.clone(),
+            ));
+        let body_stream = stream::unfold(receiver, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|bytes| (Ok::<Bytes, Infallible>(bytes), receiver))
+        });
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(body_stream))
+            .expect("static streaming response is valid"));
+    }
 
     let upstream = send_upstream(&state, &mut request, &upstream_body, &headers).await?;
     if !upstream.status().is_success() {
@@ -607,6 +668,103 @@ async fn forward_responses_stream(
                 }
             }
             Ok(SseRead::Eof) | Err(_) => {
+                let _ = request
+                    .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+async fn forward_websocket_responses_stream(
+    mut request: PendingRequest,
+    rates: ModelRates,
+    mut upstream: crate::upstream_ws::UpstreamWebSocket,
+    sender: mpsc::Sender<Bytes>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            _ = sender.closed() => None,
+            next = upstream.next() => next,
+        };
+        let Some(Ok(message)) = next else {
+            let _ = request
+                .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
+                .await;
+            return;
+        };
+        match message {
+            UpstreamMessage::Text(text) => {
+                let event = match serde_json::from_str::<Value>(text.as_str()) {
+                    Ok(event) => event,
+                    Err(_) => {
+                        let _ = request
+                            .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
+                            .await;
+                        return;
+                    }
+                };
+                let event_name = match event.get("type").and_then(Value::as_str) {
+                    Some(event_name) => event_name.to_owned(),
+                    None => {
+                        let _ = request
+                            .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
+                            .await;
+                        return;
+                    }
+                };
+                let terminal = match parse_terminal_payload(event) {
+                    Ok(terminal) => terminal,
+                    Err(_) => {
+                        let _ = request
+                            .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
+                            .await;
+                        return;
+                    }
+                };
+                let bytes = Bytes::from(format!("id: \nevent: {event_name}\ndata: {text}\n\n"));
+                if let Some(terminal) = terminal {
+                    let status = match terminal.kind {
+                        TerminalKind::Completed => FinalStatus::Completed,
+                        TerminalKind::Incomplete => FinalStatus::Incomplete,
+                        TerminalKind::Failed | TerminalKind::Error => FinalStatus::UpstreamError,
+                    };
+                    if request
+                        .finish_terminal(
+                            status,
+                            StatusCode::OK,
+                            StatusCode::OK,
+                            terminal.usage.map(|usage| billable_usage(usage, rates)),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let _ = sender.send(bytes).await;
+                    return;
+                }
+                if sender.send(bytes).await.is_err() {
+                    let _ = request
+                        .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
+                        .await;
+                    return;
+                }
+            }
+            UpstreamMessage::Ping(payload) => {
+                if upstream.send(UpstreamMessage::Pong(payload)).await.is_err() {
+                    let _ = request
+                        .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
+                        .await;
+                    return;
+                }
+            }
+            UpstreamMessage::Pong(_) => {}
+            UpstreamMessage::Close(_) | UpstreamMessage::Binary(_) | UpstreamMessage::Frame(_) => {
                 let _ = request
                     .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
                     .await;

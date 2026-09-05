@@ -19,7 +19,7 @@ use crate::store::{
     Admission, ApiProtocol, BillableUsage, FinalStatus, ModelCandidates, ModelRates,
     RequestContext, RequestId, StoreError, Transport,
 };
-use crate::upstream_ws::{UpstreamWebSocket, connect_upstream_websocket};
+use crate::upstream_ws::{UpstreamWebSocket, connect_upstream_websocket, prepare_responses_lite};
 
 struct InFlight {
     request_id: RequestId,
@@ -238,6 +238,38 @@ impl WsSession {
         }
 
         apply_effective_request(&mut prepared.payload, &effective_model);
+        let model = if effective_model.model == "gpt-6-astra" {
+            match self.state.upstream_http.model(&effective_model.model).await {
+                Ok(model) => model,
+                Err(_) => {
+                    let _ = self
+                        .state
+                        .store
+                        .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
+                        .await;
+                    return Some(ConnectionEnd::UpstreamFailure);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(model) = model
+            && prepare_responses_lite(
+                &mut self.upstream,
+                &mut prepared.payload,
+                &model,
+                &format!("codex-api-{}", request_id.0),
+            )
+            .await
+            .is_err()
+        {
+            let _ = self
+                .state
+                .store
+                .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
+                .await;
+            return Some(ConnectionEnd::UpstreamFailure);
+        }
         if self
             .upstream
             .send(UpstreamMessage::Text(prepared.payload.to_string().into()))
