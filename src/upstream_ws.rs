@@ -120,7 +120,6 @@ pub(crate) async fn prepare_responses_lite(
     }
     prewarm_object.insert("input".to_owned(), Value::Array(input));
     prewarm_object.insert("generate".to_owned(), Value::Bool(false));
-    prewarm_object.remove("previous_response_id");
     prewarm_object.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
 
     upstream

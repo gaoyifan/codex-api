@@ -238,30 +238,29 @@ impl WsSession {
         }
 
         apply_effective_request(&mut prepared.payload, &effective_model);
-        let model = if effective_model.model == "gpt-6-astra" {
-            match self.state.upstream_http.model(&effective_model.model).await {
-                Ok(model) => model,
-                Err(_) => {
-                    let _ = self
-                        .state
-                        .store
-                        .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
-                        .await;
-                    return Some(ConnectionEnd::UpstreamFailure);
-                }
+        let model = match self.state.upstream_http.model(&effective_model.model).await {
+            Ok(Some(model))
+                if model.get("use_responses_lite").and_then(Value::as_bool) == Some(true) =>
+            {
+                model
             }
-        } else {
-            None
+            Ok(_) | Err(_) => {
+                let _ = self
+                    .state
+                    .store
+                    .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
+                    .await;
+                return Some(ConnectionEnd::UpstreamFailure);
+            }
         };
-        if let Some(model) = model
-            && prepare_responses_lite(
-                &mut self.upstream,
-                &mut prepared.payload,
-                &model,
-                &format!("codex-api-{}", request_id.0),
-            )
-            .await
-            .is_err()
+        if prepare_responses_lite(
+            &mut self.upstream,
+            &mut prepared.payload,
+            &model,
+            &format!("codex-api-{}", request_id.0),
+        )
+        .await
+        .is_err()
         {
             let _ = self
                 .state

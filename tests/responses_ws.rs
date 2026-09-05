@@ -144,6 +144,7 @@ impl FakeUpstream {
         };
         let app = Router::new()
             .route("/responses", get(fake_responses_websocket))
+            .route("/models", get(fake_models))
             .route("/oauth/token", post(fake_oauth_token))
             .with_state(state);
         let task = tokio::spawn(async move {
@@ -225,6 +226,22 @@ impl FakeUpstream {
     }
 }
 
+async fn fake_models() -> Json<Value> {
+    Json(json!({
+        "models": [{
+            "slug": MODEL,
+            "visibility": "list",
+            "use_responses_lite": true,
+            "base_instructions": "Follow the user's instructions.",
+        }, {
+            "slug": FALLBACK_MODEL,
+            "visibility": "list",
+            "use_responses_lite": true,
+            "base_instructions": "Follow the user's instructions.",
+        }]
+    }))
+}
+
 impl Drop for FakeUpstream {
     fn drop(&mut self) {
         self.task.abort();
@@ -290,6 +307,35 @@ async fn run_fake_upstream(mut socket: WebSocket, state: FakeUpstreamState, conn
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(AxumMessage::Text(text))) => {
+                        if serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|value| value.get("generate").and_then(Value::as_bool))
+                            == Some(false)
+                        {
+                            let prewarm = json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp-prewarm",
+                                    "status": "completed",
+                                    "output": [],
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "input_tokens_details": {"cached_tokens": 0},
+                                        "output_tokens": 0,
+                                        "output_tokens_details": {"reasoning_tokens": 0},
+                                        "total_tokens": 1
+                                    }
+                                }
+                            });
+                            if socket
+                                .send(AxumMessage::Text(prewarm.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
                         if state.events.send(UpstreamEvent::Text {
                             connection_id,
                             text: text.to_string(),
@@ -1035,7 +1081,12 @@ async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normali
     assert_eq!(upstream_create["type"], "response.create");
     assert_eq!(upstream_create["model"], MODEL);
     assert_eq!(upstream_create["input"], create["input"]);
-    assert_eq!(upstream_create["reasoning"], create["reasoning"]);
+    assert_eq!(
+        upstream_create["reasoning"]["effort"],
+        create["reasoning"]["effort"]
+    );
+    assert_eq!(upstream_create["reasoning"]["context"], "all_turns");
+    assert_eq!(upstream_create["previous_response_id"], "resp-prewarm");
     assert_eq!(upstream_create["store"], false);
     assert_eq!(upstream_create["stream"], true);
     assert!(upstream_create.get("background").is_none());
@@ -1504,7 +1555,7 @@ async fn sequential_turns_and_previous_response_id_reuse_the_same_upstream_conne
 
     send_json(&mut socket, &response_create("first turn", None)).await;
     let first = upstream.expect_text(connection.id).await;
-    assert!(first.get("previous_response_id").is_none());
+    assert_eq!(first["previous_response_id"], "resp-prewarm");
     let first_terminal = response_completed("resp-first", 1, 0, 1);
     connection.send_json(first_terminal.clone());
     assert_eq!(receive_json(&mut socket).await, first_terminal);
@@ -1515,7 +1566,7 @@ async fn sequential_turns_and_previous_response_id_reuse_the_same_upstream_conne
     )
     .await;
     let second = upstream.expect_text(connection.id).await;
-    assert_eq!(second["previous_response_id"], "resp-first");
+    assert_eq!(second["previous_response_id"], "resp-prewarm");
     assert_eq!(second["input"][0]["content"][0]["text"], "second turn");
     let second_terminal = response_completed("resp-second", 2, 0, 1);
     connection.send_json(second_terminal.clone());
@@ -1558,7 +1609,7 @@ async fn second_in_flight_create_is_rejected_locally_then_a_later_turn_is_allowe
     .await;
     let later = upstream.expect_text(connection.id).await;
     assert_eq!(later["input"][0]["content"][0]["text"], "now allowed");
-    assert_eq!(later["previous_response_id"], "resp-running");
+    assert_eq!(later["previous_response_id"], "resp-prewarm");
     let later_terminal = response_completed("resp-later", 1, 0, 1);
     connection.send_json(later_terminal.clone());
     assert_eq!(receive_json(&mut socket).await, later_terminal);

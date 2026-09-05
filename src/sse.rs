@@ -8,7 +8,6 @@ use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 
-use bytes::Bytes;
 use eventsource_stream::{Event, EventStream, EventStreamError, Eventsource};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
@@ -37,35 +36,6 @@ impl SseEvent {
     /// Consumes this record and returns its validated terminal payload.
     pub fn into_terminal(self) -> Option<TerminalEvent> {
         self.terminal
-    }
-
-    /// Encodes this record using canonical LF-delimited SSE framing.
-    ///
-    /// The effective event ID is always emitted, including an empty ID. This
-    /// preserves both inherited IDs and the SSE operation that resets an ID.
-    /// Every logical data line receives its own `data:` prefix.
-    pub fn canonical_bytes(&self) -> Bytes {
-        let mut encoded = String::new();
-
-        encoded.push_str("id: ");
-        encoded.push_str(&self.id);
-        encoded.push('\n');
-        encoded.push_str("event: ");
-        encoded.push_str(&self.event);
-        encoded.push('\n');
-        if let Some(retry) = self.retry {
-            encoded.push_str("retry: ");
-            encoded.push_str(&retry.as_millis().to_string());
-            encoded.push('\n');
-        }
-        for line in self.data.split('\n') {
-            encoded.push_str("data: ");
-            encoded.push_str(line);
-            encoded.push('\n');
-        }
-        encoded.push('\n');
-
-        Bytes::from(encoded)
     }
 }
 

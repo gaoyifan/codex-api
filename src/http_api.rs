@@ -173,79 +173,44 @@ pub(crate) async fn responses(
         state.pending_requests.token(),
     );
 
-    let upstream_model = if effective_model.model == "gpt-6-astra" {
-        state
-            .upstream_http
-            .model(&effective_model.model)
-            .await
-            .map_err(|_| ApiError::gateway("Upstream models request failed"))?
-    } else {
-        None
-    };
-    if let Some(upstream_model) = upstream_model
-        && upstream_model
-            .get("use_responses_lite")
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
-        let mut upstream = connect_upstream_websocket(
-            &state.config.upstream.base_url,
-            Arc::clone(&state.credentials),
-            &headers,
-        )
+    let upstream_model = state
+        .upstream_http
+        .model(&effective_model.model)
         .await
-        .map_err(|_| ApiError::gateway("Failed to connect to the upstream WebSocket"))?;
-        prepare_responses_lite(
-            &mut upstream,
-            &mut upstream_body,
-            &upstream_model,
-            &format!("codex-api-{}", request_id.0),
-        )
+        .map_err(|_| ApiError::gateway("Upstream models request failed"))?
+        .filter(|model| model.get("use_responses_lite").and_then(Value::as_bool) == Some(true))
+        .ok_or_else(|| ApiError::gateway("Upstream model does not support Responses Lite"))?;
+    let mut upstream = connect_upstream_websocket(
+        &state.config.upstream.base_url,
+        Arc::clone(&state.credentials),
+        &headers,
+    )
+    .await
+    .map_err(|_| ApiError::gateway("Failed to connect to the upstream WebSocket"))?;
+    prepare_responses_lite(
+        &mut upstream,
+        &mut upstream_body,
+        &upstream_model,
+        &format!("codex-api-{}", request_id.0),
+    )
+    .await
+    .map_err(|_| ApiError::gateway("Failed to prepare the upstream Responses session"))?;
+    upstream
+        .send(UpstreamMessage::Text(upstream_body.to_string().into()))
         .await
-        .map_err(|_| ApiError::gateway("Failed to prepare the upstream Responses session"))?;
-        upstream
-            .send(UpstreamMessage::Text(upstream_body.to_string().into()))
-            .await
-            .map_err(|_| ApiError::gateway("Failed to send the upstream WebSocket request"))?;
-
-        request.response_started(StatusCode::OK);
-        let (sender, receiver) = mpsc::channel::<Bytes>(16);
-        state
-            .pending_requests
-            .spawn(forward_websocket_responses_stream(
-                request,
-                rates,
-                upstream,
-                sender,
-                state.shutdown.clone(),
-            ));
-        let body_stream = stream::unfold(receiver, |mut receiver| async move {
-            receiver
-                .recv()
-                .await
-                .map(|bytes| (Ok::<Bytes, Infallible>(bytes), receiver))
-        });
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "text/event-stream")
-            .body(Body::from_stream(body_stream))
-            .expect("static streaming response is valid"));
-    }
-
-    let upstream = send_upstream(&state, &mut request, &upstream_body, &headers).await?;
-    if !upstream.status().is_success() {
-        return upstream_error_response(&mut request, state.shutdown.clone(), upstream).await;
-    }
+        .map_err(|_| ApiError::gateway("Failed to send the upstream WebSocket request"))?;
 
     request.response_started(StatusCode::OK);
     let (sender, receiver) = mpsc::channel::<Bytes>(16);
-    state.pending_requests.spawn(forward_responses_stream(
-        request,
-        rates,
-        upstream,
-        sender,
-        state.shutdown.clone(),
-    ));
+    state
+        .pending_requests
+        .spawn(forward_websocket_responses_stream(
+            request,
+            rates,
+            upstream,
+            sender,
+            state.shutdown.clone(),
+        ));
     let body_stream = stream::unfold(receiver, |mut receiver| async move {
         receiver
             .recv()
@@ -604,79 +569,6 @@ async fn send_upstream(
     }
 }
 
-async fn forward_responses_stream(
-    mut request: PendingRequest,
-    rates: ModelRates,
-    upstream: reqwest::Response,
-    sender: mpsc::Sender<Bytes>,
-    shutdown: CancellationToken,
-) {
-    let mut reader = SseReader::new(upstream.bytes_stream());
-    loop {
-        let next = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                let _ = request
-                    .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                    .await;
-                return;
-            }
-            _ = sender.closed() => {
-                let _ = request
-                    .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                    .await;
-                return;
-            }
-            next = reader.next() => next,
-        };
-        match next {
-            Ok(SseRead::Event(event)) => {
-                if let Some(terminal) = event.terminal() {
-                    let status = match terminal.kind {
-                        TerminalKind::Completed => FinalStatus::Completed,
-                        TerminalKind::Incomplete => FinalStatus::Incomplete,
-                        TerminalKind::Failed | TerminalKind::Error => FinalStatus::UpstreamError,
-                    };
-                    let finalized = request
-                        .finish_terminal(
-                            status,
-                            StatusCode::OK,
-                            StatusCode::OK,
-                            terminal.usage.map(|usage| billable_usage(usage, rates)),
-                        )
-                        .await;
-                    if finalized.is_err() {
-                        return;
-                    }
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => {}
-                        _ = sender.send(event.canonical_bytes()) => {}
-                    }
-                    return;
-                }
-                let sent = tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => false,
-                    result = sender.send(event.canonical_bytes()) => result.is_ok(),
-                };
-                if !sent {
-                    let _ = request
-                        .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                        .await;
-                    return;
-                }
-            }
-            Ok(SseRead::Eof) | Err(_) => {
-                let _ = request
-                    .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                    .await;
-                return;
-            }
-        }
-    }
-}
-
 async fn forward_websocket_responses_stream(
     mut request: PendingRequest,
     rates: ModelRates,
@@ -903,48 +795,5 @@ async fn reject_request(
             Some(StatusCode::BAD_REQUEST.as_u16()),
         )
         .await
-        .map_err(|_| ApiError::internal())
-}
-
-async fn upstream_error_response(
-    request: &mut PendingRequest,
-    shutdown: CancellationToken,
-    upstream: reqwest::Response,
-) -> Result<Response, ApiError> {
-    let status = upstream.status();
-    request.upstream_error_started(status);
-    let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
-    let body_result = tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => {
-            request
-                .finish(FinalStatus::UpstreamError, Some(status), None)
-                .await?;
-            return Err(ApiError::shutdown());
-        }
-        result = upstream.bytes() => result,
-    };
-    let body = match body_result {
-        Ok(body) => body,
-        Err(_) => {
-            request
-                .finish(
-                    FinalStatus::UpstreamError,
-                    Some(StatusCode::BAD_GATEWAY),
-                    None,
-                )
-                .await?;
-            return Err(ApiError::gateway("Upstream error body failed"));
-        }
-    };
-    request
-        .finish(FinalStatus::UpstreamError, Some(status), None)
-        .await?;
-    let mut response = Response::builder().status(status);
-    if let Some(content_type) = content_type {
-        response = response.header(CONTENT_TYPE, content_type);
-    }
-    response
-        .body(Body::from(body))
         .map_err(|_| ApiError::internal())
 }

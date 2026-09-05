@@ -42,12 +42,6 @@ impl PendingRequest {
         self.open_mut().drop_http_status = Some(status.as_u16());
     }
 
-    pub(super) fn upstream_error_started(&mut self, status: StatusCode) {
-        let open = self.open_mut();
-        open.drop_status = FinalStatus::UpstreamError;
-        open.drop_http_status = Some(status.as_u16());
-    }
-
     pub(super) async fn finish(
         &mut self,
         status: FinalStatus,

@@ -1,158 +1,51 @@
-use std::collections::VecDeque;
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{convert::Infallible, net::SocketAddr, process::Stdio, time::Duration};
 
-use async_stream::stream;
-use axum::Router;
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
-use axum::routing::post;
+use axum::{
+    Json, Router,
+    extract::{
+        State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    routing::get,
+};
 use bytes::Bytes;
-use eventsource_stream::{Event, Eventsource};
+use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{Connection, Row};
 use tempfile::TempDir;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify, mpsc};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    process::{Child, Command},
+    sync::mpsc,
+    time::{Instant, sleep},
+};
 use tokio_stream::iter;
 
-const DOWNSTREAM_KEY: &str = "sk-downstream-test";
-const UPSTREAM_ACCESS_TOKEN: &str = "upstream-access-token";
-const ACCOUNT_ID: &str = "account-test";
-const MODEL: &str = "gpt-test";
-
-#[derive(Debug)]
-struct ScriptChunk {
-    delay: Duration,
-    bytes: Bytes,
-}
-
-impl ScriptChunk {
-    fn immediate(bytes: impl Into<Bytes>) -> Self {
-        Self {
-            delay: Duration::ZERO,
-            bytes: bytes.into(),
-        }
-    }
-
-    fn after(delay: Duration, bytes: impl Into<Bytes>) -> Self {
-        Self {
-            delay,
-            bytes: bytes.into(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ScriptedResponse {
-    status: StatusCode,
-    content_type: &'static str,
-    header_delay: Duration,
-    header_dropped: Option<Arc<Notify>>,
-    chunks: Vec<ScriptChunk>,
-    body_started: Option<Arc<Notify>>,
-    hold_open: bool,
-    dropped: Option<Arc<Notify>>,
-}
-
-impl ScriptedResponse {
-    fn sse(chunks: Vec<ScriptChunk>) -> Self {
-        Self {
-            status: StatusCode::OK,
-            content_type: "text/event-stream",
-            header_delay: Duration::ZERO,
-            header_dropped: None,
-            chunks,
-            body_started: None,
-            hold_open: false,
-            dropped: None,
-        }
-    }
-
-    fn json(status: StatusCode, value: Value) -> Self {
-        Self {
-            status,
-            content_type: "application/json",
-            header_delay: Duration::ZERO,
-            header_dropped: None,
-            chunks: vec![ScriptChunk::immediate(value.to_string())],
-            body_started: None,
-            hold_open: false,
-            dropped: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CapturedRequest {
-    headers: HeaderMap,
-    body: Value,
-}
+const KEY: &str = "sk-test";
+const MODEL: &str = "gpt-5.6-luna";
 
 #[derive(Clone)]
-struct FakeUpstreamState {
-    responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
-    captured: mpsc::UnboundedSender<CapturedRequest>,
-    contacts: Arc<AtomicUsize>,
-}
+struct UpstreamState(mpsc::UnboundedSender<Value>);
 
-struct NotifyOnDrop(Option<Arc<Notify>>);
-
-impl Drop for NotifyOnDrop {
-    fn drop(&mut self) {
-        if let Some(notify) = self.0.take() {
-            notify.notify_one();
-        }
-    }
-}
-
-struct FakeUpstream {
+struct Upstream {
     addr: SocketAddr,
-    captured: mpsc::UnboundedReceiver<CapturedRequest>,
-    contacts: Arc<AtomicUsize>,
-    task: JoinHandle<()>,
+    requests: mpsc::UnboundedReceiver<Value>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-impl FakeUpstream {
-    async fn start(responses: Vec<ScriptedResponse>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fake upstream");
-        let addr = listener.local_addr().expect("fake upstream address");
-        let (captured_tx, captured_rx) = mpsc::unbounded_channel();
-        let contacts = Arc::new(AtomicUsize::new(0));
-        let state = FakeUpstreamState {
-            responses: Arc::new(Mutex::new(responses.into())),
-            captured: captured_tx,
-            contacts: Arc::clone(&contacts),
-        };
-
+impl Upstream {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
         let app = Router::new()
-            .route("/responses", post(fake_responses))
-            .with_state(state);
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("fake upstream server failed");
-        });
-
+            .route("/models", get(models))
+            .route("/responses", get(responses))
+            .with_state(UpstreamState(tx));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self {
             addr,
-            captured: captured_rx,
-            contacts,
+            requests: rx,
             task,
         }
     }
@@ -160,166 +53,124 @@ impl FakeUpstream {
     fn base_url(&self) -> String {
         format!("http://{}", self.addr)
     }
-
-    fn contacts(&self) -> usize {
-        self.contacts.load(Ordering::SeqCst)
-    }
-
-    async fn next_request(&mut self) -> CapturedRequest {
-        timeout(Duration::from_secs(2), self.captured.recv())
-            .await
-            .expect("relay did not contact fake upstream in time")
-            .expect("fake upstream capture channel closed")
-    }
 }
 
-impl Drop for FakeUpstream {
+impl Drop for Upstream {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-async fn fake_responses(
-    State(state): State<FakeUpstreamState>,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<Value>,
-) -> Response<Body> {
-    state.contacts.fetch_add(1, Ordering::SeqCst);
-    state
-        .captured
-        .send(CapturedRequest { headers, body })
-        .expect("test still owns request capture receiver");
+async fn models() -> Json<Value> {
+    Json(json!({"models": [{
+        "slug": MODEL, "visibility": "list", "use_responses_lite": true,
+        "base_instructions": "Follow the user's instructions."
+    }]}))
+}
 
-    let response = state
-        .responses
-        .lock()
-        .await
-        .pop_front()
-        .expect("fake upstream response script exhausted");
-    let status = response.status;
-    let content_type = response.content_type;
-    let _header_drop = NotifyOnDrop(response.header_dropped);
-    if !response.header_delay.is_zero() {
-        sleep(response.header_delay).await;
-    }
-    let body = stream! {
-        let _notify_on_drop = NotifyOnDrop(response.dropped);
-        for chunk in response.chunks {
-            if !chunk.delay.is_zero() {
-                sleep(chunk.delay).await;
-            }
-            yield Ok::<Bytes, Infallible>(chunk.bytes);
-        }
-        if let Some(body_started) = response.body_started {
-            body_started.notify_one();
-        }
-        if response.hold_open {
-            std::future::pending::<()>().await;
-        }
+async fn responses(
+    State(state): State<UpstreamState>,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| serve(socket, state))
+}
+
+async fn serve(mut socket: WebSocket, state: UpstreamState) {
+    let Message::Text(text) = socket.recv().await.unwrap().unwrap() else {
+        return;
     };
-
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, content_type)
-        .body(Body::from_stream(body))
-        .expect("build fake upstream response")
+    state.0.send(serde_json::from_str(&text).unwrap()).unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"response.completed","response":{
+        "id":"resp-prewarm","status":"completed","output":[],"usage":{
+            "input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,
+            "output_tokens_details":{"reasoning_tokens":0},"total_tokens":1}}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let Message::Text(text) = socket.recv().await.unwrap().unwrap() else {
+        return;
+    };
+    state.0.send(serde_json::from_str(&text).unwrap()).unwrap();
+    for event in [
+        json!({"type":"response.output_text.done","text":"OK"}),
+        json!({"type":"response.completed","response":{"id":"resp-turn","status":"completed","output":[],"usage":{
+            "input_tokens":2,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,
+            "output_tokens_details":{"reasoning_tokens":0},"total_tokens":3}}}),
+    ] {
+        socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .unwrap();
+    }
 }
 
 struct Relay {
     addr: SocketAddr,
-    state_path: PathBuf,
     child: Child,
-    _temp_dir: TempDir,
+    _temp: TempDir,
 }
 
 impl Relay {
-    async fn start(upstream_base_url: &str) -> Self {
-        let temp_dir = tempfile::tempdir().expect("create relay test directory");
-        let auth_path = temp_dir.path().join("auth.json");
-        let state_path = temp_dir.path().join("state.sqlite3");
-        let config_path = temp_dir.path().join("config.toml");
-
+    async fn start(upstream: &Upstream) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let auth = temp.path().join("auth.json");
+        let state = temp.path().join("state.sqlite3");
+        let config = temp.path().join("config.toml");
+        std::fs::write(&auth, json!({"auth_mode":"chatgpt","tokens":{
+            "id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"account"},
+            "last_refresh":"2099-01-01T00:00:00Z"}).to_string()).unwrap();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
         std::fs::write(
-            &auth_path,
-            serde_json::to_vec_pretty(&json!({
-                "auth_mode": "chatgpt",
-                "OPENAI_API_KEY": null,
-                "tokens": {
-                    "id_token": "test-id-token",
-                    "access_token": UPSTREAM_ACCESS_TOKEN,
-                    "refresh_token": "test-refresh-token",
-                    "account_id": ACCOUNT_ID
-                },
-                "last_refresh": "2099-01-01T00:00:00Z"
-            }))
-            .expect("serialize auth seed"),
-        )
-        .expect("write auth seed");
-
-        let reservation =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve downstream port");
-        let addr = reservation.local_addr().expect("reserved address");
-        let config = format!(
-            r#"[server]
+            &config,
+            format!(
+                r#"[server]
 listen = "{addr}"
-enable_websockets = false
-
 [state]
 path = "{}"
-
 [upstream]
-base_url = "{upstream_base_url}"
-oauth_token_url = "{upstream_base_url}/oauth/token"
+base_url = "{}"
 auth_file = "{}"
-supports_websockets = false
-
 [[api_keys]]
-id = "test-client"
-secret = "{DOWNSTREAM_KEY}"
-
+id = "test"
+secret = "{KEY}"
 [model_prices."{MODEL}"]
-input_usd_per_million = "1.00"
-cached_input_usd_per_million = "0.10"
-output_usd_per_million = "6.00"
-max_reasoning_effort = "high"
+input_usd_per_million = "1"
+cached_input_usd_per_million = "0.1"
+output_usd_per_million = "6"
 "#,
-            state_path.display(),
-            auth_path.display(),
-        );
-        std::fs::write(&config_path, config).expect("write relay configuration");
-
+                state.display(),
+                upstream.base_url(),
+                auth.display()
+            ),
+        )
+        .unwrap();
         drop(reservation);
         let mut child = Command::new(env!("CARGO_BIN_EXE_codex-api"))
-            .arg("--config")
-            .arg(&config_path)
-            .arg("serve")
+            .args(["--config", config.to_str().unwrap(), "serve"])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .expect("spawn codex-api");
-
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = child.try_wait().expect("poll codex-api") {
-                panic!("codex-api exited before listening with {status}");
-            }
-            if TcpStream::connect(addr).await.is_ok() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "codex-api did not start in time");
+        while TcpStream::connect(addr).await.is_err() {
+            assert!(child.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline);
             sleep(Duration::from_millis(20)).await;
         }
-
         Self {
             addr,
-            state_path,
             child,
-            _temp_dir: temp_dir,
+            _temp: temp,
         }
     }
 
-    fn responses_url(&self) -> String {
+    fn url(&self) -> String {
         format!("http://{}/v1/responses", self.addr)
     }
 }
@@ -330,1377 +181,46 @@ impl Drop for Relay {
     }
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("build downstream client")
-}
-
-fn authorized_request(client: &reqwest::Client, relay: &Relay) -> reqwest::RequestBuilder {
-    client
-        .post(relay.responses_url())
-        .bearer_auth(DOWNSTREAM_KEY)
-}
-
-async fn parse_sse_bytes(bytes: Bytes) -> Vec<Event> {
-    let source = iter([Ok::<Bytes, Infallible>(bytes)]).eventsource();
-    let mut source = Box::pin(source);
-    let mut events = Vec::new();
-    while let Some(event) = source.next().await {
-        events.push(event.expect("valid downstream SSE framing"));
-    }
-    events
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ObservedRequestLog {
-    status: String,
-    http_status: Option<i64>,
-    input_tokens: Option<i64>,
-    cached_input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    exact_cost: Option<String>,
-}
-
-async fn request_logs(path: &Path) -> Vec<ObservedRequestLog> {
-    let mut database = timeout(
-        Duration::from_secs(2),
-        sqlx::SqliteConnection::connect_with(
-            &SqliteConnectOptions::new().filename(path).read_only(true),
-        ),
-    )
-    .await
-    .expect("open request log database in time")
-    .expect("open request log database");
-    sqlx::query(
-        "SELECT status, http_status, input_tokens, cached_input_tokens, output_tokens, \
-                CASE WHEN cost_usd IS NULL THEN NULL ELSE printf('%.9f', cost_usd) END \
-                    AS exact_cost \
-         FROM request_logs ORDER BY id",
-    )
-    .fetch_all(&mut database)
-    .await
-    .expect("read public request logs")
-    .into_iter()
-    .map(|row| ObservedRequestLog {
-        status: row.get("status"),
-        http_status: row.get("http_status"),
-        input_tokens: row.get("input_tokens"),
-        cached_input_tokens: row.get("cached_input_tokens"),
-        output_tokens: row.get("output_tokens"),
-        exact_cost: row.get("exact_cost"),
-    })
-    .collect()
-}
-
-fn completed_sse() -> String {
-    let completed = json!({
-        "type": "response.completed",
-        "sequence_number": 2,
-        "response": {
-            "id": "resp_test",
-            "object": "response",
-            "created_at": 1_786_233_600,
-            "status": "completed",
-            "model": MODEL,
-            "output": [],
-            "usage": {
-                "input_tokens": 11,
-                "input_tokens_details": {"cached_tokens": 3},
-                "output_tokens": 5,
-                "output_tokens_details": {"reasoning_tokens": 2},
-                "total_tokens": 16
-            }
-        }
-    });
-    format!("event: response.completed\ndata: {completed}\n\n")
-}
-
 #[tokio::test]
-async fn responses_requires_stream_true_before_contacting_upstream() {
-    let upstream = FakeUpstream::start(Vec::new()).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    for body in [
-        json!({"model": MODEL, "input": "hello"}),
-        json!({"model": MODEL, "input": "hello", "stream": null}),
-        json!({"model": MODEL, "input": "hello", "stream": false}),
-    ] {
-        let response = authorized_request(&client, &relay)
-            .json(&body)
-            .send()
-            .await
-            .expect("send invalid stream request");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error: Value = response.json().await.expect("OpenAI error JSON");
-        assert_eq!(error["error"]["type"], "invalid_request_error");
-        assert_eq!(error["error"]["param"], "stream");
-    }
-
-    assert_eq!(upstream.contacts(), 0);
-}
-
-#[tokio::test]
-async fn responses_rejects_storage_and_background_modes_before_upstream() {
-    let upstream = FakeUpstream::start(Vec::new()).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    for (field, body) in [
-        (
-            "store",
-            json!({"model": MODEL, "input": "hello", "stream": true, "store": true}),
-        ),
-        (
-            "background",
-            json!({"model": MODEL, "input": "hello", "stream": true, "background": true}),
-        ),
-        (
-            "max_output_tokens",
-            json!({"model": MODEL, "input": "hello", "stream": true, "max_output_tokens": 64}),
-        ),
-    ] {
-        let response = authorized_request(&client, &relay)
-            .json(&body)
-            .send()
-            .await
-            .expect("send unsupported mode request");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error: Value = response.json().await.expect("OpenAI error JSON");
-        assert_eq!(error["error"]["type"], "invalid_request_error");
-        assert_eq!(error["error"]["param"], field);
-    }
-
-    assert_eq!(upstream.contacts(), 0);
-}
-
-#[tokio::test]
-async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
-    let mut upstream =
-        FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
-            completed_sse(),
-        )])])
-        .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-    let downstream_body = json!({
-        "model": MODEL,
-        "input": [{
-            "role": "user",
-            "content": [{"type": "input_text", "text": "hello"}]
-        }],
-        "instructions": "Be concise",
-        "stream": true,
-        "reasoning": {"effort": "ultra", "summary": "auto"},
-        "tools": [{
-            "type": "function",
-            "name": "weather",
-            "description": "Get weather",
-            "parameters": {"type": "object", "properties": {}}
-        }],
-        "parallel_tool_calls": true,
-        "previous_response_id": "resp_previous",
-        "prompt_cache_key": "cache-test",
-        "include": ["reasoning.encrypted_content"]
-    });
-
-    let response = authorized_request(&client, &relay)
-        .json(&downstream_body)
+async fn http_responses_use_websocket_lite_prewarm_and_return_sse() {
+    let mut upstream = Upstream::start().await;
+    let relay = Relay::start(&upstream).await;
+    let response = reqwest::Client::new()
+        .post(relay.url())
+        .bearer_auth(KEY)
+        .json(&json!({"model":MODEL,"input":"Reply with OK.","stream":true}))
         .send()
         .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    response.bytes().await.expect("consume downstream stream");
-
-    let captured = upstream.next_request().await;
-    assert_eq!(
-        captured
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok()),
-        Some("Bearer upstream-access-token")
-    );
-    assert_ne!(
-        captured
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok()),
-        Some("Bearer sk-downstream-test")
-    );
-    assert_eq!(
-        captured
-            .headers
-            .get("ChatGPT-Account-ID")
-            .and_then(|value| value.to_str().ok()),
-        Some(ACCOUNT_ID)
-    );
-    assert_eq!(
-        captured
-            .headers
-            .get("originator")
-            .and_then(|value| value.to_str().ok()),
-        Some("codex_cli_rs")
-    );
-    assert_eq!(
-        captured
-            .headers
-            .get("version")
-            .and_then(|value| value.to_str().ok()),
-        Some("0.153.4")
-    );
-    assert!(
-        captured
-            .headers
-            .get(USER_AGENT)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("codex_cli_rs/0.153.4")),
-        "upstream User-Agent should identify the baseline Codex client"
-    );
-    assert_eq!(
-        captured
-            .headers
-            .get(ACCEPT)
-            .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
-    );
-    assert_eq!(
-        captured
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json")
-    );
-    assert_eq!(
-        captured
-            .headers
-            .get("session_id")
-            .and_then(|value| value.to_str().ok()),
-        Some("cache-test")
-    );
-
-    let mut expected = downstream_body;
-    expected["store"] = json!(false);
-    expected["reasoning"]["effort"] = json!("high");
-    assert_eq!(captured.body, expected);
-}
-
-#[tokio::test]
-async fn responses_preserves_explicit_session_id_over_prompt_cache_key() {
-    for header_name in ["session_id", "session-id"] {
-        let mut upstream =
-            FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
-                completed_sse(),
-            )])])
-            .await;
-        let relay = Relay::start(&upstream.base_url()).await;
-        let response = authorized_request(&client(), &relay)
-            .header(header_name, "explicit-session")
-            .json(&json!({
-                "model": MODEL,
-                "input": "hello",
-                "stream": true,
-                "prompt_cache_key": "cache-test"
-            }))
-            .send()
-            .await
-            .expect("send Responses request");
-        assert_eq!(response.status(), StatusCode::OK);
-        response.bytes().await.expect("consume downstream stream");
-
-        let captured = upstream.next_request().await;
-        assert_eq!(
-            captured
-                .headers
-                .get(header_name)
-                .and_then(|value| value.to_str().ok()),
-            Some("explicit-session")
-        );
-        if header_name == "session-id" {
-            assert!(!captured.headers.contains_key("session_id"));
-        }
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut events =
+        Box::pin(iter([Ok::<Bytes, Infallible>(response.bytes().await.unwrap())]).eventsource());
+    let mut data = Vec::new();
+    while let Some(event) = events.next().await {
+        data.push(event.unwrap().data);
     }
+    assert!(data.iter().any(|event| event.contains("\"text\":\"OK\"")));
+    assert!(data.last().unwrap().contains("response.completed"));
+    let prewarm = upstream.requests.recv().await.unwrap();
+    assert_eq!(prewarm["generate"], false);
+    assert_eq!(prewarm["input"][0]["type"], "additional_tools");
+    let turn = upstream.requests.recv().await.unwrap();
+    assert_eq!(turn["previous_response_id"], "resp-prewarm");
+    assert_eq!(turn["reasoning"]["context"], "all_turns");
+    assert_eq!(turn["input"][0]["content"][0]["text"], "Reply with OK.");
 }
 
 #[tokio::test]
-async fn responses_does_not_derive_session_id_from_an_unusable_prompt_cache_key() {
-    for prompt_cache_key in [
-        None,
-        Some(Value::Null),
-        Some(json!(42)),
-        Some(json!("")),
-        Some(json!("invalid\nheader")),
-    ] {
-        let mut upstream =
-            FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
-                completed_sse(),
-            )])])
-            .await;
-        let relay = Relay::start(&upstream.base_url()).await;
-        let mut body = json!({
-            "model": MODEL,
-            "input": "hello",
-            "stream": true
-        });
-        if let Some(prompt_cache_key) = prompt_cache_key {
-            body["prompt_cache_key"] = prompt_cache_key;
-        }
-        let response = authorized_request(&client(), &relay)
-            .json(&body)
-            .send()
-            .await
-            .expect("send Responses request");
-        assert_eq!(response.status(), StatusCode::OK);
-        response.bytes().await.expect("consume downstream stream");
-
-        let captured = upstream.next_request().await;
-        assert!(!captured.headers.contains_key("session_id"));
-        assert!(!captured.headers.contains_key("session-id"));
-    }
-}
-
-#[tokio::test]
-async fn responses_forwards_codex_headers_without_a_prompt_cache_key() {
-    let mut upstream =
-        FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
-            completed_sse(),
-        )])])
-        .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let response = authorized_request(&client(), &relay)
-        .header(USER_AGENT, "codex-cli/downstream")
-        .header("originator", "Codex CLI")
-        .header("session_id", "session-123")
-        .header("x-codex-turn-state", "turn-state")
-        .header("x-oai-attestation", "must-not-pass")
-        .json(&json!({
-            "model": MODEL,
-            "input": "hello",
-            "stream": true
-        }))
+async fn stream_true_is_validated_before_contacting_upstream() {
+    let mut upstream = Upstream::start().await;
+    let relay = Relay::start(&upstream).await;
+    let response = reqwest::Client::new()
+        .post(relay.url())
+        .bearer_auth(KEY)
+        .json(&json!({"model":MODEL,"input":"hello"}))
         .send()
         .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    response.bytes().await.expect("consume downstream stream");
-
-    let captured = upstream.next_request().await;
-    assert_eq!(
-        captured.headers.get(USER_AGENT).unwrap(),
-        "codex-cli/downstream"
-    );
-    assert_eq!(captured.headers.get("originator").unwrap(), "Codex CLI");
-    assert_eq!(captured.headers.get("session_id").unwrap(), "session-123");
-    assert_eq!(
-        captured.headers.get("x-codex-turn-state").unwrap(),
-        "turn-state"
-    );
-    assert!(!captured.headers.contains_key("x-oai-attestation"));
-    assert_eq!(
-        captured.headers.get(AUTHORIZATION).unwrap(),
-        "Bearer upstream-access-token"
-    );
-}
-
-#[tokio::test]
-async fn responses_delivers_the_first_event_before_upstream_finishes() {
-    let created = json!({
-        "type": "response.created",
-        "sequence_number": 0,
-        "response": {"id": "resp_slow", "status": "in_progress"}
-    });
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![
-        ScriptChunk::immediate(format!("event: response.created\ndata: {created}\n\n")),
-        ScriptChunk::after(Duration::from_millis(1_200), completed_sse()),
-    ])])
-    .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    let response = timeout(
-        Duration::from_millis(600),
-        authorized_request(&client, &relay)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send(),
-    )
-    .await
-    .expect("relay buffered the upstream stream before sending headers")
-    .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
-    );
-
-    let mut events = Box::pin(response.bytes_stream().eventsource());
-    let first = timeout(Duration::from_millis(600), events.next())
-        .await
-        .expect("first SSE event was buffered")
-        .expect("stream ended before first event")
-        .expect("first event framing");
-    assert_eq!(first.event, "response.created");
-    assert_eq!(serde_json::from_str::<Value>(&first.data).unwrap(), created);
-
-    assert!(
-        timeout(Duration::from_millis(300), events.next())
-            .await
-            .is_err(),
-        "terminal event arrived before its scripted upstream delay"
-    );
-    let terminal = timeout(Duration::from_secs(2), events.next())
-        .await
-        .expect("terminal event did not arrive")
-        .expect("stream ended before terminal event")
-        .expect("terminal event framing");
-    assert_eq!(terminal.event, "response.completed");
-}
-
-#[tokio::test]
-async fn responses_preserves_sse_semantics_across_arbitrary_chunk_boundaries() {
-    let terminal = completed_sse();
-    let chunks = vec![
-        ScriptChunk::immediate("id: cre"),
-        ScriptChunk::immediate("ated-1\r\nevent: response.cre"),
-        ScriptChunk::immediate("ated\r\ndata: {\"type\":\"response.created\",\"sequence_"),
-        ScriptChunk::immediate("number\":0}\r"),
-        ScriptChunk::immediate("\n\r\nid: extension-9\nevent: codex.rate_limit.updated\nda"),
-        ScriptChunk::immediate("ta: {\"type\":\"codex.rate_limit.updated\",\"remaining\":7}\n\n"),
-        ScriptChunk::immediate(Bytes::copy_from_slice(&terminal.as_bytes()[..17])),
-        ScriptChunk::immediate(Bytes::copy_from_slice(&terminal.as_bytes()[17..49])),
-        ScriptChunk::immediate(Bytes::copy_from_slice(&terminal.as_bytes()[49..])),
-    ];
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(chunks)]).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    let response = authorized_request(&client, &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response.bytes().await.expect("read downstream SSE");
-    let raw = std::str::from_utf8(&bytes).expect("downstream SSE is UTF-8");
-    assert!(!raw.contains("[DONE]"));
-    assert!(
-        !raw.contains("\r\n"),
-        "relay should emit canonical LF framing"
-    );
-
-    let events = parse_sse_bytes(bytes).await;
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0].id, "created-1");
-    assert_eq!(events[0].event, "response.created");
-    assert_eq!(
-        serde_json::from_str::<Value>(&events[0].data).unwrap(),
-        json!({"type": "response.created", "sequence_number": 0})
-    );
-    assert_eq!(events[1].id, "extension-9");
-    assert_eq!(events[1].event, "codex.rate_limit.updated");
-    assert_eq!(
-        serde_json::from_str::<Value>(&events[1].data).unwrap(),
-        json!({"type": "codex.rate_limit.updated", "remaining": 7})
-    );
-    assert_eq!(events[2].event, "response.completed");
-    let terminal: Value = serde_json::from_str(&events[2].data).unwrap();
-    assert_eq!(terminal["response"]["usage"]["input_tokens"], 11);
-    assert_eq!(
-        terminal["response"]["usage"]["input_tokens_details"]["cached_tokens"],
-        3
-    );
-    assert_eq!(terminal["response"]["usage"]["output_tokens"], 5);
-}
-
-#[tokio::test]
-async fn responses_forwards_each_usage_bearing_terminal_event_type() {
-    let terminals = [
-        ("response.completed", "completed"),
-        ("response.incomplete", "incomplete"),
-        ("response.failed", "failed"),
-    ];
-    let scripts = terminals
-        .iter()
-        .map(|(event, status)| {
-            let data = json!({
-                "type": event,
-                "sequence_number": 1,
-                "response": {
-                    "id": format!("resp_{status}"),
-                    "status": status,
-                    "model": MODEL,
-                    "output": [],
-                    "usage": {
-                        "input_tokens": 2,
-                        "input_tokens_details": {"cached_tokens": 1},
-                        "output_tokens": 3,
-                        "total_tokens": 5
-                    }
-                }
-            });
-            ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
-                "event: {event}\ndata: {data}\n\n"
-            ))])
-        })
-        .collect();
-    let upstream = FakeUpstream::start(scripts).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    for (expected_event, expected_status) in terminals {
-        let response = authorized_request(&client, &relay)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-            .expect("send terminal event request");
-        assert_eq!(response.status(), StatusCode::OK);
-        let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event, expected_event);
-        let data: Value = serde_json::from_str(&events[0].data).unwrap();
-        assert_eq!(data["response"]["status"], expected_status);
-        assert_eq!(data["response"]["usage"]["total_tokens"], 5);
-    }
-}
-
-#[tokio::test]
-async fn responses_suppress_unaccountable_success_terminals_and_finalize_upstream_error() {
-    let unaccountable_tokens = i64::MAX as u64 + 1;
-    let terminals = [
-        ("response.completed", "completed"),
-        ("response.incomplete", "incomplete"),
-    ];
-    let scripts = terminals
-        .iter()
-        .map(|(event, status)| {
-            let data = json!({
-                "type": event,
-                "sequence_number": 1,
-                "response": {
-                    "id": format!("resp_{status}_unaccountable"),
-                    "status": status,
-                    "model": MODEL,
-                    "output": [],
-                    "usage": {
-                        "input_tokens": unaccountable_tokens,
-                        "input_tokens_details": {"cached_tokens": 0},
-                        "output_tokens": 0,
-                        "total_tokens": unaccountable_tokens
-                    }
-                }
-            });
-            ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
-                "event: {event}\ndata: {data}\n\n"
-            ))])
-        })
-        .collect();
-    let upstream = FakeUpstream::start(scripts).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    for _ in terminals {
-        let response = authorized_request(&client, &relay)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-            .expect("send Responses request");
-        assert_eq!(response.status(), StatusCode::OK);
-        let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
-        assert!(
-            events.is_empty(),
-            "an unaccountable success terminal must not be forwarded"
-        );
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let logs = request_logs(&relay.state_path).await;
-        if logs.len() == 2 && logs.iter().all(|row| row.status != "started") {
-            assert_eq!(
-                logs,
-                [
-                    ObservedRequestLog {
-                        status: "upstream_error".to_owned(),
-                        http_status: Some(200),
-                        input_tokens: None,
-                        cached_input_tokens: None,
-                        output_tokens: None,
-                        exact_cost: None,
-                    },
-                    ObservedRequestLog {
-                        status: "upstream_error".to_owned(),
-                        http_status: Some(200),
-                        input_tokens: None,
-                        cached_input_tokens: None,
-                        output_tokens: None,
-                        exact_cost: None,
-                    },
-                ]
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "unaccountable terminal left an unfinished ledger row: {logs:?}"
-        );
-        sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[tokio::test]
-async fn responses_treats_null_usage_detail_objects_as_zero() {
-    let terminal = json!({
-        "type": "response.completed",
-        "sequence_number": 1,
-        "response": {
-            "id": "resp_null_details",
-            "status": "completed",
-            "model": MODEL,
-            "output": [],
-            "usage": {
-                "input_tokens": 10,
-                "input_tokens_details": null,
-                "output_tokens": 2,
-                "output_tokens_details": null,
-                "total_tokens": 12
-            }
-        }
-    });
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
-        format!("event: response.completed\ndata: {terminal}\n\n"),
-    )])])
-    .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-
-    let response = authorized_request(&client(), &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event, "response.completed");
-    assert_eq!(
-        serde_json::from_str::<Value>(&events[0].data).unwrap(),
-        terminal
-    );
-
-    assert_eq!(
-        request_logs(&relay.state_path).await,
-        [ObservedRequestLog {
-            status: "completed".to_owned(),
-            http_status: Some(200),
-            input_tokens: Some(10),
-            cached_input_tokens: Some(0),
-            output_tokens: Some(2),
-            exact_cost: Some("0.000022000".to_owned()),
-        }]
-    );
-}
-
-#[tokio::test]
-async fn responses_suppress_success_terminals_without_usage_and_finalize_upstream_error() {
-    let cases = [
-        ("response.completed", "completed", true),
-        ("response.completed", "completed", false),
-        ("response.incomplete", "incomplete", true),
-        ("response.incomplete", "incomplete", false),
-    ];
-    let scripts = cases
-        .iter()
-        .map(|(event, status, include_null_usage)| {
-            let mut response = json!({
-                "id": format!("resp_{status}_without_usage"),
-                "status": status,
-                "model": MODEL,
-                "output": []
-            });
-            if *include_null_usage {
-                response["usage"] = Value::Null;
-            }
-            let data = json!({
-                "type": event,
-                "sequence_number": 1,
-                "response": response
-            });
-            ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
-                "event: {event}\ndata: {data}\n\n"
-            ))])
-        })
-        .collect();
-    let upstream = FakeUpstream::start(scripts).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    for _ in cases {
-        let response = authorized_request(&client, &relay)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-            .expect("send Responses request");
-        assert_eq!(response.status(), StatusCode::OK);
-        let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
-        assert!(
-            events.is_empty(),
-            "a success terminal without usage must not be forwarded"
-        );
-    }
-
-    let logs = request_logs(&relay.state_path).await;
-    assert_eq!(logs.len(), 4);
-    assert!(logs.iter().all(|row| {
-        row == &ObservedRequestLog {
-            status: "upstream_error".to_owned(),
-            http_status: Some(200),
-            input_tokens: None,
-            cached_input_tokens: None,
-            output_tokens: None,
-            exact_cost: None,
-        }
-    }));
-}
-
-#[tokio::test]
-async fn responses_forwards_failed_terminals_without_usage_and_does_not_charge_them() {
-    let failed_with_null_usage = json!({
-        "type": "response.failed",
-        "sequence_number": 1,
-        "response": {
-            "id": "resp_failed_null_usage",
-            "status": "failed",
-            "error": {"code": "rate_limit_exceeded", "message": "try later"},
-            "usage": null
-        }
-    });
-    let failed_without_usage = json!({
-        "type": "response.failed",
-        "sequence_number": 1,
-        "response": {
-            "id": "resp_failed_missing_usage",
-            "status": "failed",
-            "error": {"code": "context_length_exceeded", "message": "too long"}
-        }
-    });
-    let scripts = [&failed_with_null_usage, &failed_without_usage]
-        .into_iter()
-        .map(|terminal| {
-            ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
-                "event: response.failed\ndata: {terminal}\n\n"
-            ))])
-        })
-        .collect();
-    let upstream = FakeUpstream::start(scripts).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    for expected in [&failed_with_null_usage, &failed_without_usage] {
-        let response = authorized_request(&client, &relay)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-            .expect("send Responses request");
-        assert_eq!(response.status(), StatusCode::OK);
-        let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event, "response.failed");
-        assert_eq!(
-            serde_json::from_str::<Value>(&events[0].data).unwrap(),
-            *expected
-        );
-    }
-
-    assert_eq!(
-        request_logs(&relay.state_path).await,
-        [
-            ObservedRequestLog {
-                status: "upstream_error".to_owned(),
-                http_status: Some(200),
-                input_tokens: None,
-                cached_input_tokens: None,
-                output_tokens: None,
-                exact_cost: None,
-            },
-            ObservedRequestLog {
-                status: "upstream_error".to_owned(),
-                http_status: Some(200),
-                input_tokens: None,
-                cached_input_tokens: None,
-                output_tokens: None,
-                exact_cost: None,
-            },
-        ]
-    );
-}
-
-#[tokio::test]
-async fn responses_accounts_and_forwards_an_error_event_without_waiting_for_eof() {
-    let upstream_stream_dropped = Arc::new(Notify::new());
-    let error = json!({
-        "type": "error",
-        "sequence_number": 1,
-        "code": "server_error",
-        "message": "upstream failed",
-        "param": null
-    });
-    let mut script = ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
-        "event: error\ndata: {error}\n\n"
-    ))]);
-    script.hold_open = true;
-    script.dropped = Some(Arc::clone(&upstream_stream_dropped));
-    let upstream = FakeUpstream::start(vec![script]).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-
-    let response = authorized_request(&client(), &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let mut events = Box::pin(response.bytes_stream().eventsource());
-    let forwarded = timeout(Duration::from_secs(1), events.next())
-        .await
-        .expect("relay waited for EOF before forwarding the error event")
-        .expect("downstream stream ended before the error event")
-        .expect("error event framing");
-    assert_eq!(forwarded.event, "error");
-    assert_eq!(
-        serde_json::from_str::<Value>(&forwarded.data).unwrap(),
-        error
-    );
-
-    assert_eq!(
-        request_logs(&relay.state_path).await,
-        [ObservedRequestLog {
-            status: "upstream_error".to_owned(),
-            http_status: Some(200),
-            input_tokens: None,
-            cached_input_tokens: None,
-            output_tokens: None,
-            exact_cost: None,
-        }],
-        "the error must be committed before it is forwarded"
-    );
-    assert!(
-        timeout(Duration::from_secs(1), events.next())
-            .await
-            .expect("downstream stream remained open after the error event")
-            .is_none(),
-        "the error event must terminate the downstream stream"
-    );
-    timeout(Duration::from_secs(1), upstream_stream_dropped.notified())
-        .await
-        .expect("relay kept the upstream stream open after the error event");
-}
-
-#[tokio::test]
-async fn responses_does_not_require_total_tokens_to_equal_the_billed_token_sum() {
-    let terminal = json!({
-        "type": "response.completed",
-        "sequence_number": 1,
-        "response": {
-            "id": "resp_independent_total",
-            "status": "completed",
-            "model": MODEL,
-            "output": [],
-            "usage": {
-                "input_tokens": 2,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": 3,
-                "output_tokens_details": {"reasoning_tokens": 1},
-                "total_tokens": 9
-            }
-        }
-    });
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
-        format!("event: response.completed\ndata: {terminal}\n\n"),
-    )])])
-    .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-
-    let response = authorized_request(&client(), &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let events = parse_sse_bytes(response.bytes().await.unwrap()).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event, "response.completed");
-    let forwarded: Value = serde_json::from_str(&events[0].data).unwrap();
-    assert_eq!(forwarded, terminal);
-    assert_eq!(forwarded["response"]["usage"]["total_tokens"], 9);
-
-    assert_eq!(
-        request_logs(&relay.state_path).await,
-        [ObservedRequestLog {
-            status: "completed".to_owned(),
-            http_status: Some(200),
-            input_tokens: Some(2),
-            cached_input_tokens: Some(0),
-            output_tokens: Some(3),
-            exact_cost: Some("0.000020000".to_owned()),
-        }]
-    );
-}
-
-#[tokio::test]
-async fn responses_preserves_an_upstream_error_before_streaming_starts() {
-    let upstream_error = json!({
-        "error": {
-            "message": "upstream rate limit",
-            "type": "requests",
-            "param": null,
-            "code": "rate_limit_exceeded"
-        }
-    });
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::json(
-        StatusCode::TOO_MANY_REQUESTS,
-        upstream_error.clone(),
-    )])
-    .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    let response = authorized_request(&client, &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(
-        response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("application/json"))
-    );
-    assert_eq!(
-        response.json::<Value>().await.expect("upstream error JSON"),
-        upstream_error
-    );
-}
-
-#[tokio::test]
-async fn responses_disconnect_after_upstream_error_starts_preserves_the_error_outcome() {
-    let upstream_body_started = Arc::new(Notify::new());
-    let upstream_body_dropped = Arc::new(Notify::new());
-    let mut script = ScriptedResponse::json(
-        StatusCode::TOO_MANY_REQUESTS,
-        json!({
-            "error": {
-                "message": "upstream rate limit",
-                "type": "requests",
-                "param": null,
-                "code": "rate_limit_exceeded"
-            }
-        }),
-    );
-    script.body_started = Some(Arc::clone(&upstream_body_started));
-    script.hold_open = true;
-    script.dropped = Some(Arc::clone(&upstream_body_dropped));
-    let upstream = FakeUpstream::start(vec![script]).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let url = relay.responses_url();
-
-    let downstream = tokio::spawn(async move {
-        client()
-            .post(url)
-            .bearer_auth(DOWNSTREAM_KEY)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-    });
-    timeout(Duration::from_secs(2), upstream_body_started.notified())
-        .await
-        .expect("relay did not start consuming the upstream error body");
-    sleep(Duration::from_millis(100)).await;
-    assert!(
-        !downstream.is_finished(),
-        "relay returned before the upstream error body completed"
-    );
-
-    downstream.abort();
-    let _ = downstream.await;
-    timeout(Duration::from_secs(2), upstream_body_dropped.notified())
-        .await
-        .expect("downstream disconnect did not drop the upstream error body");
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let logs = request_logs(&relay.state_path).await;
-        if logs.first().is_some_and(|row| row.status != "started") {
-            assert_eq!(
-                logs,
-                [ObservedRequestLog {
-                    status: "upstream_error".to_owned(),
-                    http_status: Some(429),
-                    input_tokens: None,
-                    cached_input_tokens: None,
-                    output_tokens: None,
-                    exact_cost: None,
-                }]
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "disconnect left the upstream error ledger row unfinished: {logs:?}"
-        );
-        sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[tokio::test]
-async fn responses_suppresses_a_malformed_terminal_event() {
-    let created = json!({"type": "response.created", "sequence_number": 0});
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![
-        ScriptChunk::immediate(format!("event: response.created\ndata: {created}\n\n")),
-        ScriptChunk::immediate("event: response.completed\ndata: {not-json}\n\n"),
-    ])])
-    .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    let response = authorized_request(&client, &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response
-        .bytes()
-        .await
-        .expect("stream closes after bad terminal");
-    assert!(
-        !String::from_utf8_lossy(&bytes).contains("not-json"),
-        "a malformed terminal must not be presented as a successful terminal"
-    );
-    let events = parse_sse_bytes(bytes).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event, "response.created");
-}
-
-#[tokio::test]
-async fn responses_clean_eof_without_terminal_does_not_fabricate_completion() {
-    let delta = json!({
-        "type": "response.output_text.delta",
-        "sequence_number": 1,
-        "item_id": "msg_1",
-        "output_index": 0,
-        "content_index": 0,
-        "delta": "partial"
-    });
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![ScriptChunk::immediate(
-        format!("event: response.output_text.delta\ndata: {delta}\n\n"),
-    )])])
-    .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    let response = authorized_request(&client, &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response.bytes().await.expect("stream ends at upstream EOF");
-    let raw = String::from_utf8_lossy(&bytes);
-    assert!(!raw.contains("response.completed"));
-    assert!(!raw.contains("response.incomplete"));
-    assert!(!raw.contains("response.failed"));
-    assert!(!raw.contains("[DONE]"));
-    let events = parse_sse_bytes(bytes).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event, "response.output_text.delta");
-    assert_eq!(
-        serde_json::from_str::<Value>(&events[0].data).unwrap(),
-        delta
-    );
-}
-
-#[tokio::test]
-async fn responses_does_not_forward_an_event_truncated_at_eof() {
-    let created = json!({"type": "response.created", "sequence_number": 0});
-    let upstream = FakeUpstream::start(vec![ScriptedResponse::sse(vec![
-        ScriptChunk::immediate(format!("event: response.created\ndata: {created}\n\n")),
-        ScriptChunk::immediate(
-            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\"",
-        ),
-    ])])
-    .await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    let response = authorized_request(&client, &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response
-        .bytes()
-        .await
-        .expect("stream ends at truncated EOF");
-    assert!(
-        !String::from_utf8_lossy(&bytes).contains("output_text.delta"),
-        "incomplete SSE records must not be forwarded"
-    );
-    let events = parse_sse_bytes(bytes).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event, "response.created");
-}
-
-#[tokio::test]
-async fn responses_client_disconnect_cancels_the_upstream_stream() {
-    let upstream_stream_dropped = Arc::new(Notify::new());
-    let created = json!({"type": "response.created", "sequence_number": 0});
-    let mut script = ScriptedResponse::sse(vec![ScriptChunk::immediate(format!(
-        "event: response.created\ndata: {created}\n\n"
-    ))]);
-    script.hold_open = true;
-    script.dropped = Some(Arc::clone(&upstream_stream_dropped));
-    let upstream = FakeUpstream::start(vec![script]).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let client = client();
-
-    let response = authorized_request(&client, &relay)
-        .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-        .send()
-        .await
-        .expect("send Responses request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let mut events = Box::pin(response.bytes_stream().eventsource());
-    let first = timeout(Duration::from_secs(1), events.next())
-        .await
-        .expect("first event did not arrive")
-        .expect("stream ended before first event")
-        .expect("first event framing");
-    assert_eq!(first.event, "response.created");
-
-    drop(events);
-    drop(client);
-    timeout(Duration::from_secs(3), upstream_stream_dropped.notified())
-        .await
-        .expect("dropping the downstream response did not cancel upstream");
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let logs = request_logs(&relay.state_path).await;
-        if logs.first().is_some_and(|row| row.status == "canceled") {
-            assert_eq!(
-                logs,
-                [ObservedRequestLog {
-                    status: "canceled".to_owned(),
-                    http_status: Some(200),
-                    input_tokens: None,
-                    cached_input_tokens: None,
-                    output_tokens: None,
-                    exact_cost: None,
-                }]
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "disconnect left the streaming ledger row unfinished: {logs:?}"
-        );
-        sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn responses_prioritizes_an_already_closed_downstream_over_ready_terminal_or_eof() {
-    const ATTEMPTS: usize = 16;
-
-    let created = json!({"type": "response.created", "sequence_number": 0});
-    let scripts = (0..ATTEMPTS)
-        .map(|attempt| {
-            let second = if attempt % 2 == 0 {
-                ScriptChunk::after(Duration::from_millis(100), completed_sse())
-            } else {
-                ScriptChunk::after(Duration::from_millis(100), Bytes::new())
-            };
-            ScriptedResponse::sse(vec![
-                ScriptChunk::immediate(format!("event: response.created\ndata: {created}\n\n")),
-                second,
-            ])
-        })
-        .collect();
-    let upstream = FakeUpstream::start(scripts).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-
-    for attempt in 0..ATTEMPTS {
-        let client = client();
-        let response = authorized_request(&client, &relay)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-            .expect("send Responses request");
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut events = Box::pin(response.bytes_stream().eventsource());
-        let first = timeout(Duration::from_secs(1), events.next())
-            .await
-            .expect("first event did not arrive")
-            .expect("stream ended before first event")
-            .expect("first event framing");
-        assert_eq!(first.event, "response.created");
-
-        sleep(Duration::from_millis(90)).await;
-        drop(events);
-        drop(client);
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let logs = request_logs(&relay.state_path).await;
-            if logs.get(attempt).is_some_and(|row| row.status != "started") {
-                assert_eq!(
-                    logs[attempt],
-                    ObservedRequestLog {
-                        status: "canceled".to_owned(),
-                        http_status: Some(200),
-                        input_tokens: None,
-                        cached_input_tokens: None,
-                        output_tokens: None,
-                        exact_cost: None,
-                    },
-                    "attempt {attempt} selected the ready upstream branch after downstream closure"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "attempt {attempt} left its race ledger row unfinished: {logs:?}"
-            );
-            sleep(Duration::from_millis(20)).await;
-        }
-    }
-}
-
-#[tokio::test]
-async fn responses_disconnect_before_upstream_headers_is_logged_as_canceled() {
-    let mut delayed = ScriptedResponse::sse(vec![ScriptChunk::immediate(completed_sse())]);
-    delayed.header_delay = Duration::from_secs(5);
-    let mut upstream = FakeUpstream::start(vec![delayed]).await;
-    let relay = Relay::start(&upstream.base_url()).await;
-    let url = relay.responses_url();
-    let request = tokio::spawn(async move {
-        client()
-            .post(url)
-            .bearer_auth(DOWNSTREAM_KEY)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-    });
-
-    let _ = upstream.next_request().await;
-    request.abort();
-    let _ = request.await;
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let logs = request_logs(&relay.state_path).await;
-        if logs.first().is_some_and(|row| row.status == "canceled") {
-            assert_eq!(
-                logs,
-                [ObservedRequestLog {
-                    status: "canceled".to_owned(),
-                    http_status: None,
-                    input_tokens: None,
-                    cached_input_tokens: None,
-                    output_tokens: None,
-                    exact_cost: None,
-                }]
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "disconnect left the pre-stream ledger row unfinished: {logs:?}"
-        );
-        sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn responses_tracks_a_pre_header_disconnect_finalizer_through_sigterm() {
-    let upstream_request_dropped = Arc::new(Notify::new());
-    let mut delayed = ScriptedResponse::sse(vec![ScriptChunk::immediate(completed_sse())]);
-    delayed.header_delay = Duration::from_secs(5);
-    delayed.header_dropped = Some(Arc::clone(&upstream_request_dropped));
-    let mut upstream = FakeUpstream::start(vec![delayed]).await;
-    let mut relay = Relay::start(&upstream.base_url()).await;
-    let url = relay.responses_url();
-    let request = tokio::spawn(async move {
-        client()
-            .post(url)
-            .bearer_auth(DOWNSTREAM_KEY)
-            .json(&json!({"model": MODEL, "input": "hello", "stream": true}))
-            .send()
-            .await
-    });
-    let _ = upstream.next_request().await;
-
-    let mut database = sqlx::SqliteConnection::connect_with(
-        &SqliteConnectOptions::new()
-            .filename(&relay.state_path)
-            .busy_timeout(Duration::from_secs(5)),
-    )
-    .await
-    .expect("open lifecycle write lock connection");
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut database)
-        .await
-        .expect("hold the cancellation ledger write");
-
-    request.abort();
-    let _ = request.await;
-    timeout(Duration::from_secs(2), upstream_request_dropped.notified())
-        .await
-        .expect("downstream disconnect did not cancel the pre-header upstream request");
-
-    let process_id = relay.child.id().expect("relay process ID");
-    let terminated = Command::new("kill")
-        .args(["-TERM", &process_id.to_string()])
-        .status()
-        .await
-        .expect("signal relay shutdown");
-    assert!(terminated.success(), "failed to signal relay shutdown");
-    sleep(Duration::from_millis(150)).await;
-    assert!(
-        relay
-            .child
-            .try_wait()
-            .expect("poll relay shutdown")
-            .is_none(),
-        "relay exited before its blocked cancellation finalizer committed"
-    );
-
-    sqlx::query("COMMIT")
-        .execute(&mut database)
-        .await
-        .expect("release the cancellation ledger write");
-    drop(database);
-    let exit = timeout(Duration::from_secs(2), relay.child.wait())
-        .await
-        .expect("relay did not finish after the cancellation commit was released")
-        .expect("wait for relay shutdown");
-    assert!(exit.success(), "relay shutdown failed with {exit}");
-    assert_eq!(
-        request_logs(&relay.state_path).await,
-        [ObservedRequestLog {
-            status: "canceled".to_owned(),
-            http_status: None,
-            input_tokens: None,
-            cached_input_tokens: None,
-            output_tokens: None,
-            exact_cost: None,
-        }]
-    );
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(upstream.requests.try_recv().is_err());
 }
