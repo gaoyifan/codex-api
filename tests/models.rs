@@ -441,7 +441,7 @@ async fn models_follow_upstream_visibility_local_pricing_and_live_quota_state() 
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1, "catalog requests should share the cache");
-    assert_eq!(requests[0].0.query(), Some("client_version=0.147.0"));
+    assert_eq!(requests[0].0.query(), Some("client_version=0.153.4"));
     assert_eq!(
         requests[0].1["authorization"],
         format!("Bearer {ACCESS_TOKEN}")

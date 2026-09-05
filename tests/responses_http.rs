@@ -549,14 +549,14 @@ async fn responses_sends_subscription_headers_and_normalized_body_upstream() {
             .headers
             .get("version")
             .and_then(|value| value.to_str().ok()),
-        Some("0.147.0")
+        Some("0.153.4")
     );
     assert!(
         captured
             .headers
             .get(USER_AGENT)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("codex_cli_rs/0.147.0")),
+            .is_some_and(|value| value.starts_with("codex_cli_rs/0.153.4")),
         "upstream User-Agent should identify the baseline Codex client"
     );
     assert_eq!(

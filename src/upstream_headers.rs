@@ -1,8 +1,8 @@
 use http::HeaderMap;
 
 pub(crate) const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-pub(crate) const CODEX_VERSION: &str = "0.147.0";
-pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.147.0 (codex-api)";
+pub(crate) const CODEX_VERSION: &str = "0.153.4";
+pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.153.4 (codex-api)";
 
 const CODEX_PASSTHROUGH_HEADERS: &[&str] = &[
     "originator",
