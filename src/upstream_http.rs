@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::upstream_headers::{
-    CODEX_ORIGINATOR, CODEX_USER_AGENT, CODEX_VERSION, codex_passthrough_headers,
+    CODEX_ORIGINATOR, CODEX_USER_AGENT, CODEX_VERSION, codex_request_headers,
 };
 use crate::{
     Clock,
@@ -169,17 +169,6 @@ impl UpstreamHttpClient {
         ))
         .map_err(|_| UpstreamHttpError::InvalidCredentialHeader)?;
         authorization.set_sensitive(true);
-        let mut passthrough_headers = codex_passthrough_headers(downstream_headers);
-        if !passthrough_headers.contains_key("session_id")
-            && !passthrough_headers.contains_key("session-id")
-            && let Some(prompt_cache_key) = body
-                .get("prompt_cache_key")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            && let Ok(session_id) = HeaderValue::from_str(prompt_cache_key)
-        {
-            passthrough_headers.insert("session_id", session_id);
-        }
         self.client
             .post(self.responses_url.clone())
             .header(AUTHORIZATION, authorization)
@@ -188,7 +177,7 @@ impl UpstreamHttpClient {
             .header("version", CODEX_VERSION)
             .header(USER_AGENT, CODEX_USER_AGENT)
             .header(ACCEPT, "text/event-stream")
-            .headers(passthrough_headers)
+            .headers(codex_request_headers(downstream_headers, body))
             .json(body)
             .send()
             .await

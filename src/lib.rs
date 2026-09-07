@@ -97,6 +97,7 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
         store,
         credentials: Arc::clone(&credentials),
         upstream_http,
+        responses_sessions: http_api::ResponsesSessions::default(),
         shutdown: shutdown.clone(),
         pending_requests: pending_requests.clone(),
         websocket_tasks: websocket_tasks.clone(),

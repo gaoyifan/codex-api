@@ -14,6 +14,9 @@ use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 use tokio_util::sync::CancellationToken;
 
 mod request;
+mod responses_session;
+
+pub(crate) use responses_session::ResponsesSessions;
 
 use request::PendingRequest;
 
@@ -22,14 +25,13 @@ use crate::{
     chat::{self, ChatErrorKind, TerminalStatus},
     config::apply_effective_request,
     error::ApiError,
-    responses_terminal::{TerminalKind, Usage, parse_terminal_payload},
+    responses_terminal::{TerminalEvent, TerminalKind, Usage, parse_terminal_payload},
     sse::{SseRead, SseReader},
     state::AppState,
     store::{
         Admission, ApiProtocol, BillableUsage, EffectiveModel, FinalStatus, ModelAccess,
         ModelCandidates, ModelRates, RequestContext, RequestId, Transport,
     },
-    upstream_ws::{connect_upstream_websocket, prepare_responses_lite},
 };
 
 pub(crate) async fn models(
@@ -157,6 +159,20 @@ pub(crate) async fn responses(
             return Err(error);
         }
     };
+    let key = match responses_session::SessionKey::from_headers(&identity.id, &headers) {
+        Ok(key) => key,
+        Err(error) => {
+            reject_request(
+                &state,
+                &identity,
+                &model,
+                reasoning_effort,
+                ApiProtocol::Responses,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     let (request_id, effective_model) = admit_request(
         &state,
         &identity,
@@ -167,7 +183,7 @@ pub(crate) async fn responses(
     .await?;
     apply_effective_request(&mut upstream_body, &effective_model);
     let rates = effective_model.rates;
-    let mut request = PendingRequest::new(
+    let request = PendingRequest::new(
         Arc::clone(&state.store),
         request_id,
         state.pending_requests.token(),
@@ -180,37 +196,21 @@ pub(crate) async fn responses(
         .map_err(|_| ApiError::gateway("Upstream models request failed"))?
         .filter(|model| model.get("use_responses_lite").and_then(Value::as_bool) == Some(true))
         .ok_or_else(|| ApiError::gateway("Upstream model does not support Responses Lite"))?;
-    let mut upstream = connect_upstream_websocket(
-        &state.config.upstream.base_url,
-        Arc::clone(&state.credentials),
-        &headers,
-    )
-    .await
-    .map_err(|_| ApiError::gateway("Failed to connect to the upstream WebSocket"))?;
-    prepare_responses_lite(
-        &mut upstream,
-        &mut upstream_body,
-        &upstream_model,
-        &format!("codex-api-{}", request_id.0),
-    )
-    .await
-    .map_err(|_| ApiError::gateway("Failed to prepare the upstream Responses session"))?;
-    upstream
-        .send(UpstreamMessage::Text(upstream_body.to_string().into()))
-        .await
-        .map_err(|_| ApiError::gateway("Failed to send the upstream WebSocket request"))?;
-
-    request.response_started(StatusCode::OK);
-    let (sender, receiver) = mpsc::channel::<Bytes>(16);
-    state
-        .pending_requests
-        .spawn(forward_websocket_responses_stream(
-            request,
-            rates,
-            upstream,
-            sender,
-            state.shutdown.clone(),
-        ));
+    let receiver = state
+        .responses_sessions
+        .stream(
+            Arc::clone(&state),
+            key,
+            responses_session::Turn {
+                body: upstream_body,
+                model: upstream_model,
+                headers,
+                request_key: format!("codex-api-{}", request_id.0),
+                pending: request,
+                rates,
+            },
+        )
+        .await?;
     let body_stream = stream::unfold(receiver, |mut receiver| async move {
         receiver
             .recv()
@@ -570,12 +570,13 @@ async fn send_upstream(
 }
 
 async fn forward_websocket_responses_stream(
-    mut request: PendingRequest,
+    request: &mut PendingRequest,
     rates: ModelRates,
-    mut upstream: crate::upstream_ws::UpstreamWebSocket,
-    sender: mpsc::Sender<Bytes>,
+    upstream: &mut crate::upstream_ws::UpstreamWebSocket,
+    sender: &mpsc::Sender<Bytes>,
     shutdown: CancellationToken,
-) {
+) -> Option<(TerminalEvent, Bytes)> {
+    let mut completed_output_items = Vec::new();
     loop {
         let next = tokio::select! {
             biased;
@@ -587,7 +588,7 @@ async fn forward_websocket_responses_stream(
             let _ = request
                 .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
                 .await;
-            return;
+            return None;
         };
         match message {
             UpstreamMessage::Text(text) => {
@@ -597,7 +598,7 @@ async fn forward_websocket_responses_stream(
                         let _ = request
                             .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
                             .await;
-                        return;
+                        return None;
                     }
                 };
                 let event_name = match event.get("type").and_then(Value::as_str) {
@@ -606,20 +607,36 @@ async fn forward_websocket_responses_stream(
                         let _ = request
                             .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
                             .await;
-                        return;
+                        return None;
                     }
                 };
+                if event_name == "response.output_item.done"
+                    && let Some(item) = event.get("item").filter(|item| item.is_object())
+                {
+                    completed_output_items.push(item.clone());
+                }
                 let terminal = match parse_terminal_payload(event) {
                     Ok(terminal) => terminal,
                     Err(_) => {
                         let _ = request
                             .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
                             .await;
-                        return;
+                        return None;
                     }
                 };
                 let bytes = Bytes::from(format!("id: \nevent: {event_name}\ndata: {text}\n\n"));
-                if let Some(terminal) = terminal {
+                if let Some(mut terminal) = terminal {
+                    // Private Responses can omit the final output array. Keep SSE bytes unchanged;
+                    // the session snapshot still needs the completed items to rebuild its context.
+                    let output = terminal.payload.pointer("/response/output");
+                    if terminal.kind == TerminalKind::Completed
+                        && !completed_output_items.is_empty()
+                        && (matches!(output, None | Some(Value::Null))
+                            || output.and_then(Value::as_array).is_some_and(Vec::is_empty))
+                    {
+                        terminal.payload["response"]["output"] =
+                            Value::Array(completed_output_items);
+                    }
                     let status = match terminal.kind {
                         TerminalKind::Completed => FinalStatus::Completed,
                         TerminalKind::Incomplete => FinalStatus::Incomplete,
@@ -635,16 +652,15 @@ async fn forward_websocket_responses_stream(
                         .await
                         .is_err()
                     {
-                        return;
+                        return None;
                     }
-                    let _ = sender.send(bytes).await;
-                    return;
+                    return Some((terminal, bytes));
                 }
                 if sender.send(bytes).await.is_err() {
                     let _ = request
                         .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
                         .await;
-                    return;
+                    return None;
                 }
             }
             UpstreamMessage::Ping(payload) => {
@@ -652,7 +668,7 @@ async fn forward_websocket_responses_stream(
                     let _ = request
                         .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
                         .await;
-                    return;
+                    return None;
                 }
             }
             UpstreamMessage::Pong(_) => {}
@@ -660,7 +676,7 @@ async fn forward_websocket_responses_stream(
                 let _ = request
                     .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
                     .await;
-                return;
+                return None;
             }
         }
     }

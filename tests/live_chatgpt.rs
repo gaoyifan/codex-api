@@ -52,6 +52,7 @@ async fn live_chatgpt_contract_supports_responses_chat_and_websocket() -> Result
 
     let config_directory = tempfile::tempdir().context("failed to create a config directory")?;
     let config_path = config_directory.path().join("live.toml");
+    let trace_path = config_directory.path().join("service.log");
     let config = format!(
         r#"[server]
 listen = "{listen_address}"
@@ -84,8 +85,10 @@ output_usd_per_million = "6.00"
         .arg(&config_path)
         .arg("serve")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&trace_path)?))
         .stderr(Stdio::null())
+        .env("RUST_LOG", "codex_api::http_api::responses_session=debug")
+        .env("NO_COLOR", "1")
         .kill_on_drop(true);
     let mut service = command
         .spawn()
@@ -115,12 +118,17 @@ output_usd_per_million = "6.00"
         .context("failed to build the live-test HTTP client")?;
     let http_base = format!("http://{listen_address}");
 
+    let session_token = format!("violet{run_nonce}");
+    let session_prompt =
+        format!("Remember this token for later: {session_token}. Reply with exactly OK.");
+    let first_started = Instant::now();
     let responses_http = client
         .post(format!("{http_base}/v1/responses"))
         .bearer_auth(&api_key_secret)
+        .header("thread_id", &api_key_id)
         .json(&json!({
             "model": MODEL,
-            "input": PROMPT,
+            "input": session_prompt,
             "stream": true,
             "store": false,
             "reasoning": { "effort": "low" }
@@ -151,10 +159,11 @@ output_usd_per_million = "6.00"
             _ => Value::Null,
         };
         bail!(
-            "the live Responses HTTP request returned status {status}, detail={detail}, type={:?}, code={:?}, param={:?}",
+            "the live Responses HTTP request returned status {status}, detail={detail}, type={:?}, code={:?}, param={:?}, message={:?}",
             error.pointer("/error/type").and_then(Value::as_str),
             error.pointer("/error/code").and_then(Value::as_str),
             error.pointer("/error/param").and_then(Value::as_str),
+            error.pointer("/error/message").and_then(Value::as_str),
         );
     }
     let content_type = responses_http
@@ -167,27 +176,12 @@ output_usd_per_million = "6.00"
         "the live Responses HTTP request did not return SSE"
     );
 
-    let mut response_events = responses_http.bytes_stream().eventsource();
-    let responses_terminal: Value = timeout(Duration::from_secs(180), async {
-        while let Some(event) = response_events.next().await {
-            let event = event.context("the live Responses SSE stream was malformed")?;
-            if event.data.trim().is_empty() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(&event.data)
-                .context("the live Responses SSE event was not JSON")?;
-            match value.get("type").and_then(Value::as_str) {
-                Some("response.completed") => return Ok::<Value, anyhow::Error>(value),
-                Some("response.incomplete" | "response.failed" | "error") => {
-                    bail!("the live Responses HTTP request did not complete successfully")
-                }
-                _ => {}
-            }
-        }
-        bail!("the live Responses SSE stream ended without a terminal event")
-    })
-    .await
-    .context("the live Responses SSE request timed out")??;
+    let (responses_terminal, first_output, first_event) =
+        read_live_response(responses_http, first_started).await?;
+    eprintln!(
+        "live Responses initial: first_event_ms={}",
+        first_event.as_millis()
+    );
     let responses_usage = responses_terminal
         .pointer("/response/usage")
         .context("the live Responses terminal event omitted usage")?;
@@ -209,6 +203,93 @@ output_usd_per_million = "6.00"
             && responses_total_tokens >= responses_input_tokens + responses_output_tokens,
         "the live Responses HTTP usage was not internally consistent"
     );
+
+    let mut history = vec![
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":session_prompt}]}),
+    ];
+    history.extend(first_output);
+    let mut previous_id = responses_terminal["response"]["id"].clone();
+    for mode in ["explicit", "full_history", "reconnect"] {
+        let input = json!({"type":"message","role":"user","content":[{"type":"input_text","text":"What token did I ask you to remember? Reply with only that token."}]});
+        history.push(input.clone());
+        let mut payload = json!({
+            "model":MODEL,"input":[input],"previous_response_id":previous_id,
+            "stream":true,"store":false,"reasoning":{"effort":"low"}
+        });
+        if mode == "full_history" {
+            payload["input"] = json!(history);
+            payload
+                .as_object_mut()
+                .unwrap()
+                .remove("previous_response_id");
+        }
+        let mut request = client
+            .post(format!("{http_base}/v1/responses"))
+            .bearer_auth(&api_key_secret)
+            .header("thread_id", &api_key_id)
+            .json(&payload);
+        if mode == "reconnect" {
+            // An immutable handshake change forces a new socket while retaining the logical snapshot.
+            request = request.header(
+                "user-agent",
+                "codex_cli_rs/0.153.4 (codex-api live reconnect)",
+            );
+        }
+        let started = Instant::now();
+        let response = request
+            .send()
+            .await
+            .context("live session continuation failed")?;
+        ensure!(
+            response.status() == StatusCode::OK,
+            "live {mode} returned {}",
+            response.status()
+        );
+        let (terminal, output, first_event) = read_live_response(response, started).await?;
+        let text = output
+            .iter()
+            .filter(|item| item["role"] == "assistant")
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<String>();
+        ensure!(
+            text.contains(&session_token),
+            "live {mode} lost the remembered context"
+        );
+        previous_id = terminal["response"]["id"].clone();
+        history.extend(output);
+        eprintln!(
+            "live Responses {mode}: first_event_ms={}",
+            first_event.as_millis()
+        );
+    }
+    let traces = fs::read_to_string(&trace_path)?;
+    let preparations: Vec<_> = traces
+        .lines()
+        .filter(|line| line.contains("Prepared Responses WebSocket"))
+        .collect();
+    ensure!(
+        preparations.len() == 4,
+        "expected four prepared HTTP Responses operations"
+    );
+    ensure!(
+        preparations
+            .iter()
+            .filter(|line| line.contains("connection_reused=false"))
+            .count()
+            == 2,
+        "expected two WS handshakes across the live HTTP session"
+    );
+    ensure!(
+        preparations
+            .iter()
+            .filter(|line| line.contains("context_reused=false"))
+            .count()
+            == 2,
+        "expected only the initial and rebuilt contexts to prewarm"
+    );
+    eprintln!("live Responses session: requests=4 handshakes=2 prewarms=2");
 
     let chat_http = client
         .post(format!("{http_base}/v1/chat/completions"))
@@ -412,10 +493,13 @@ output_usd_per_million = "6.00"
     .await
     .context("failed to read the public live-test request log")?;
     ensure!(
-        request_rows.len() == 3,
-        "the live flow did not commit exactly three request-log rows"
+        request_rows.len() == 6,
+        "the live flow did not commit exactly six request-log rows"
     );
     let expected_rows = [
+        ("responses", "http_sse"),
+        ("responses", "http_sse"),
+        ("responses", "http_sse"),
         ("responses", "http_sse"),
         ("chat_completions", "http_sse"),
         ("responses", "websocket"),
@@ -462,4 +546,44 @@ output_usd_per_million = "6.00"
     );
 
     Ok(())
+}
+
+async fn read_live_response(
+    response: reqwest::Response,
+    started: Instant,
+) -> Result<(Value, Vec<Value>, Duration)> {
+    let mut events = response.bytes_stream().eventsource();
+    timeout(Duration::from_secs(180), async {
+        let mut output = Vec::new();
+        let mut first_event = None;
+        while let Some(event) = events.next().await {
+            let event = event.context("live Responses SSE stream was malformed")?;
+            first_event.get_or_insert_with(|| started.elapsed());
+            if event.data.trim().is_empty() {
+                continue;
+            }
+            let value: Value =
+                serde_json::from_str(&event.data).context("live SSE event was not JSON")?;
+            match value["type"].as_str() {
+                Some("response.output_item.done") => output.push(value["item"].clone()),
+                Some("response.completed") => {
+                    if let Some(items) = value
+                        .pointer("/response/output")
+                        .and_then(Value::as_array)
+                        .filter(|items| !items.is_empty())
+                    {
+                        output = items.clone();
+                    }
+                    return Ok((value, output, first_event.unwrap()));
+                }
+                Some("response.incomplete" | "response.failed" | "error") => {
+                    bail!("live Responses request did not complete successfully")
+                }
+                _ => {}
+            }
+        }
+        bail!("live Responses stream ended without a terminal event")
+    })
+    .await
+    .context("live Responses request timed out")?
 }

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
-    status: StatusCode,
+    pub(crate) status: StatusCode,
     error_type: &'static str,
     code: &'static str,
     param: Option<String>,
@@ -15,6 +15,16 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn session_busy() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            error_type: "invalid_request_error",
+            code: "session_busy",
+            param: None,
+            message: "This session already has a request in progress".to_owned(),
+        }
+    }
+
     pub(crate) fn invalid(param: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

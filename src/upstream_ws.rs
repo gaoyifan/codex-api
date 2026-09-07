@@ -87,6 +87,17 @@ pub(crate) async fn prepare_responses_lite(
         return Ok(());
     }
 
+    let prewarm = responses_lite_prewarm(request, model, request_key)?;
+    let previous_response_id = send_responses_prewarm(upstream, &prewarm).await?;
+    request["previous_response_id"] = Value::String(previous_response_id);
+    Ok(())
+}
+
+pub(crate) fn responses_lite_prewarm(
+    request: &mut Value,
+    model: &Value,
+    request_key: &str,
+) -> Result<Value, UpstreamWebSocketError> {
     let object = request
         .as_object_mut()
         .ok_or(UpstreamWebSocketError::Request)?;
@@ -121,7 +132,13 @@ pub(crate) async fn prepare_responses_lite(
     prewarm_object.insert("input".to_owned(), Value::Array(input));
     prewarm_object.insert("generate".to_owned(), Value::Bool(false));
     prewarm_object.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
+    Ok(prewarm)
+}
 
+pub(crate) async fn send_responses_prewarm(
+    upstream: &mut UpstreamWebSocket,
+    prewarm: &Value,
+) -> Result<String, UpstreamWebSocketError> {
     upstream
         .send(UpstreamMessage::Text(prewarm.to_string().into()))
         .await
@@ -160,11 +177,7 @@ pub(crate) async fn prepare_responses_lite(
         }
     };
 
-    object.insert(
-        "previous_response_id".to_owned(),
-        Value::String(previous_response_id),
-    );
-    Ok(())
+    Ok(previous_response_id)
 }
 
 fn normalize_responses_lite_fields(

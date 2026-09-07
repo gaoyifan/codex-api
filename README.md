@@ -38,9 +38,50 @@ its soft limit sees that full intersection; a key in fallback state sees only
 request logs or consume quota. An unavailable single model returns
 `model_not_found`.
 
-HTTP Responses and Chat requests always use upstream HTTP/SSE. Downstream
-WebSockets always use an upstream WebSocket; the service never bridges or falls
-back between those transports.
+HTTP Responses requests use upstream Responses Lite WebSockets and return the
+upstream events as SSE. Chat requests use upstream HTTP/SSE. Downstream
+WebSockets use a dedicated upstream WebSocket.
+
+### HTTP Responses sessions
+
+Send a stable `thread_id` header to reuse an upstream connection across HTTP
+requests. If it is absent, `session_id` enables reuse instead. Sessions are
+isolated by the authenticated API key ID and the selected header name and
+value. Requests without either header open a new connection each time.
+
+Clients such as Hermes can send `prompt_cache_key` in the request body to keep
+prompt-cache routing stable even across independent connections. When neither
+`session_id` nor `session-id` is supplied, the relay also sends that key as the
+upstream `session_id` header. This routing hint does not enable stateful session
+reuse or serialize independent requests that share a cache key.
+
+A session retains only its latest successful response and materialized history:
+
+- Send the full `input` history, including prior output items, to let the relay
+  check for an exact JSON prefix match and send only the new items upstream.
+- Alternatively, send that response's `previous_response_id` with only the new
+  input items. Older response IDs and IDs from other sessions are rejected with
+  HTTP 400 and `param: "previous_response_id"`.
+- When effective parameters, tools, or instructions change, the relay starts a
+  fresh context with the full history. Each request supplies its own parameters;
+  omitted tools or instructions are not inherited from an earlier request.
+- A lost connection is rebuilt from the cached history on the next request.
+  Cancellation or failure discards the socket and preserves the last successful
+  snapshot. A generation that has already been sent is not automatically retried.
+
+Only one request may run per session. An overlapping request returns HTTP 409
+with code `session_busy`. Other sessions can run concurrently.
+
+Session snapshots stay in memory, expire after 10 minutes idle, and are limited
+to 64 idle sessions and 64 MiB of serialized snapshots. Capacity eviction removes
+the least recently used idle sessions; active requests are never evicted. A
+snapshot larger than the byte budget is not retained. After eviction or restart,
+resend the full history without `previous_response_id` to establish a new session.
+These limits are internal defaults, not configuration options.
+
+Request-level Codex headers are carried in each upstream frame's
+`client_metadata`; a previous request's turn state is not replayed. Changes to
+the remaining handshake headers reconnect and rebuild the context.
 
 ## Build and run
 
@@ -184,6 +225,7 @@ Streaming Responses:
 curl -N http://127.0.0.1:8080/v1/responses \
   -H 'Authorization: Bearer sk-local-change-me' \
   -H 'Content-Type: application/json' \
+  -H 'thread_id: example-conversation' \
   -d '{"model":"gpt-5.6-luna","input":"Reply with OK.","stream":true}'
 ```
 
@@ -322,12 +364,15 @@ cargo test --all-targets
 ```
 
 The real subscription contract test is ignored by default because it makes
-three billable upstream requests and uses a persistent test database:
+six billable upstream requests and uses a persistent test database. Its four
+HTTP Responses turns cover explicit continuation, full-history reuse, and
+context rebuilding on a replacement connection. It checks handshake and prewarm
+counts and reports time to the first SSE event:
 
 ```bash
 cargo test --test live_chatgpt \
   live_chatgpt_contract_supports_responses_chat_and_websocket \
-  -- --ignored --exact
+  -- --ignored --exact --nocapture
 ```
 
 It expects `/home/yifan/.codex-test/auth.json`, uses
