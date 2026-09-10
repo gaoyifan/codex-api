@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use time::{
-    Date, Duration as TimeDuration, OffsetDateTime,
+    Date, Duration as TimeDuration, OffsetDateTime, UtcOffset,
     format_description::{self, well_known::Rfc3339},
 };
 
@@ -150,7 +150,7 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header([
             "API KEY",
-            "TIME UTC",
+            "TIME LOCAL",
             "MODEL (REASONING)",
             "PROTOCOL",
             "TOKENS I/C/O (K)",
@@ -159,6 +159,8 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
             "STATUS",
         ]);
     for row in rows {
+        let requested_at = row.try_get::<String, _>("requested_at")?;
+        let requested_at = format_local_timestamp(&requested_at)?;
         let model = row.try_get::<String, _>("model")?;
         let reasoning = row.try_get::<Option<String>, _>("reasoning_effort")?;
         let model = match reasoning {
@@ -185,7 +187,7 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
             .unwrap_or_else(|| "—".to_owned());
         table.add_row([
             row.try_get::<String, _>("api_key_id")?,
-            row.try_get::<String, _>("requested_at")?,
+            requested_at,
             model,
             protocol,
             tokens,
@@ -196,6 +198,17 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
     }
     println!("{table}");
     Ok(())
+}
+
+fn format_local_timestamp(value: &str) -> anyhow::Result<String> {
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339)
+        .context("request_logs contains an invalid requested_at value")?;
+    let offset = UtcOffset::local_offset_at(timestamp)
+        .context("failed to determine the local UTC offset")?;
+    timestamp
+        .to_offset(offset)
+        .format(&Rfc3339)
+        .context("failed to format the local request time")
 }
 
 async fn open_read_only(path: &Path) -> anyhow::Result<SqlitePool> {

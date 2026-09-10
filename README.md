@@ -325,9 +325,10 @@ codex-api logs \
 The filters are combined with AND. `--since` is inclusive and `--until` is
 exclusive; both accept RFC3339 timestamps at whole-second precision. Status accepts `started`, `completed`, `incomplete`, `rejected`,
 `upstream_error`, `canceled`, and `internal_error`. The compact table shows API
-key ID, UTC request time, model and reasoning effort, API protocol and
-transport, input/cached-input/output tokens in thousands, exact USD cost,
-duration, and status. Missing accounting values are shown as `—`.
+key ID, request time in the system's current time zone, model and reasoning
+effort, API protocol and transport, input/cached-input/output tokens in
+thousands, exact USD cost, duration, and status. Missing accounting values are
+shown as `—`.
 
 `stat` prints every configured API key in configuration order for a UTC date
 range. `--start-date` and `--end-date` are inclusive and may be specified

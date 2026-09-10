@@ -176,7 +176,11 @@ async fn logs_renders_a_compact_human_readable_request_table() {
         )
         .await;
 
-    let output = fixture.command("logs").output().expect("run logs command");
+    let output = fixture
+        .command("logs")
+        .env("TZ", "SGT-8")
+        .output()
+        .expect("run logs command");
     assert!(
         output.status.success(),
         "logs failed: {}",
@@ -185,7 +189,7 @@ async fn logs_renders_a_compact_human_readable_request_table() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 logs output");
     for expected in [
         "API KEY",
-        "TIME UTC",
+        "TIME LOCAL",
         "MODEL (REASONING)",
         "PROTOCOL",
         "TOKENS I/C/O (K)",
@@ -193,7 +197,7 @@ async fn logs_renders_a_compact_human_readable_request_table() {
         "DURATION",
         "STATUS",
         "client-a",
-        "2026-08-10T12:34:56Z",
+        "2026-08-10T20:34:56+08:00",
         "gpt-query (high)",
         "responses/websocket",
         "1.234/0.234/0.056",
@@ -240,6 +244,7 @@ async fn logs_combines_common_filters_and_limits_newest_first() {
             "--until",
             "2026-08-10T13:00:00Z",
         ])
+        .env("TZ", "SGT-8")
         .output()
         .expect("run filtered logs command");
     assert!(
@@ -248,8 +253,8 @@ async fn logs_combines_common_filters_and_limits_newest_first() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 filtered logs output");
-    assert!(stdout.contains("2026-08-10T12:34:56Z"), "{stdout}");
-    assert!(!stdout.contains("2026-08-10T11:30:00Z"), "{stdout}");
+    assert!(stdout.contains("2026-08-10T20:34:56+08:00"), "{stdout}");
+    assert!(!stdout.contains("2026-08-10T19:30:00+08:00"), "{stdout}");
     assert!(!stdout.contains("client-unlimited"), "{stdout}");
     assert!(!stdout.contains("other-model"), "{stdout}");
     assert!(!stdout.contains("canceled"), "{stdout}");
