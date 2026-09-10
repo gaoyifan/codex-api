@@ -8,9 +8,11 @@ use std::time::Duration as StdDuration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
-use axum::routing::post;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
@@ -72,7 +74,11 @@ impl FakeCodexServer {
     async fn start() -> Self {
         let state = Arc::new(FakeState::default());
         let app = Router::new()
-            .route("/backend-api/codex/responses", post(fake_responses))
+            .route("/backend-api/codex/models", get(fake_models))
+            .route(
+                "/backend-api/codex/responses",
+                get(fake_responses_websocket).post(fake_responses_http),
+            )
             .route("/oauth/token", post(fake_oauth))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -205,13 +211,54 @@ impl Drop for FakeCodexServer {
     }
 }
 
-async fn fake_responses(
+async fn fake_models() -> Response<Body> {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "models": [{
+                "slug": MODEL,
+                "visibility": "list",
+                "use_responses_lite": true,
+                "base_instructions": "Follow the user's instructions."
+            }]
+        }),
+    )
+}
+
+async fn fake_responses_websocket(
     State(state): State<Arc<FakeState>>,
     headers: HeaderMap,
-    _body: Bytes,
+    websocket: WebSocketUpgrade,
 ) -> Response<Body> {
-    let authorization = header_string(&headers, AUTHORIZATION.as_str());
-    let account_id = header_string(&headers, "chatgpt-account-id");
+    if let Some(rejection) = observe_upstream_request(&state, &headers).await {
+        return rejection;
+    }
+    websocket
+        .on_upgrade(serve_fake_responses_websocket)
+        .into_response()
+}
+
+async fn fake_responses_http(
+    State(state): State<Arc<FakeState>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Some(rejection) = observe_upstream_request(&state, &headers).await {
+        return rejection;
+    }
+    let body = format!("event: response.completed\ndata: {}\n\n", completed_event());
+    let mut response = Response::new(Body::from(body));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
+async fn observe_upstream_request(
+    state: &FakeState,
+    headers: &HeaderMap,
+) -> Option<Response<Body>> {
+    let authorization = header_string(headers, AUTHORIZATION.as_str());
+    let account_id = header_string(headers, "chatgpt-account-id");
     state
         .upstream_requests
         .lock()
@@ -231,7 +278,7 @@ async fn fake_responses(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        return json_response(
+        return Some(json_response(
             StatusCode::UNAUTHORIZED,
             json!({
                 "error": {
@@ -240,7 +287,7 @@ async fn fake_responses(
                     "code": "invalid_api_key"
                 }
             }),
-        );
+        ));
     }
 
     if state
@@ -250,7 +297,7 @@ async fn fake_responses(
         })
         .is_ok()
     {
-        return json_response(
+        return Some(json_response(
             StatusCode::UNAUTHORIZED,
             json!({
                 "error": {
@@ -259,10 +306,37 @@ async fn fake_responses(
                     "code": "invalid_api_key"
                 }
             }),
-        );
+        ));
     }
 
-    let terminal = json!({
+    None
+}
+
+async fn serve_fake_responses_websocket(mut socket: WebSocket) {
+    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+        let Ok(request) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        let response = if request.get("generate").and_then(Value::as_bool) == Some(false) {
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_oauth_prewarm"}
+            })
+        } else {
+            completed_event()
+        };
+        if socket
+            .send(Message::Text(response.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn completed_event() -> Value {
+    json!({
         "type": "response.completed",
         "sequence_number": 1,
         "response": {
@@ -280,13 +354,7 @@ async fn fake_responses(
                 "total_tokens": 2
             }
         }
-    });
-    let body = format!("event: response.completed\ndata: {terminal}\n\n");
-    let mut response = Response::new(Body::from(body));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-    response
+    })
 }
 
 async fn fake_oauth(State(state): State<Arc<FakeState>>, body: Bytes) -> Response<Body> {
@@ -433,6 +501,10 @@ impl RelayProcess {
         format!("{}/v1/responses", self.base_url)
     }
 
+    fn chat_url(&self) -> String {
+        format!("{}/v1/chat/completions", self.base_url)
+    }
+
     fn stop(self) {
         drop(self);
     }
@@ -514,6 +586,25 @@ async fn post_streaming_response(url: &str) -> PublicResponse {
         .send()
         .await
         .expect("send downstream Responses request");
+    let status = response.status();
+    let body = response.text().await.expect("read downstream response");
+    PublicResponse { status, body }
+}
+
+async fn post_chat_response(url: &str) -> PublicResponse {
+    let response = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(5))
+        .build()
+        .expect("build downstream client")
+        .post(url)
+        .bearer_auth(CLIENT_KEY)
+        .json(&json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Reply with OK."}]
+        }))
+        .send()
+        .await
+        .expect("send downstream Chat Completions request");
     let status = response.status();
     let body = response.text().await.expect("read downstream response");
     PublicResponse { status, body }
@@ -1070,15 +1161,15 @@ async fn concurrent_same_generation_callers_share_one_oauth_failure() {
         ),
     );
     let relay = fixture.start().await;
-    let responses_url = relay.responses_url();
+    let chat_url = relay.chat_url();
     let barrier = Arc::new(Barrier::new(REQUEST_COUNT));
     let requests = (0..REQUEST_COUNT)
         .map(|_| {
             let barrier = barrier.clone();
-            let responses_url = responses_url.clone();
+            let chat_url = chat_url.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                post_streaming_response(&responses_url).await
+                post_chat_response(&chat_url).await
             })
         })
         .collect::<Vec<_>>();

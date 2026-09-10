@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    convert::Infallible,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
@@ -9,11 +8,14 @@ use std::{
 
 use axum::{
     Router,
-    body::{Body, Bytes},
-    extract::State,
+    body::Body,
+    extract::{
+        State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::{StatusCode, header},
-    response::Response,
-    routing::post,
+    response::{IntoResponse, Response},
+    routing::get,
 };
 use codex_api::{Clock, run_with_clock};
 use eventsource_stream::Eventsource;
@@ -109,7 +111,8 @@ impl FakeUpstream {
         let addr = listener.local_addr().expect("fake upstream address");
         let received_models = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
-            .route("/responses", post(upstream_response))
+            .route("/models", get(upstream_models))
+            .route("/responses", get(upstream_response))
             .with_state(UpstreamState {
                 replies: Arc::new(Mutex::new(replies.into())),
                 received_models: Arc::clone(&received_models),
@@ -141,54 +144,34 @@ impl Drop for FakeUpstream {
     }
 }
 
-async fn upstream_response(State(state): State<UpstreamState>, body: Bytes) -> Response<Body> {
-    let request: Value = serde_json::from_slice(&body).expect("relay sent upstream JSON");
-    let model = request["model"].as_str().unwrap_or(MODEL).to_owned();
-    state.received_models.lock().await.push(model.clone());
+async fn upstream_models() -> Response<Body> {
+    let models = [MODEL, FALLBACK_MODEL, ROUND_MODEL, HIGH_VALUE_MODEL].map(|model| {
+        json!({
+            "slug": model,
+            "visibility": "list",
+            "use_responses_lite": true,
+            "base_instructions": "Follow the user's instructions."
+        })
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"models": models}).to_string()))
+        .expect("build upstream models response")
+}
+
+async fn upstream_response(
+    State(state): State<UpstreamState>,
+    websocket: WebSocketUpgrade,
+) -> Response<Body> {
     let reply = state
         .replies
         .lock()
         .await
         .pop_front()
         .expect("fake upstream reply exhausted");
-    match reply {
-        Reply::Terminal {
-            event,
-            status,
-            usage,
-        } => terminal_response(&model, event, status, &usage),
-        Reply::BarrierTerminal { barrier, usage } => {
-            timeout(TEST_TIMEOUT, barrier.wait())
-                .await
-                .expect("two admitted requests did not reach upstream");
-            terminal_response(&model, "response.completed", "completed", &usage)
-        }
-        Reply::GatedTerminal {
-            reached,
-            release,
-            usage,
-        } => {
-            let created = json!({
-                "type": "response.created",
-                "sequence_number": 0,
-                "response": {"id": "resp_gated", "status": "in_progress"}
-            });
-            let terminal = terminal_sse(&model, "response.completed", "completed", &usage);
-            let stream = async_stream::stream! {
-                yield Ok::<Bytes, Infallible>(Bytes::from(format!(
-                    "event: response.created\ndata: {created}\n\n"
-                )));
-                reached.notify_one();
-                release.notified().await;
-                yield Ok::<Bytes, Infallible>(Bytes::from(terminal));
-            };
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from_stream(stream))
-                .expect("build gated terminal SSE")
-        }
-        Reply::Http(status) => Response::builder()
+    if let Reply::Http(status) = reply {
+        return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -201,19 +184,86 @@ async fn upstream_response(State(state): State<UpstreamState>, body: Bytes) -> R
                 })
                 .to_string(),
             ))
-            .expect("build HTTP failure"),
+            .expect("build HTTP failure");
+    }
+    websocket
+        .on_upgrade(move |socket| serve_upstream_websocket(socket, state, reply))
+        .into_response()
+}
+
+async fn serve_upstream_websocket(mut socket: WebSocket, state: UpstreamState, reply: Reply) {
+    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+        let Ok(request) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        if request.get("generate").and_then(Value::as_bool) == Some(false) {
+            let prewarm = json!({
+                "type": "response.completed",
+                "response": {"id": "resp_quota_prewarm"}
+            });
+            if socket
+                .send(Message::Text(prewarm.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+
+        let model = request["model"].as_str().unwrap_or(MODEL).to_owned();
+        state.received_models.lock().await.push(model.clone());
+        match reply {
+            Reply::Terminal {
+                event,
+                status,
+                usage,
+            } => {
+                let terminal = terminal_event(&model, event, status, &usage);
+                let _ = socket
+                    .send(Message::Text(terminal.to_string().into()))
+                    .await;
+            }
+            Reply::BarrierTerminal { barrier, usage } => {
+                timeout(TEST_TIMEOUT, barrier.wait())
+                    .await
+                    .expect("two admitted requests did not reach upstream");
+                let terminal = terminal_event(&model, "response.completed", "completed", &usage);
+                let _ = socket
+                    .send(Message::Text(terminal.to_string().into()))
+                    .await;
+            }
+            Reply::GatedTerminal {
+                reached,
+                release,
+                usage,
+            } => {
+                let created = json!({
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": {"id": "resp_gated", "status": "in_progress"}
+                });
+                if socket
+                    .send(Message::Text(created.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                reached.notify_one();
+                release.notified().await;
+                let terminal = terminal_event(&model, "response.completed", "completed", &usage);
+                let _ = socket
+                    .send(Message::Text(terminal.to_string().into()))
+                    .await;
+            }
+            Reply::Http(_) => unreachable!("HTTP replies are handled before upgrade"),
+        }
+        return;
     }
 }
 
-fn terminal_response(model: &str, event: &str, status: &str, usage: &Usage) -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from(terminal_sse(model, event, status, usage)))
-        .expect("build terminal SSE")
-}
-
-fn terminal_sse(model: &str, event: &str, status: &str, usage: &Usage) -> String {
+fn terminal_event(model: &str, event: &str, status: &str, usage: &Usage) -> Value {
     let error = (status == "failed").then(|| {
         json!({
             "message": RAW_ERROR_SENTINEL,
@@ -251,7 +301,7 @@ fn terminal_sse(model: &str, event: &str, status: &str, usage: &Usage) -> String
             }
         }
     });
-    format!("event: {event}\ndata: {terminal}\n\n")
+    terminal
 }
 
 struct Fixture {
@@ -551,7 +601,7 @@ async fn public_view_commits_exact_pricing_rounding_and_safe_columns_before_term
     );
     assert_eq!(
         post_response(&relay, API_KEY, MODEL, json!(true)).await,
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::BAD_GATEWAY
     );
 
     let rows = sqlx::query("SELECT * FROM request_logs ORDER BY id")
@@ -750,7 +800,7 @@ async fn invalid_keys_are_not_logged_while_valid_rejections_and_terminal_failure
     );
     assert_eq!(
         post_response(&relay, API_KEY, MODEL, json!(true)).await,
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::BAD_GATEWAY
     );
     assert_eq!(
         post_response(&relay, API_KEY, MODEL, json!(true)).await,
@@ -783,7 +833,7 @@ async fn invalid_keys_are_not_logged_while_valid_rejections_and_terminal_failure
         observed,
         [
             ("rejected".to_owned(), Some(400), false),
-            ("upstream_error".to_owned(), Some(503), false),
+            ("upstream_error".to_owned(), Some(502), false),
             ("incomplete".to_owned(), Some(200), true),
             ("upstream_error".to_owned(), Some(200), true),
         ]

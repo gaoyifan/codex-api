@@ -8,12 +8,15 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
-    extract::{Request, State},
-    http::StatusCode,
+    extract::{
+        Request, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
@@ -88,7 +91,11 @@ impl FakeUpstream {
         let address = listener.local_addr().expect("fake upstream address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
-            .fallback(any(fake_upstream_response))
+            .route("/models", get(fake_upstream_models))
+            .route(
+                "/responses",
+                get(fake_upstream_websocket).post(fake_upstream_response),
+            )
             .with_state(Arc::clone(&requests));
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -122,25 +129,85 @@ async fn fake_upstream_response(
     State(requests): State<Arc<Mutex<Vec<ObservedRequest>>>>,
     request: Request,
 ) -> Response {
-    let authorization = request
-        .headers()
+    record_upstream_request(&requests, "/responses", request.headers());
+
+    let body = format!("event: response.completed\ndata: {}\n\n", completed_event());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .expect("build fake upstream response")
+}
+
+async fn fake_upstream_models(
+    State(requests): State<Arc<Mutex<Vec<ObservedRequest>>>>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    record_upstream_request(&requests, "/models", &headers);
+    Json(json!({
+        "models": [{
+            "slug": MODEL,
+            "visibility": "list",
+            "use_responses_lite": true,
+            "base_instructions": "Follow the user's instructions."
+        }]
+    }))
+}
+
+async fn fake_upstream_websocket(
+    State(requests): State<Arc<Mutex<Vec<ObservedRequest>>>>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    record_upstream_request(&requests, "/responses", &headers);
+    websocket
+        .on_upgrade(run_fake_upstream_websocket)
+        .into_response()
+}
+
+async fn run_fake_upstream_websocket(mut socket: WebSocket) {
+    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+        let Ok(request) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        let event = if request.get("generate").and_then(Value::as_bool) == Some(false) {
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_auth_prewarm"}
+            })
+        } else {
+            completed_event()
+        };
+        if socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn record_upstream_request(
+    requests: &Mutex<Vec<ObservedRequest>>,
+    path: &str,
+    headers: &HeaderMap,
+) {
+    let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let path = request.uri().path().to_owned();
     requests
         .lock()
         .expect("request lock")
         .push(ObservedRequest {
-            path: path.clone(),
+            path: path.to_owned(),
             authorization,
         });
+}
 
-    if path != "/responses" {
-        return (StatusCode::NOT_FOUND, "unexpected upstream path").into_response();
-    }
-
-    let event = json!({
+fn completed_event() -> Value {
+    json!({
         "type": "response.completed",
         "sequence_number": 1,
         "response": {
@@ -169,13 +236,7 @@ async fn fake_upstream_response(
                 "total_tokens": 3
             }
         }
-    });
-    let body = format!("event: response.completed\ndata: {event}\n\n");
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .body(Body::from(body))
-        .expect("build fake upstream response")
+    })
 }
 
 #[derive(Debug)]
@@ -1023,7 +1084,18 @@ async fn each_configured_key_can_use_the_responses_and_chat_http_apis() {
 
     let observed = upstream.requests();
     assert_eq!(
-        observed.len(),
+        observed
+            .iter()
+            .filter(|request| request.path == "/models")
+            .count(),
+        1,
+        "the upstream model catalog should be cached"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request.path == "/responses")
+            .count(),
         4,
         "all four valid key and endpoint combinations should reach upstream"
     );
@@ -1031,7 +1103,6 @@ async fn each_configured_key_can_use_the_responses_and_chat_http_apis() {
     let first_downstream_authorization = format!("Bearer {FIRST_KEY}");
     let second_downstream_authorization = format!("Bearer {SECOND_KEY}");
     for request in observed {
-        assert_eq!(request.path, "/responses");
         assert_eq!(
             request.authorization.as_deref(),
             Some(expected_upstream_authorization.as_str())

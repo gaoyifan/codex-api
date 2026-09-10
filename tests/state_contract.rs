@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -8,16 +7,16 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use async_stream::stream;
-use axum::body::{Body, Bytes};
-use axum::extract::State;
-use axum::http::{StatusCode, header::CONTENT_TYPE};
-use axum::response::Response;
-use axum::{Router, routing::post};
+use axum::extract::{
+    State, WebSocketUpgrade,
+    ws::{Message, WebSocket},
+};
+use axum::http::StatusCode;
+use axum::{Json, Router, routing::get};
 use codex_api::{Clock, run_with_clock};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Row, SqliteConnection};
 use tempfile::TempDir;
@@ -61,7 +60,8 @@ impl FakeUpstream {
             .local_addr()
             .expect("read state-contract upstream address");
         let app = Router::new()
-            .route("/responses", post(upstream_response))
+            .route("/models", get(upstream_models))
+            .route("/responses", get(upstream_response))
             .with_state(UpstreamState {
                 behavior: Arc::new(Mutex::new(Some(behavior))),
             });
@@ -84,42 +84,78 @@ impl Drop for FakeUpstream {
     }
 }
 
-async fn upstream_response(State(state): State<UpstreamState>) -> Response<Body> {
-    let behavior = state
-        .behavior
-        .lock()
-        .await
-        .take()
-        .expect("state-contract upstream received an unexpected second request");
-    let created = json!({
-        "type": "response.created",
-        "sequence_number": 0,
-        "response": {"id": "resp_state_contract", "status": "in_progress"}
-    });
-    let created = format!("event: response.created\ndata: {created}\n\n");
-
-    let body = match behavior {
-        UpstreamBehavior::Hold => Body::from_stream(stream! {
-            yield Ok::<Bytes, Infallible>(Bytes::from(created));
-            std::future::pending::<()>().await;
-        }),
-        UpstreamBehavior::GatedTerminal { reached, release } => Body::from_stream(stream! {
-            yield Ok::<Bytes, Infallible>(Bytes::from(created));
-            reached.notify_one();
-            release.notified().await;
-            yield Ok::<Bytes, Infallible>(Bytes::from(completed_sse()));
-        }),
-    };
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/event-stream")
-        .body(body)
-        .expect("build state-contract upstream response")
+async fn upstream_models() -> Json<Value> {
+    Json(json!({
+        "models": [{
+            "slug": MODEL,
+            "visibility": "list",
+            "use_responses_lite": true,
+            "base_instructions": "Follow the user's instructions."
+        }]
+    }))
 }
 
-fn completed_sse() -> String {
-    let completed = json!({
+async fn upstream_response(
+    State(state): State<UpstreamState>,
+    websocket: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    websocket.on_upgrade(move |socket| serve_upstream_websocket(socket, state))
+}
+
+async fn serve_upstream_websocket(mut socket: WebSocket, state: UpstreamState) {
+    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+        let Ok(request) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        if request.get("generate").and_then(Value::as_bool) == Some(false) {
+            let prewarm = json!({
+                "type": "response.completed",
+                "response": {"id": "resp_state_contract_prewarm"}
+            });
+            if socket
+                .send(Message::Text(prewarm.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+
+        let behavior = state
+            .behavior
+            .lock()
+            .await
+            .take()
+            .expect("state-contract upstream received an unexpected second request");
+        let created = json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {"id": "resp_state_contract", "status": "in_progress"}
+        });
+        if socket
+            .send(Message::Text(created.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match behavior {
+            UpstreamBehavior::Hold => std::future::pending::<()>().await,
+            UpstreamBehavior::GatedTerminal { reached, release } => {
+                reached.notify_one();
+                release.notified().await;
+                let _ = socket
+                    .send(Message::Text(completed_event().to_string().into()))
+                    .await;
+            }
+        }
+        return;
+    }
+}
+
+fn completed_event() -> Value {
+    json!({
         "type": "response.completed",
         "sequence_number": 1,
         "response": {
@@ -137,8 +173,7 @@ fn completed_sse() -> String {
                 "total_tokens": 2
             }
         }
-    });
-    format!("event: response.completed\ndata: {completed}\n\n")
+    })
 }
 
 struct Fixture {

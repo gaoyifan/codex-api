@@ -12,7 +12,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
-use axum::{Router, routing::get};
+use axum::{Json, Router, routing::get};
 use eventsource_stream::Eventsource;
 use futures_util::{SinkExt, StreamExt};
 use http::header::AUTHORIZATION;
@@ -58,6 +58,7 @@ impl FakeUpstream {
             events: event_sender,
         };
         let app = Router::new()
+            .route("/models", get(upstream_models))
             .route("/responses", get(upstream_websocket).post(upstream_http))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -107,6 +108,17 @@ impl Drop for FakeUpstream {
     }
 }
 
+async fn upstream_models() -> Json<Value> {
+    Json(json!({
+        "models": [{
+            "slug": MODEL,
+            "visibility": "list",
+            "use_responses_lite": true,
+            "base_instructions": "Follow the user's instructions."
+        }]
+    }))
+}
+
 async fn upstream_http(State(state): State<UpstreamState>) -> Response {
     let _ = state.events.send(UpstreamEvent::HttpRequest);
     let created = json!({
@@ -143,6 +155,20 @@ async fn serve_upstream_websocket(mut socket: WebSocket, state: UpstreamState) {
                     Err(_) => return,
                 };
                 if value.get("type").and_then(Value::as_str) == Some("response.create") {
+                    if value.get("generate").and_then(Value::as_bool) == Some(false) {
+                        let completed = json!({
+                            "type": "response.completed",
+                            "response": {"id": "resp-lifecycle-prewarm"}
+                        });
+                        if socket
+                            .send(AxumMessage::Text(completed.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     let _ = state.events.send(UpstreamEvent::WebSocketCreate);
                     let created = json!({
                         "type": "response.created",
@@ -386,7 +412,7 @@ async fn sigterm_cancels_active_responses_sse_before_bounded_exit() {
         .await
         .expect("start active downstream Responses stream");
     assert_eq!(response.status(), StatusCode::OK);
-    upstream.expect_http_request().await;
+    upstream.expect_websocket_create().await;
     let mut events = response.bytes_stream().eventsource();
     let created = timeout(TEST_TIMEOUT, events.next())
         .await
