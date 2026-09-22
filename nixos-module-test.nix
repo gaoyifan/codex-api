@@ -43,6 +43,18 @@ assert config.users.users.codex-api.isSystemUser;
 assert config.users.users.codex-api.group == "codex-api";
 assert config.systemd.services.codex-api.serviceConfig.User == "codex-api";
 assert config.systemd.services.codex-api.serviceConfig.Group == "codex-api";
+assert
+  config.services.codex-api.settings.model_prices."gpt-6-sol" == {
+    input_usd_per_million = "2.00";
+    cached_input_usd_per_million = "0.20";
+    output_usd_per_million = "10.00";
+  };
+assert
+  config.services.codex-api.settings.model_prices."gpt-6-luna" == {
+    input_usd_per_million = "0.10";
+    cached_input_usd_per_million = "0.01";
+    output_usd_per_million = "0.50";
+  };
 pkgs.runCommand "codex-api-nixos-module-test" { } ''
   grep -F 'fallback_model = "gpt-5.6-luna"' \
     ${config.systemd.services.codex-api.environment.CODEX_API_CONFIG}
