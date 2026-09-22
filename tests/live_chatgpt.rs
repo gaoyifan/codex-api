@@ -232,7 +232,7 @@ output_usd_per_million = "6.00"
             // An immutable handshake change forces a new socket while retaining the logical snapshot.
             request = request.header(
                 "user-agent",
-                "codex_cli_rs/0.153.4 (codex-api live reconnect)",
+                "codex_cli_rs/0.155.1 (codex-api live reconnect)",
             );
         }
         let started = Instant::now();
