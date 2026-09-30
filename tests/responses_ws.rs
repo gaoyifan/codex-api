@@ -1046,13 +1046,13 @@ async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normali
     );
     assert_eq!(
         headers.get("version").and_then(|value| value.to_str().ok()),
-        Some("0.155.1")
+        Some("0.159.2")
     );
     assert!(
         headers
             .get("user-agent")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("codex_cli_rs/0.155.1 "))
+            .is_some_and(|value| value.starts_with("codex_cli_rs/0.159.2 "))
     );
     assert_eq!(
         headers
