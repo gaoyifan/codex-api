@@ -208,8 +208,8 @@ el2 host module under `~/nix/nixos/hosts/el2/` can use this shape:
 }
 ```
 
-The NixOS module supplies the current Standard short-context prices for GPT-6
-Astra, Sol, and Luna and the GPT-5.6 Sol, Terra, and Luna models by default.
+The NixOS module supplies the current Standard short-context prices for GPT-6.1
+Sol, GPT-6 Astra, Sol, and Luna, and GPT-5.6 Sol, Terra, and Luna by default.
 Set `settings.model_prices` only when overriding that table deliberately.
 
 If `user` or `group` is changed from `codex-api`, define that account outside

@@ -41,10 +41,16 @@ in
 
   config = lib.mkIf cfg.enable {
     # Standard short-context prices: https://developers.openai.com/api/docs/pricing
+    # GPT-6.1 Sol: https://developers.openai.com/api/docs/models/gpt-6.1-sol
     # GPT-6 Sol and Luna: https://developers.openai.com/api/docs/models/gpt-6-sol
     # https://developers.openai.com/api/docs/models/gpt-6-luna
     services.codex-api.settings.fallback_model = lib.mkDefault "gpt-5.6-luna";
     services.codex-api.settings.model_prices = {
+      "gpt-6.1-sol" = {
+        input_usd_per_million = lib.mkDefault "2.00";
+        cached_input_usd_per_million = lib.mkDefault "0.10";
+        output_usd_per_million = lib.mkDefault "10.00";
+      };
       "gpt-6-astra" = {
         input_usd_per_million = lib.mkDefault "10.00";
         cached_input_usd_per_million = lib.mkDefault "1.00";
