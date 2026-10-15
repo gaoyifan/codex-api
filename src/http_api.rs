@@ -224,6 +224,49 @@ pub(crate) async fn responses(
         .expect("static streaming response is valid"))
 }
 
+pub(crate) async fn image_generations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    images(&state, headers, body, "generations").await
+}
+
+pub(crate) async fn image_edits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    images(&state, headers, body, "edits").await
+}
+
+async fn images(
+    state: &AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    operation: &str,
+) -> Result<Response, ApiError> {
+    authenticate(&headers, &state.config)?;
+    let parsed: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::invalid("request", "request body must be valid JSON"))?;
+    let upstream = tokio::select! {
+        biased;
+        _ = state.shutdown.cancelled() => return Err(ApiError::shutdown()),
+        result = state.upstream_http.images(operation, &parsed, &headers) => {
+            result.map_err(|_| ApiError::gateway("Upstream image request failed"))?
+        }
+    };
+    let mut response = Response::builder().status(upstream.status());
+    for name in ["content-type", "x-codex-imagegen-request-id"] {
+        if let Some(value) = upstream.headers().get(name) {
+            response = response.header(name, value);
+        }
+    }
+    Ok(response
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .expect("upstream response headers are valid"))
+}
+
 pub(crate) async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

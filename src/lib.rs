@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use tokio_util::sync::CancellationToken;
@@ -111,6 +112,14 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
     let router = Router::new()
         .route("/v1/responses", responses)
         .route("/v1/chat/completions", post(http_api::chat_completions))
+        .route(
+            "/v1/images/generations",
+            post(http_api::image_generations).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/v1/images/edits",
+            post(http_api::image_edits).layer(DefaultBodyLimit::disable()),
+        )
         .route("/v1/models", get(http_api::models))
         .route("/v1/models/{model}", get(http_api::model))
         .with_state(state);

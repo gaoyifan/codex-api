@@ -18,6 +18,7 @@ const CODEX_PASSTHROUGH_HEADERS: &[&str] = &[
     "x-codex-turn-metadata",
     "x-codex-window-id",
     "x-codex-parent-thread-id",
+    "x-codex-image-turn-id",
     "x-openai-subagent",
     "x-openai-memgen-request",
     "x-responsesapi-include-timing-metrics",

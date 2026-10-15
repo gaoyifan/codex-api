@@ -20,6 +20,7 @@ use crate::{
 pub(crate) struct UpstreamHttpClient {
     client: reqwest::Client,
     responses_url: Url,
+    images_url: Url,
     models_url: Url,
     credentials: Arc<CredentialManager>,
     clock: Arc<dyn Clock>,
@@ -45,6 +46,8 @@ impl UpstreamHttpClient {
         responses_url.set_path(&format!("{base_path}/responses"));
         responses_url.set_query(None);
         responses_url.set_fragment(None);
+        let mut images_url = responses_url.clone();
+        images_url.set_path(&format!("{base_path}/images"));
         let mut models_url = base_url.clone();
         models_url.set_path(&format!("{base_path}/models"));
         models_url.set_query(None);
@@ -55,6 +58,7 @@ impl UpstreamHttpClient {
         Self {
             client,
             responses_url,
+            images_url,
             models_url,
             credentials,
             clock,
@@ -130,13 +134,41 @@ impl UpstreamHttpClient {
         body: &Value,
         downstream_headers: &HeaderMap,
     ) -> Result<Response, UpstreamHttpError> {
+        self.send_json(
+            &self.responses_url,
+            "text/event-stream",
+            body,
+            downstream_headers,
+        )
+        .await
+    }
+
+    pub(crate) async fn images(
+        &self,
+        operation: &str,
+        body: &Value,
+        downstream_headers: &HeaderMap,
+    ) -> Result<Response, UpstreamHttpError> {
+        let mut url = self.images_url.clone();
+        url.set_path(&format!("{}/{operation}", self.images_url.path()));
+        self.send_json(&url, "application/json", body, downstream_headers)
+            .await
+    }
+
+    async fn send_json(
+        &self,
+        url: &Url,
+        accept: &str,
+        body: &Value,
+        downstream_headers: &HeaderMap,
+    ) -> Result<Response, UpstreamHttpError> {
         let credential = self
             .credentials
             .credentials()
             .await
             .map_err(UpstreamHttpError::Credentials)?;
         let response = self
-            .send_once(body, downstream_headers, &credential)
+            .send_once(url, accept, body, downstream_headers, &credential)
             .await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
@@ -148,7 +180,7 @@ impl UpstreamHttpClient {
             .await
             .map_err(UpstreamHttpError::CredentialRefresh)?;
         let response = self
-            .send_once(body, downstream_headers, &credential)
+            .send_once(url, accept, body, downstream_headers, &credential)
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             Err(UpstreamHttpError::AuthenticationRejected)
@@ -159,6 +191,8 @@ impl UpstreamHttpClient {
 
     async fn send_once(
         &self,
+        url: &Url,
+        accept: &str,
         body: &Value,
         downstream_headers: &HeaderMap,
         credential: &CredentialSnapshot,
@@ -170,13 +204,13 @@ impl UpstreamHttpClient {
         .map_err(|_| UpstreamHttpError::InvalidCredentialHeader)?;
         authorization.set_sensitive(true);
         self.client
-            .post(self.responses_url.clone())
+            .post(url.clone())
             .header(AUTHORIZATION, authorization)
             .header("ChatGPT-Account-ID", &credential.account_id)
             .header("originator", CODEX_ORIGINATOR)
             .header("version", CODEX_VERSION)
             .header(USER_AGENT, CODEX_USER_AGENT)
-            .header(ACCEPT, "text/event-stream")
+            .header(ACCEPT, accept)
             .headers(codex_request_headers(downstream_headers, body))
             .json(body)
             .send()

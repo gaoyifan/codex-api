@@ -8,7 +8,8 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
+    extract::DefaultBodyLimit,
     extract::State,
     http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -60,6 +61,7 @@ impl Clock for FixedClock {
 
 enum ModelsReply {
     Json(Value),
+    Image(StatusCode, Value),
     Status(StatusCode),
     Raw(&'static str),
 }
@@ -67,13 +69,13 @@ enum ModelsReply {
 #[derive(Clone)]
 struct UpstreamState {
     replies: Arc<Mutex<VecDeque<ModelsReply>>>,
-    requests: Arc<Mutex<Vec<(Uri, HeaderMap)>>>,
+    requests: Arc<Mutex<Vec<(Uri, HeaderMap, Bytes)>>>,
     oauth_requests: Arc<Mutex<usize>>,
 }
 
 struct FakeUpstream {
     address: SocketAddr,
-    requests: Arc<Mutex<Vec<(Uri, HeaderMap)>>>,
+    requests: Arc<Mutex<Vec<(Uri, HeaderMap, Bytes)>>>,
     oauth_requests: Arc<Mutex<usize>>,
     task: JoinHandle<()>,
 }
@@ -92,8 +94,11 @@ impl FakeUpstream {
             oauth_requests: Arc::clone(&oauth_requests),
         };
         let app = Router::new()
-            .route("/models", get(upstream_models))
+            .route("/models", get(upstream_handler))
+            .route("/images/generations", post(upstream_handler))
+            .route("/images/edits", post(upstream_handler))
             .route("/oauth/token", post(upstream_oauth))
+            .layer(DefaultBodyLimit::disable())
             .with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -112,7 +117,7 @@ impl FakeUpstream {
         format!("http://{}", self.address)
     }
 
-    async fn requests(&self) -> Vec<(Uri, HeaderMap)> {
+    async fn requests(&self) -> Vec<(Uri, HeaderMap, Bytes)> {
         self.requests.lock().await.clone()
     }
 
@@ -135,12 +140,13 @@ impl Drop for FakeUpstream {
     }
 }
 
-async fn upstream_models(
+async fn upstream_handler(
     State(state): State<UpstreamState>,
     uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    state.requests.lock().await.push((uri, headers));
+    state.requests.lock().await.push((uri, headers, body));
     match state
         .replies
         .lock()
@@ -149,6 +155,12 @@ async fn upstream_models(
         .expect("fake models reply exhausted")
     {
         ModelsReply::Json(value) => Json(value).into_response(),
+        ModelsReply::Image(status, value) => Response::builder()
+            .status(status)
+            .header("content-type", "application/json; charset=utf-8")
+            .header("x-codex-imagegen-request-id", "image-request-test")
+            .body(Body::from(value.to_string()))
+            .expect("build image upstream response"),
         ModelsReply::Status(status) => status.into_response(),
         ModelsReply::Raw(body) => Response::builder()
             .header("content-type", "application/json")
@@ -540,4 +552,114 @@ async fn invalid_upstream_models_payload_returns_502() {
         response.json::<Value>().await.unwrap()["error"]["code"],
         "upstream_error"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_images_forward_json_headers_and_upstream_status_without_text_quota() {
+    let success = json!({"data": [{"b64_json": "generated-image"}]});
+    let error = json!({"error": {"message": "image service unavailable"}});
+    let upstream = FakeUpstream::start(vec![
+        ModelsReply::Image(StatusCode::OK, success.clone()),
+        ModelsReply::Image(StatusCode::SERVICE_UNAVAILABLE, error.clone()),
+    ])
+    .await;
+    let fixture = Fixture::new(&upstream);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    record_spend(&fixture.database_path, 2_000_000_000).await;
+
+    for (operation, expected_status, expected_body) in [
+        ("generations", StatusCode::OK, success),
+        ("edits", StatusCode::SERVICE_UNAVAILABLE, error),
+    ] {
+        let mut payload = json!({
+            "model": "gpt-image-2",
+            "prompt": "Draw a blue square",
+            "quality": "medium",
+            "size": "1024x1024",
+            "background": "opaque"
+        });
+        if operation == "edits" {
+            payload["images"] = json!([{
+                "image_url": format!("data:image/png;base64,{}", "A".repeat(3 * 1024 * 1024))
+            }]);
+        }
+        let url = relay.url(&format!("/v1/images/{operation}"));
+        let unauthorized = client()
+            .post(&url)
+            .bearer_auth("wrong-key")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = client()
+            .post(&url)
+            .bearer_auth(API_KEY)
+            .header("x-codex-image-turn-id", "image-turn-test")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()["x-codex-imagegen-request-id"],
+            "image-request-test"
+        );
+        assert_eq!(response.json::<Value>().await.unwrap(), expected_body);
+
+        let requests = upstream.requests().await;
+        let (uri, headers, body) = requests.last().unwrap();
+        assert_eq!(uri.path(), format!("/images/{operation}"));
+        assert_eq!(headers["authorization"], format!("Bearer {ACCESS_TOKEN}"));
+        assert_eq!(headers["chatgpt-account-id"], ACCOUNT_ID);
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(headers["x-codex-image-turn-id"], "image-turn-test");
+        assert_eq!(serde_json::from_slice::<Value>(body).unwrap(), payload);
+    }
+    assert_eq!(upstream.requests().await.len(), 2);
+    let mut database = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new().filename(&fixture.database_path),
+    )
+    .await
+    .unwrap();
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_ledger")
+        .fetch_one(&mut database)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 1, "images must not write quota entries");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_images_retry_with_refreshed_credentials_after_upstream_401() {
+    let upstream = FakeUpstream::start(vec![
+        ModelsReply::Status(StatusCode::UNAUTHORIZED),
+        ModelsReply::Image(StatusCode::OK, json!({"data": []})),
+    ])
+    .await;
+    let fixture = Fixture::new(&upstream);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    let response = client()
+        .post(relay.url("/v1/images/generations"))
+        .bearer_auth(API_KEY)
+        .json(&json!({"model": "gpt-image-2", "prompt": "A square"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].1["authorization"],
+        format!("Bearer {ACCESS_TOKEN}")
+    );
+    assert_eq!(
+        requests[1].1["authorization"],
+        format!("Bearer {ROTATED_ACCESS_TOKEN}")
+    );
+    assert_eq!(upstream.oauth_requests().await, 1);
 }

@@ -23,6 +23,11 @@ management UI, multi-account scheduling, or transport fallbacks.
 - `GET /v1/models` and `GET /v1/models/{model}` expose the currently usable
   Codex models in OpenAI-compatible shapes. Codex metadata such as
   `context_window` is retained on each model object.
+- `POST /v1/images/generations` and `POST /v1/images/edits` forward native
+  Codex image JSON requests, including inline images for edits. They preserve
+  the upstream status, body, content type, and `x-codex-imagegen-request-id`.
+  Image requests use the configured API keys but do not check or record quota
+  and do not require a `model_prices` entry.
 
 All endpoints require:
 
@@ -140,7 +145,7 @@ See [config.example.toml](config.example.toml). Important rules:
 - API key IDs and resolved secrets must be non-empty and unique. Set exactly
   one of `secret` or `secret_file` for each key.
 - Decimal prices and limits must be quoted strings and non-negative.
-- `model_prices` supplies deterministic billing rates and bounds the models
+- `model_prices` supplies deterministic billing rates and bounds the text models
   this relay may expose or forward. The models API additionally requires the
   model to be visible in the live Codex catalog.
 - A model's optional `max_reasoning_effort` caps higher requested levels after
