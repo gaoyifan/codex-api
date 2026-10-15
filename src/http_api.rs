@@ -262,8 +262,11 @@ async fn images(
             response = response.header(name, value);
         }
     }
+    let body = upstream
+        .bytes_stream()
+        .take_until(state.shutdown.clone().cancelled_owned());
     Ok(response
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .body(Body::from_stream(body))
         .expect("upstream response headers are valid"))
 }
 

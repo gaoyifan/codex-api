@@ -12,7 +12,10 @@ use axum::extract::State;
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    routing::{get, post},
+};
 use eventsource_stream::Eventsource;
 use futures_util::{SinkExt, StreamExt};
 use http::header::AUTHORIZATION;
@@ -60,6 +63,8 @@ impl FakeUpstream {
         let app = Router::new()
             .route("/models", get(upstream_models))
             .route("/responses", get(upstream_websocket).post(upstream_http))
+            .route("/images/generations", post(upstream_image))
+            .route("/images/edits", post(upstream_image))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -137,6 +142,19 @@ async fn upstream_http(State(state): State<UpstreamState>) -> Response {
         .header(CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(body))
         .expect("build active upstream SSE response")
+}
+
+async fn upstream_image(State(state): State<UpstreamState>) -> Response {
+    let _ = state.events.send(UpstreamEvent::HttpRequest);
+    let body = stream! {
+        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"{\"data\":["));
+        std::future::pending::<()>().await;
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(body))
+        .expect("build pending upstream image response")
 }
 
 async fn upstream_websocket(
@@ -398,6 +416,37 @@ fn client() -> reqwest::Client {
         .timeout(TEST_TIMEOUT)
         .build()
         .expect("build lifecycle HTTP client")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_cancels_pending_image_bodies_before_bounded_exit() {
+    for operation in ["generations", "edits"] {
+        let mut upstream = FakeUpstream::start().await;
+        let mut relay = RelayProcess::start(&upstream).await;
+        let mut response = client()
+            .post(format!("http://{}/v1/images/{operation}", relay.addr))
+            .bearer_auth(API_KEY)
+            .json(&json!({"model": "gpt-image-2", "prompt": "hold"}))
+            .send()
+            .await
+            .expect("start pending image response");
+        assert_eq!(response.status(), StatusCode::OK);
+        upstream.expect_http_request().await;
+        assert!(
+            response
+                .chunk()
+                .await
+                .expect("read pending image body")
+                .is_some(),
+            "image response ended before SIGTERM"
+        );
+
+        let shutdown = relay.terminate().await;
+        assert!(
+            shutdown.exited_in_time && shutdown.successful,
+            "SIGTERM did not cancel the pending image {operation} body"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

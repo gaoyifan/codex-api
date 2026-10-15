@@ -24,8 +24,9 @@ management UI, multi-account scheduling, or transport fallbacks.
   Codex models in OpenAI-compatible shapes. Codex metadata such as
   `context_window` is retained on each model object.
 - `POST /v1/images/generations` and `POST /v1/images/edits` forward native
-  Codex image JSON requests, including inline images for edits. They preserve
-  the upstream status, body, content type, and `x-codex-imagegen-request-id`.
+  Codex image JSON requests, including inline images for edits. After the usual
+  OAuth refresh handling, they preserve the upstream status, body, content type,
+  and `x-codex-imagegen-request-id`.
   Image requests use the configured API keys but do not check or record quota
   and do not require a `model_prices` entry.
 
@@ -125,10 +126,10 @@ codex-api logs
 codex-api stat [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD]
 ```
 
-`SIGINT` and `SIGTERM` stop new connections and cancel Responses, Chat, and
-WebSocket operations that are still awaiting an upstream outcome. Outcomes
-already received from upstream retain their terminal status and usage. The
-service waits for ledger writes, connection tasks, and any dispatched OAuth
+`SIGINT` and `SIGTERM` stop new connections and cancel Responses, Chat, Images,
+and WebSocket operations that are still awaiting an upstream outcome. Text
+outcomes already received from upstream retain their terminal status and usage.
+The service waits for ledger writes, connection tasks, and any dispatched OAuth
 token rotation to finish before the process exits.
 
 The ChatGPT authentication file has the same token structure as Codex CLI's
@@ -268,8 +269,9 @@ close the socket with code 1003.
 
 ## Accounting and weekly limits
 
-Every authenticated generation operation gets a ledger row. Models queries and
-invalid API keys do not.
+Every authenticated text generation operation gets a ledger row. Image requests,
+model queries, and invalid API keys do not. The limits below apply only to text
+generation.
 Prices are calculated with decimal arithmetic, then rounded half-up once per
 request to one nano-USD:
 
