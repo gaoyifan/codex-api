@@ -105,7 +105,18 @@ pub(crate) fn responses_lite_prewarm(
         .remove("tools")
         .and_then(|value| value.as_array().cloned())
         .filter(|tools| !tools.is_empty());
-    let disable_tools = tools.is_none();
+    let has_inline_tools = object
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|input| {
+            input.iter().any(|item| {
+                item["type"] == "additional_tools"
+                    && item["tools"]
+                        .as_array()
+                        .is_some_and(|tools| !tools.is_empty())
+            })
+        });
+    let disable_tools = tools.is_none() && !has_inline_tools;
     let tools = tools.unwrap_or_else(route_marker_tools);
     let client_instructions = object
         .remove("instructions")

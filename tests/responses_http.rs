@@ -287,6 +287,36 @@ impl Drop for Relay {
 }
 
 #[tokio::test]
+async fn native_responses_lite_preserves_tool_choice() {
+    let mut upstream = Upstream::start().await;
+    let relay = Relay::start(&upstream).await;
+    let input = json!([
+        {"type": "additional_tools", "role": "developer", "tools": [{
+            "type": "namespace", "name": "functions", "tools": [{
+                "type": "function", "name": "lookup",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }]},
+        user("lookup")
+    ]);
+    let mut request = body(input.clone());
+    request["tool_choice"] = json!("auto");
+    let response = spawn_response(
+        relay
+            .post(None, request)
+            .header("x-openai-internal-codex-responses-lite", "true")
+            .send(),
+    );
+    let mut connection = upstream.accept().await;
+    connection.prewarm().await;
+    let turn = connection.request().await;
+    connection.complete("resp-native-lite", json!([]));
+    finish(response).await;
+    assert_eq!(turn["input"], input);
+    assert_eq!(turn["tool_choice"], "auto");
+}
+
+#[tokio::test]
 async fn http_responses_use_websocket_lite_prewarm_and_return_sse() {
     let mut upstream = Upstream::start().await;
     let relay = Relay::start(&upstream).await;
