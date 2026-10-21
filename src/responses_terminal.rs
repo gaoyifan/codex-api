@@ -50,6 +50,17 @@ pub(crate) struct TerminalEvent {
     pub(crate) usage: Option<Usage>,
 }
 
+impl TerminalEvent {
+    pub(crate) fn upstream_error(&self) -> Option<&Value> {
+        match self.kind {
+            TerminalKind::Error => self.payload.get("error"),
+            TerminalKind::Failed => self.payload.pointer("/response/error"),
+            TerminalKind::Completed | TerminalKind::Incomplete => None,
+        }
+        .filter(|error| error.is_object())
+    }
+}
+
 /// Token accounting and Chat usage fields from a terminal response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Usage {
@@ -96,6 +107,25 @@ pub(crate) fn parse_terminal_payload(
     else {
         return Ok(None);
     };
+
+    // Log only failure metadata, never the surrounding response or its output.
+    if matches!(kind, TerminalKind::Error | TerminalKind::Failed) {
+        let error = if kind == TerminalKind::Error {
+            &payload["error"]
+        } else {
+            &payload["response"]["error"]
+        };
+        tracing::warn!(
+            event = kind.event_name(),
+            error_code = error["code"].as_str(),
+            error_type = error["type"].as_str(),
+            error_message = error["message"].as_str(),
+            response_id = payload
+                .pointer("/response/id")
+                .and_then(|value| value.as_str()),
+            "Upstream Responses request failed"
+        );
+    }
 
     if kind == TerminalKind::Error {
         return Ok(Some(TerminalEvent {

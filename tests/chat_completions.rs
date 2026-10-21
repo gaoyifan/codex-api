@@ -228,7 +228,7 @@ max_reasoning_effort = "high"
             .arg(&config_path)
             .arg("serve")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(std::fs::File::create(directory.path().join("relay.log")).unwrap())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
@@ -1333,6 +1333,78 @@ async fn unaccountable_chat_terminal_returns_and_records_bad_gateway() {
 }
 
 #[tokio::test]
+async fn preserves_upstream_capacity_errors_in_json_and_streaming_chat() {
+    let error = json!({
+        "type": "service_unavailable_error",
+        "code": "server_is_overloaded",
+        "message": "Our servers are currently overloaded. Please try again later.",
+        "param": null
+    });
+    let events = [
+        json!({"type": "error", "error": error}),
+        json!({
+            "type": "response.failed",
+            "response": {"id": "resp_capacity", "status": "failed", "error": error}
+        }),
+    ];
+    let upstream = ScriptedUpstream::start(
+        events
+            .iter()
+            .cycle()
+            .take(4)
+            .map(|event| UpstreamReply::events(vec![event.clone()]))
+            .collect(),
+    )
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+
+    for stream in [false, true] {
+        for _ in &events {
+            let mut request = minimal_request();
+            request["stream"] = json!(stream);
+            let response = relay.post(&request).await;
+            if stream {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.text().await.unwrap();
+                assert!(!body.contains("[DONE]"));
+                let data = body
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("stream must include the upstream error");
+                let body: Value = serde_json::from_str(data).unwrap();
+                assert_eq!(body["error"], error);
+                assert!(!body.to_string().contains("could not be converted"));
+            } else {
+                let (status, body) = response_json(response).await;
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert_eq!(body["error"], error);
+            }
+        }
+    }
+
+    let mut database = relay.database().await;
+    let rows = sqlx::query("SELECT status, http_status, cost_usd FROM request_logs ORDER BY id")
+        .fetch_all(&mut database)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.get::<String, _>("status"), "upstream_error");
+        assert_eq!(
+            row.get::<i64, _>("http_status"),
+            if index < 2 { 502 } else { 200 }
+        );
+        assert_eq!(row.get::<Option<String>, _>("cost_usd"), None);
+    }
+    let log = std::fs::read_to_string(relay._directory.path().join("relay.log")).unwrap();
+    assert_eq!(log.matches("Upstream Responses request failed").count(), 4);
+    assert!(log.contains("server_is_overloaded"));
+    assert!(log.contains("Our servers are currently overloaded"));
+    assert!(!log.contains(API_KEY));
+    assert!(!log.contains("unused-refresh-token"));
+}
+
+#[tokio::test]
 async fn turns_upstream_http_errors_error_events_and_failed_responses_into_gateway_errors() {
     let failed = json!({
         "type": "response.failed",
@@ -1363,8 +1435,15 @@ async fn turns_upstream_http_errors_error_events_and_failed_responses_into_gatew
     .await;
     let relay = TestRelay::start(&upstream).await;
 
-    for _ in 0..3 {
-        assert_gateway_error(relay.post(&minimal_request()).await).await;
+    for (code, message) in [
+        ("upstream_error", "Upstream request failed"),
+        ("server_error", "boom"),
+        ("server_error", "upstream failed"),
+    ] {
+        let (status, body) = response_json(relay.post(&minimal_request()).await).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], code);
+        assert_eq!(body["error"]["message"], message);
     }
     assert_eq!(upstream.request_count(), 3);
 }

@@ -267,6 +267,16 @@ are Responses `error` events and leave the socket usable. Malformed JSON is
 reported the same way without contacting upstream; binary application frames
 close the socket with code 1003.
 
+Upstream `error` and `response.failed` events retain their error code, type,
+message, and parameter in Chat Completions responses. Non-streaming requests
+return HTTP 502; streams that have already started emit a final `data:` record
+containing the error instead of silently closing. Responses endpoints continue
+to forward the upstream events unchanged.
+
+The service also writes terminal failure metadata (event type, error code, type,
+message, and response ID when present) to its standard log. It does not log the
+surrounding request or response payload. These details are not stored in SQLite.
+
 ## Accounting and weekly limits
 
 Every authenticated text generation operation gets a ledger row. Image requests,

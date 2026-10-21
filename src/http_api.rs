@@ -386,7 +386,7 @@ pub(crate) async fn chat_completions(
             request.finish(FinalStatus::Canceled, None, None).await?;
             return Err(ApiError::shutdown());
         }
-        Err(ChatStreamError::InvalidTerminal(usage)) => {
+        Err(ChatStreamError::InvalidTerminal(usage, error)) => {
             let _ = request
                 .finish_terminal(
                     FinalStatus::UpstreamError,
@@ -395,9 +395,7 @@ pub(crate) async fn chat_completions(
                     usage.map(|usage| billable_usage(usage, rates)),
                 )
                 .await;
-            return Err(ApiError::gateway(
-                "Upstream terminal response could not be converted",
-            ));
+            return Err(error);
         }
         Err(ChatStreamError::MissingTerminal) => {
             request
@@ -470,6 +468,19 @@ async fn forward_chat_stream(
             }
         };
         if let Some(terminal) = event.terminal() {
+            if let Some(error) = terminal.upstream_error() {
+                let error = ApiError::upstream(error);
+                let _ = request
+                    .finish_terminal(
+                        FinalStatus::UpstreamError,
+                        StatusCode::OK,
+                        StatusCode::OK,
+                        terminal.usage.map(|usage| billable_usage(usage, rates)),
+                    )
+                    .await;
+                let _ = sender.send(chat_sse_bytes(&error.body())).await;
+                return;
+            }
             let converted = match converter.convert_terminal(terminal) {
                 Ok(converted) => converted,
                 Err(_) => {
@@ -537,7 +548,7 @@ fn chat_sse_bytes(value: &Value) -> Bytes {
 
 enum ChatStreamError {
     Shutdown,
-    InvalidTerminal(Option<Usage>),
+    InvalidTerminal(Option<Usage>, ApiError),
     MissingTerminal,
 }
 
@@ -569,6 +580,12 @@ async fn read_chat_terminal(
         let mut terminal = event.into_terminal().expect("checked above");
 
         let usage = terminal.usage;
+        if let Some(error) = terminal.upstream_error() {
+            return Err(ChatStreamError::InvalidTerminal(
+                usage,
+                ApiError::upstream(error),
+            ));
+        }
         let output_is_empty = matches!(
             terminal.payload.pointer("/response/output"),
             Some(Value::Array(output)) if output.is_empty()
@@ -579,7 +596,11 @@ async fn read_chat_terminal(
         return match chat::convert_terminal_event(&terminal) {
             Ok(converted) => Ok(converted),
             Err(error) if error.kind == ChatErrorKind::UpstreamProtocol => {
-                Err(ChatStreamError::InvalidTerminal(usage))
+                tracing::warn!(%error, "Upstream Chat terminal conversion failed");
+                Err(ChatStreamError::InvalidTerminal(
+                    usage,
+                    ApiError::gateway("Upstream terminal response could not be converted"),
+                ))
             }
             Err(_) => unreachable!("terminal conversion cannot be a request error"),
         };
