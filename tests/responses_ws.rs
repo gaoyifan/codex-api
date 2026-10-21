@@ -1075,7 +1075,8 @@ async fn one_downstream_socket_uses_one_authenticated_codex_upstream_and_normali
     );
     let connection = upstream.expect_connection().await;
 
-    let create = response_create("preserve this input", None);
+    let mut create = response_create("preserve this input", None);
+    create["stream"] = json!(true);
     send_json(&mut socket, &create).await;
     let upstream_create = upstream.expect_text(connection.id).await;
     assert_eq!(upstream_create["type"], "response.create");
@@ -1512,6 +1513,65 @@ async fn usage_above_sqlite_range_closes_without_forwarding_and_finalizes_upstre
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capacity_errors_are_normalized_with_retry_advice_in_websockets() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    for code in ["server_is_overloaded", "slow_down"] {
+        for bare in [true, false] {
+            send_json(&mut socket, &response_create("retry", None)).await;
+            let _ = upstream.expect_text(connection.id).await;
+            let error = json!({"code": code, "type": "service_unavailable_error",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "param": null});
+            let event = if bare {
+                json!({"type": "error", "error": error})
+            } else {
+                json!({"type": "response.failed", "response": {
+                    "status": "failed", "id": "resp-capacity", "error": error}})
+            };
+            connection.send_json(event);
+            let mut expected_error = error;
+            expected_error["headers"] = json!({"Retry-After": "30"});
+            let mut expected = json!({"type": "response.failed", "response": {
+                "status": "failed", "error": expected_error}});
+            if !bare {
+                expected["response"]["id"] = json!("resp-capacity");
+            }
+            assert_eq!(receive_json(&mut socket).await, expected);
+        }
+    }
+    assert_eq!(
+        request_log_rows(&relay.database_path, 4).await,
+        vec![("upstream_error".to_owned(), "websocket".to_owned(), true); 4]
+    );
+    let options = SqliteConnectOptions::new()
+        .filename(&relay.database_path)
+        .read_only(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let billed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE cost_usd IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(billed, 0);
+    socket.close(None).await.unwrap();
+    let _ = upstream.expect_close(connection.id).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_event_type_must_match_response_status() {
     let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
     let relay = RelayProcess::start(&upstream, RelayOptions::enabled()).await;
@@ -1704,7 +1764,7 @@ async fn validation_errors_are_not_forwarded_and_leave_the_connection_usable() {
             "model",
         ),
         (
-            json!({"type": "response.create", "model": MODEL, "input": [], "stream": true}),
+            json!({"type": "response.create", "model": MODEL, "input": [], "stream": false}),
             "stream",
         ),
         (

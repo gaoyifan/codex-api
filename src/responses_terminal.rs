@@ -1,4 +1,4 @@
-//! Transport-independent validation of terminal Responses event payloads.
+//! Terminal Responses validation and client-facing capacity retry advice.
 
 use serde_json::Value;
 use thiserror::Error;
@@ -58,6 +58,59 @@ impl TerminalEvent {
             TerminalKind::Completed | TerminalKind::Incomplete => None,
         }
         .filter(|error| error.is_object())
+    }
+
+    /// Makes capacity failures actionable by Responses clients without changing accounting.
+    pub(crate) fn retryable_capacity_payload(&self) -> Option<Value> {
+        let error = self.upstream_error()?;
+        if !matches!(
+            error["code"].as_str(),
+            Some("server_is_overloaded" | "slow_down")
+        ) {
+            return None;
+        }
+
+        // Both streamed and wrapped WebSocket failures accept nested retry advice.
+        // Preserve valid upstream advice, including zero seconds and HTTP dates.
+        let retry_after = [&error["headers"], &self.payload["headers"]]
+            .into_iter()
+            .filter_map(Value::as_object)
+            .flat_map(|headers| headers.iter())
+            .find_map(|(name, value)| {
+                if !name.eq_ignore_ascii_case("retry-after") {
+                    return None;
+                }
+                let valid = match value {
+                    Value::String(value) => {
+                        let value = value.trim();
+                        (!value.is_empty()
+                            && value.bytes().all(|byte| byte.is_ascii_digit())
+                            && value.parse::<u64>().is_ok())
+                            || httpdate::parse_http_date(value).is_ok()
+                    }
+                    Value::Number(value) => value.as_u64().is_some(),
+                    _ => false,
+                };
+                valid.then(|| value.clone())
+            })
+            .unwrap_or_else(|| Value::String("30".to_owned()));
+
+        let mut error = error.clone();
+        let mut headers = error["headers"].as_object().cloned().unwrap_or_default();
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("retry-after"));
+        headers.insert("Retry-After".to_owned(), retry_after);
+        error["headers"] = Value::Object(headers);
+
+        let mut payload = self.payload.clone();
+        if self.kind == TerminalKind::Error {
+            // A bare `error` without an HTTP status is otherwise ignored by Codex.
+            payload.as_object_mut()?.remove("error");
+            payload["type"] = Value::String("response.failed".to_owned());
+            payload["response"] = serde_json::json!({"status": "failed", "error": error});
+        } else {
+            payload["response"]["error"] = error;
+        }
+        Some(payload)
     }
 }
 
@@ -275,4 +328,77 @@ fn optional_detail_u64(
         field: token_path,
         expected: "a non-negative integer",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn capacity_retry_advice_preserves_valid_headers_and_replaces_invalid_values() {
+        for (value, expected) in [
+            (json!("7"), json!("7")),
+            (json!(0), json!(0)),
+            (json!("0"), json!("0")),
+            (
+                json!("Wed, 21 Oct 2037 07:28:00 GMT"),
+                json!("Wed, 21 Oct 2037 07:28:00 GMT"),
+            ),
+            (Value::Null, json!("30")),
+            (json!("invalid"), json!("30")),
+            (json!("+1"), json!("30")),
+            (json!(-1), json!("30")),
+        ] {
+            let original = json!({
+                "type": "response.failed",
+                "response": {"id": "resp-failed", "status": "failed", "error": {
+                    "code": "server_is_overloaded", "message": "At capacity.",
+                    "headers": {"retry-after": value, "x-request-id": "upstream-request"}
+                }}
+            });
+            let terminal = parse_terminal_payload(original.clone()).unwrap().unwrap();
+            let mut expected_payload = original.clone();
+            expected_payload["response"]["error"]["headers"] = json!({
+                "Retry-After": expected, "x-request-id": "upstream-request"
+            });
+            assert_eq!(
+                terminal.retryable_capacity_payload(),
+                Some(expected_payload)
+            );
+            assert_eq!(terminal.payload, original);
+        }
+    }
+
+    #[test]
+    fn wrapped_capacity_errors_keep_upstream_advice_and_error_details() {
+        for code in ["server_is_overloaded", "slow_down"] {
+            let error = json!({"code": code, "type": "service_unavailable_error",
+                "message": "At capacity.", "param": null,
+                "headers": {"Retry-After": "invalid"}});
+            let original = json!({"type": "error", "status": 429, "error": error,
+                "headers": {"retry-after": "12"}, "sequence_number": 3});
+            let terminal = parse_terminal_payload(original).unwrap().unwrap();
+            let mut expected_error = error;
+            expected_error["headers"] = json!({"Retry-After": "12"});
+            assert_eq!(
+                terminal.retryable_capacity_payload(),
+                Some(json!({
+                    "type": "response.failed", "status": 429,
+                    "headers": {"retry-after": "12"}, "sequence_number": 3,
+                    "response": {"status": "failed", "error": expected_error}
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_upstream_errors_are_not_rewritten() {
+        let terminal = parse_terminal_payload(json!({"type": "error", "error": {
+            "code": "insufficient_quota", "message": "Quota exhausted."
+        }}))
+        .unwrap()
+        .unwrap();
+        assert_eq!(terminal.retryable_capacity_payload(), None);
+    }
 }

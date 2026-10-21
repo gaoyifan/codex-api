@@ -691,7 +691,19 @@ async fn forward_websocket_responses_stream(
                         return None;
                     }
                 };
-                let bytes = Bytes::from(format!("id: \nevent: {event_name}\ndata: {text}\n\n"));
+                let rewritten = terminal
+                    .as_ref()
+                    .and_then(TerminalEvent::retryable_capacity_payload)
+                    .map(|payload| payload.to_string());
+                let event_name = if rewritten.is_some() {
+                    "response.failed"
+                } else {
+                    &event_name
+                };
+                let downstream_text = rewritten.as_deref().unwrap_or(text.as_str());
+                let bytes = Bytes::from(format!(
+                    "id: \nevent: {event_name}\ndata: {downstream_text}\n\n"
+                ));
                 if let Some(mut terminal) = terminal {
                     // Private Responses can omit the final output array. Keep SSE bytes unchanged;
                     // the session snapshot still needs the completed items to rebuild its context.

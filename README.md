@@ -262,6 +262,7 @@ header, and send text frames such as:
 }
 ```
 
+WebSocket requests may omit `stream` or set it to `true`.
 Only one response may be in flight per connection. Validation and quota errors
 are Responses `error` events and leave the socket usable. Malformed JSON is
 reported the same way without contacting upstream; binary application frames
@@ -270,8 +271,13 @@ close the socket with code 1003.
 Upstream `error` and `response.failed` events retain their error code, type,
 message, and parameter in Chat Completions responses. Non-streaming requests
 return HTTP 502; streams that have already started emit a final `data:` record
-containing the error instead of silently closing. Responses endpoints continue
-to forward the upstream events unchanged.
+containing the error instead of silently closing. Responses endpoints normalize
+upstream `server_is_overloaded` and `slow_down` failures into `response.failed`
+events with nested `error.headers["Retry-After"]` advice. Valid upstream advice is
+preserved; otherwise the delay is 30 seconds. This lets Codex retry capacity
+failures, including bare `error` events without an HTTP status. Error codes and
+messages are preserved; other upstream events are forwarded unchanged. The
+client still controls its retry budget; the relay does not replay requests.
 
 The service also writes terminal failure metadata (event type, error code, type,
 message, and response ID when present) to its standard log. It does not log the

@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use crate::auth::{ClientIdentity, authenticate};
 use crate::config::apply_effective_request;
 use crate::error::{ApiError, websocket_error};
-use crate::responses_terminal::{TerminalKind, parse_terminal_payload};
+use crate::responses_terminal::{TerminalEvent, TerminalKind, parse_terminal_payload};
 use crate::state::AppState;
 use crate::store::{
     Admission, ApiProtocol, BillableUsage, FinalStatus, ModelCandidates, ModelRates,
@@ -341,6 +341,9 @@ impl WsSession {
             Ok(terminal) => terminal,
             Err(_) => return Some(ConnectionEnd::UpstreamFailure),
         };
+        let rewritten = terminal
+            .as_ref()
+            .and_then(TerminalEvent::retryable_capacity_payload);
         if let Some(terminal) = terminal {
             let Some(active) = self.active.take() else {
                 return Some(ConnectionEnd::UpstreamFailure);
@@ -372,7 +375,12 @@ impl WsSession {
             }
         }
         self.downstream
-            .send(DownstreamMessage::Text(text.to_owned().into()))
+            .send(DownstreamMessage::Text(
+                rewritten
+                    .map(|payload| payload.to_string())
+                    .unwrap_or_else(|| text.to_owned())
+                    .into(),
+            ))
             .await
             .err()
             .map(|_| ConnectionEnd::ClientDisconnect(None))
@@ -499,10 +507,13 @@ fn prepare_request(
                 param: "model",
                 message: "The requested model is not configured",
             })?;
-        if object.contains_key("stream") {
+        if object
+            .get("stream")
+            .is_some_and(|stream| stream.as_bool() != Some(true))
+        {
             return Err(ValidationError {
                 param: "stream",
-                message: "stream is not used in WebSocket mode",
+                message: "stream must be true in WebSocket mode",
             });
         }
         if object.contains_key("background") {

@@ -22,6 +22,7 @@ comfy-table = "=7.2.1"
 eventsource-stream = "0.2.3"
 futures-util = { version = "0.3.33", features = ["sink"] }
 http = "1.4.0"
+httpdate = "1.0.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "rustls", "stream"] }
 rust_decimal = "1.40.0"
 secrecy = { version = "0.10.3", features = ["serde"] }

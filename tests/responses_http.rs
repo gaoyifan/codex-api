@@ -321,6 +321,59 @@ async fn http_responses_use_websocket_lite_prewarm_and_return_sse() {
 }
 
 #[tokio::test]
+async fn capacity_errors_are_normalized_with_retry_advice_in_sse() {
+    let mut upstream = Upstream::start().await;
+    let relay = Relay::start(&upstream).await;
+    for code in ["server_is_overloaded", "slow_down"] {
+        for bare in [true, false] {
+            let error = json!({"code": code, "type": "service_unavailable_error",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "param": null});
+            let event = if bare {
+                json!({"type": "error", "error": error})
+            } else {
+                json!({"type": "response.failed", "response": {
+                    "status": "failed", "id": "resp-capacity", "error": error}})
+            };
+            let response = spawn_response(relay.post(None, body(json!([user("retry")]))).send());
+            let mut connection = upstream.accept().await;
+            connection.prewarm().await;
+            connection.request().await;
+            connection.send(event);
+            let response = response.await.unwrap().unwrap();
+            let mut events = Box::pin(
+                iter([Ok::<Bytes, Infallible>(response.bytes().await.unwrap())]).eventsource(),
+            );
+            let event = events.next().await.unwrap().unwrap();
+            assert_eq!(event.event, "response.failed");
+            let mut expected_error = error;
+            expected_error["headers"] = json!({"Retry-After": "30"});
+            let mut expected = json!({"type": "response.failed", "response": {
+                "status": "failed", "error": expected_error}});
+            if !bare {
+                expected["response"]["id"] = json!("resp-capacity");
+            }
+            assert_eq!(
+                serde_json::from_str::<Value>(&event.data).unwrap(),
+                expected
+            );
+            assert!(events.next().await.is_none());
+        }
+    }
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(relay._temp.path().join("state.sqlite3"));
+    let mut database = <sqlx::SqliteConnection as sqlx::Connection>::connect_with(&options)
+        .await
+        .unwrap();
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, cost_usd FROM request_logs ORDER BY id")
+            .fetch_all(&mut database)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![("upstream_error".to_owned(), None); 4]);
+}
+
+#[tokio::test]
 async fn stream_true_is_validated_before_contacting_upstream() {
     let mut upstream = Upstream::start().await;
     let relay = Relay::start(&upstream).await;
