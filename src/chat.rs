@@ -264,8 +264,10 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
         .map(convert_reasoning_effort)
         .transpose()?
         .flatten();
-    if let Some(value) = request.remove("max_completion_tokens") {
-        validate_ignored_completion_limit(value)?;
+    for field in ["max_completion_tokens", "max_tokens"] {
+        if let Some(value) = request.remove(field) {
+            validate_ignored_completion_limit(value, field)?;
+        }
     }
     let text = request
         .remove("response_format")
@@ -460,7 +462,7 @@ fn convert_stream_options(value: Value, stream: bool) -> Result<bool, ChatError>
     Ok(include_usage)
 }
 
-fn validate_ignored_completion_limit(value: Value) -> Result<(), ChatError> {
+fn validate_ignored_completion_limit(value: Value, field: &str) -> Result<(), ChatError> {
     if value.is_null() {
         return Ok(());
     }
@@ -468,8 +470,8 @@ fn validate_ignored_completion_limit(value: Value) -> Result<(), ChatError> {
         return Ok(());
     }
     Err(ChatError::invalid(
-        "max_completion_tokens",
-        "max_completion_tokens must be a positive integer or null",
+        field,
+        format!("{field} must be a positive integer or null"),
     ))
 }
 

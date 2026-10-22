@@ -451,7 +451,7 @@ async fn streams_chat_text_and_terminal_usage() {
     let request = json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": "Hello"}],
-        "max_completion_tokens": 1024,
+        "max_tokens": 1024,
         "stream": true,
         "stream_options": {"include_usage": true}
     });
@@ -482,6 +482,7 @@ async fn streams_chat_text_and_terminal_usage() {
     let sent = upstream.requests().await;
     assert_eq!(sent.len(), 1);
     assert!(sent[0].get("max_completion_tokens").is_none());
+    assert!(sent[0].get("max_tokens").is_none());
     assert!(sent[0].get("stream_options").is_none());
 }
 
@@ -1638,7 +1639,7 @@ async fn rejects_every_unsupported_chat_category_before_accessing_upstream() {
             "allowed tools extension",
             json!({"tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "lookup"}]}}),
         ),
-        ("deprecated max tokens", json!({"max_tokens": 50})),
+        ("invalid max tokens", json!({"max_tokens": 0})),
         (
             "unsupported Responses output token limit",
             json!({"max_output_tokens": 50}),
