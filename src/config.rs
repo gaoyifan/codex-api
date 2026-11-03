@@ -75,6 +75,7 @@ pub(crate) struct UpstreamConfig {
 pub(crate) struct ApiKeyConfig {
     pub(crate) id: String,
     pub(crate) secret: SecretString,
+    pub(crate) max_concurrent_requests: usize,
     pub(crate) weekly_limit_usd: Option<Decimal>,
     /// Present only when `weekly_limit_usd` is set. Defaults to 600.00.
     pub(crate) hard_limit_usd: Option<Decimal>,
@@ -86,6 +87,8 @@ struct ApiKeyConfigInput {
     id: String,
     secret: Option<SecretString>,
     secret_file: Option<PathBuf>,
+    #[serde(default = "default_max_concurrent_requests")]
+    max_concurrent_requests: usize,
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
     weekly_limit_usd: Option<Decimal>,
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
@@ -144,6 +147,7 @@ impl<'de> Deserialize<'de> for ApiKeyConfig {
         Ok(Self {
             id: input.id,
             secret,
+            max_concurrent_requests: input.max_concurrent_requests,
             weekly_limit_usd: input.weekly_limit_usd,
             hard_limit_usd,
         })
@@ -156,6 +160,7 @@ impl fmt::Debug for ApiKeyConfig {
             .debug_struct("ApiKeyConfig")
             .field("id", &self.id)
             .field("secret", &"[REDACTED]")
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("weekly_limit_usd", &self.weekly_limit_usd)
             .field("hard_limit_usd", &self.hard_limit_usd)
             .finish()
@@ -212,6 +217,14 @@ impl Config {
         let mut ids = HashSet::with_capacity(self.api_keys.len());
         let mut secrets = HashSet::with_capacity(self.api_keys.len());
         for api_key in &self.api_keys {
+            if api_key.max_concurrent_requests == 0
+                || api_key.max_concurrent_requests > tokio::sync::Semaphore::MAX_PERMITS
+            {
+                bail!(
+                    "configuration API key max_concurrent_requests must be between 1 and {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                );
+            }
             if api_key.id.is_empty() {
                 bail!("configuration api_keys id must not be empty");
             }
@@ -337,6 +350,10 @@ impl Config {
             },
         })
     }
+}
+
+fn default_max_concurrent_requests() -> usize {
+    3
 }
 
 pub(crate) fn apply_effective_request(body: &mut Value, effective_model: &EffectiveModel) {

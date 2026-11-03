@@ -1166,3 +1166,21 @@ async fn api_key_can_be_loaded_from_a_file_without_embedding_it_in_config() {
     assert!(body.contains("event: response.completed"));
     service.stop();
 }
+
+#[tokio::test]
+async fn invalid_concurrent_request_limits_are_rejected_before_listening() {
+    for value in ["0", "-1", "1.5"] {
+        let fixture = Fixture::new("http://127.0.0.1:9");
+        let base = std::fs::read_to_string(&fixture.config_path).unwrap();
+        fixture.write_config(&base.replacen(
+            "weekly_limit_usd = \"10.00\"",
+            &format!("weekly_limit_usd = \"10.00\"\nmax_concurrent_requests = {value}"),
+            1,
+        ));
+        let output =
+            expect_startup_failure(&["--config", fixture.config_path.to_str().unwrap(), "serve"])
+                .await;
+        assert_error_mentions(&output, "max_concurrent_requests");
+        assert!(StdTcpListener::bind(fixture.listen_address).is_ok());
+    }
+}

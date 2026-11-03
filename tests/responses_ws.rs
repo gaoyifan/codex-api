@@ -450,6 +450,7 @@ async fn fake_oauth_token(
 struct RelayOptions {
     enable_websockets: bool,
     supports_websockets: bool,
+    max_concurrent_requests: Option<usize>,
     weekly_limit_usd: Option<&'static str>,
     hard_limit_usd: Option<&'static str>,
     fallback_model: Option<&'static str>,
@@ -462,6 +463,7 @@ impl RelayOptions {
         Self {
             enable_websockets: true,
             supports_websockets: true,
+            max_concurrent_requests: None,
             weekly_limit_usd: None,
             hard_limit_usd: None,
             fallback_model: None,
@@ -562,6 +564,10 @@ fn write_relay_files(upstream: &FakeUpstream, options: &RelayOptions) -> RelayFi
         .hard_limit_usd
         .map(|limit| format!("hard_limit_usd = \"{limit}\"\n"))
         .unwrap_or_default();
+    let concurrency_limit = options
+        .max_concurrent_requests
+        .map(|limit| format!("max_concurrent_requests = {limit}\n"))
+        .unwrap_or_default();
     let fallback = options
         .fallback_model
         .map(|model| format!("fallback_model = \"{model}\"\n"))
@@ -596,7 +602,7 @@ supports_websockets = {supports_websockets}
 [[api_keys]]
 id = "{api_key_id}"
 secret = "{client_key}"
-{weekly_limit}{hard_limit}
+{weekly_limit}{hard_limit}{concurrency_limit}
 [model_prices."{model}"]
 input_usd_per_million = "1.00"
 cached_input_usd_per_million = "0.10"
@@ -1596,6 +1602,189 @@ async fn terminal_event_type_must_match_response_status() {
     assert_eq!(
         rows,
         vec![("upstream_error".to_string(), "websocket".to_string(), true)]
+    );
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_key_concurrency_queues_websocket_turns_until_terminal_without_counting_idle_sockets() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            max_concurrent_requests: Some(1),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let authorization = format!("Bearer {CLIENT_KEY}");
+    let mut first_socket = connect_downstream(&relay.websocket_url(), Some(&authorization))
+        .await
+        .expect("upgrade first downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let first_connection = upstream.expect_connection().await;
+    let mut second_socket = connect_downstream(&relay.websocket_url(), Some(&authorization))
+        .await
+        .expect("upgrade second downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let second_connection = upstream.expect_connection().await;
+
+    // The first connection is idle, so the second can use the only request slot.
+    send_json(&mut second_socket, &response_create("active", None)).await;
+    let _ = upstream.expect_text(second_connection.id).await;
+    second_connection.send_json(json!({
+        "type": "response.created",
+        "response": {"id": "resp-active", "status": "in_progress"}
+    }));
+    let _ = receive_json(&mut second_socket).await;
+
+    send_json(&mut first_socket, &response_create("queued", None)).await;
+    assert!(
+        timeout(Duration::from_millis(150), upstream.events.recv())
+            .await
+            .is_err(),
+        "the queued create must not reach upstream before the active terminal"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), first_socket.next())
+            .await
+            .is_err(),
+        "an over-limit create must wait instead of returning an error"
+    );
+
+    let terminal = response_completed("resp-active", 1, 0, 1);
+    second_connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut second_socket).await, terminal);
+    let queued = upstream.expect_text(first_connection.id).await;
+    assert_eq!(queued["input"][0]["content"][0]["text"], "queued");
+    let queued_terminal = response_completed("resp-queued", 1, 0, 1);
+    first_connection.send_json(queued_terminal.clone());
+    assert_eq!(receive_json(&mut first_socket).await, queued_terminal);
+
+    // Neither completed-but-open socket reserves a slot for its next turn.
+    send_json(&mut second_socket, &response_create("later turn", None)).await;
+    let _ = upstream.expect_text(second_connection.id).await;
+    let later_terminal = response_completed("resp-later", 1, 0, 1);
+    second_connection.send_json(later_terminal.clone());
+    assert_eq!(receive_json(&mut second_socket).await, later_terminal);
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_and_http_responses_share_the_per_key_concurrency_limit() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            max_concurrent_requests: Some(1),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let mut socket = connect_downstream(
+        &relay.websocket_url(),
+        Some(&format!("Bearer {CLIENT_KEY}")),
+    )
+    .await
+    .expect("upgrade downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let connection = upstream.expect_connection().await;
+    send_json(&mut socket, &response_create("websocket", None)).await;
+    let _ = upstream.expect_text(connection.id).await;
+
+    let http_request = reqwest::Client::new()
+        .post(format!("http://{}/v1/responses", relay.addr))
+        .bearer_auth(CLIENT_KEY)
+        .json(&json!({"model": MODEL, "input": "http", "stream": true}));
+    let http_response = tokio::spawn(async move {
+        http_request
+            .send()
+            .await
+            .expect("send HTTP Responses request")
+            .error_for_status()
+            .expect("HTTP request should wait and succeed")
+            .text()
+            .await
+            .expect("read HTTP response stream")
+    });
+    assert!(
+        timeout(Duration::from_millis(150), upstream.events.recv())
+            .await
+            .is_err(),
+        "the HTTP request must share the slot occupied by the WebSocket turn"
+    );
+    let terminal = response_completed("resp-websocket", 1, 0, 1);
+    connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut socket).await, terminal);
+
+    let _ = upstream.expect_handshake().await;
+    let http_connection = upstream.expect_connection().await;
+    let _ = upstream.expect_text(http_connection.id).await;
+    http_connection.send_json(response_completed("resp-http", 1, 0, 1));
+    let body = timeout(TEST_TIMEOUT, http_response)
+        .await
+        .expect("HTTP request should finish after slot release")
+        .expect("HTTP task should not panic");
+    assert!(body.contains("resp-http"));
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_a_queued_websocket_discards_its_request_before_a_slot_is_available() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            max_concurrent_requests: Some(1),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let authorization = format!("Bearer {CLIENT_KEY}");
+    let mut active_socket = connect_downstream(&relay.websocket_url(), Some(&authorization))
+        .await
+        .expect("upgrade active downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let active_connection = upstream.expect_connection().await;
+    send_json(&mut active_socket, &response_create("active", None)).await;
+    let _ = upstream.expect_text(active_connection.id).await;
+
+    let mut queued_socket = connect_downstream(&relay.websocket_url(), Some(&authorization))
+        .await
+        .expect("upgrade queued downstream WebSocket");
+    let _ = upstream.expect_handshake().await;
+    let queued_connection = upstream.expect_connection().await;
+    send_json(&mut queued_socket, &response_create("must never run", None)).await;
+    assert!(
+        timeout(Duration::from_millis(150), upstream.events.recv())
+            .await
+            .is_err()
+    );
+    queued_socket
+        .close(None)
+        .await
+        .expect("close queued downstream WebSocket");
+    // Closing must be processed even while the other socket holds the only slot.
+    let _ = upstream.expect_close(queued_connection.id).await;
+
+    let terminal = response_completed("resp-active", 1, 0, 1);
+    active_connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut active_socket).await, terminal);
+    send_json(
+        &mut active_socket,
+        &response_create("next active turn", None),
+    )
+    .await;
+    let next = upstream.expect_text(active_connection.id).await;
+    assert_eq!(next["input"][0]["content"][0]["text"], "next active turn");
+    let next_terminal = response_completed("resp-next", 1, 0, 1);
+    active_connection.send_json(next_terminal.clone());
+    assert_eq!(receive_json(&mut active_socket).await, next_terminal);
+    assert!(
+        timeout(Duration::from_millis(100), upstream.events.recv())
+            .await
+            .is_err(),
+        "the canceled queued request must never be forwarded"
     );
     relay.stop().await;
 }

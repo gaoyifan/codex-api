@@ -6,9 +6,11 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame as UpstreamCloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_util::sync::PollSemaphore;
 
 use crate::auth::{ClientIdentity, authenticate};
 use crate::config::apply_effective_request;
@@ -24,6 +26,13 @@ use crate::upstream_ws::{UpstreamWebSocket, connect_upstream_websocket, prepare_
 struct InFlight {
     request_id: RequestId,
     rates: ModelRates,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct WaitingRequest {
+    prepared: PreparedRequest,
+    // Preserve FIFO position while the session handles ping, close, and other frames.
+    permit: PollSemaphore,
 }
 
 struct PreparedRequest {
@@ -73,6 +82,7 @@ pub(crate) async fn responses_websocket(
                 state,
                 identity,
                 active: None,
+                waiting: None,
             }
             .run()
             .await;
@@ -86,9 +96,11 @@ struct WsSession {
     state: Arc<AppState>,
     identity: ClientIdentity,
     active: Option<InFlight>,
+    waiting: Option<WaitingRequest>,
 }
 
 enum ConnectionEvent {
+    Admitted(OwnedSemaphorePermit),
     Shutdown,
     ClientGone,
     Downstream(DownstreamMessage),
@@ -120,9 +132,22 @@ impl WsSession {
                     Some(Ok(message)) => ConnectionEvent::Upstream(message),
                     Some(Err(_)) | None => ConnectionEvent::UpstreamGone,
                 },
+                permit = async {
+                    match self.waiting.as_mut() {
+                        Some(waiting) => waiting.permit.next().await.expect("request semaphores are never closed"),
+                        None => std::future::pending().await,
+                    }
+                } => ConnectionEvent::Admitted(permit),
             };
 
             let end = match event {
+                ConnectionEvent::Admitted(permit) => {
+                    let waiting = self
+                        .waiting
+                        .take()
+                        .expect("admission requires a waiting request");
+                    self.start_request(waiting.prepared, Some(permit)).await
+                }
                 ConnectionEvent::Shutdown => Some(ConnectionEnd::Shutdown),
                 ConnectionEvent::ClientGone => Some(ConnectionEnd::ClientDisconnect(None)),
                 ConnectionEvent::Downstream(message) => self.handle_downstream(message).await,
@@ -177,7 +202,7 @@ impl WsSession {
                     .await;
             }
         };
-        let mut prepared = match prepare_request(value, &self.state, &self.identity) {
+        let prepared = match prepare_request(value, &self.state, &self.identity) {
             Ok(prepared) => prepared,
             Err((value, validation)) => {
                 return self
@@ -193,6 +218,21 @@ impl WsSession {
             }
         };
 
+        if self.active.is_some() || self.waiting.is_some() {
+            return self.start_request(prepared, None).await;
+        }
+        self.waiting = Some(WaitingRequest {
+            prepared,
+            permit: PollSemaphore::new(Arc::clone(&self.state.request_limits[&self.identity.id])),
+        });
+        None
+    }
+
+    async fn start_request(
+        &mut self,
+        mut prepared: PreparedRequest,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Option<ConnectionEnd> {
         let admission = match self
             .state
             .store
@@ -218,7 +258,7 @@ impl WsSession {
             }
         };
 
-        if self.active.is_some() {
+        if self.active.is_some() || self.waiting.is_some() {
             if self
                 .state
                 .store
@@ -285,6 +325,7 @@ impl WsSession {
         self.active = Some(InFlight {
             request_id,
             rates: effective_model.rates,
+            _permit: permit.expect("a new response requires a concurrency permit"),
         });
         None
     }

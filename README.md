@@ -145,6 +145,13 @@ See [config.example.toml](config.example.toml). Important rules:
 
 - API key IDs and resolved secrets must be non-empty and unique. Set exactly
   one of `secret` or `secret_file` for each key.
+- Each key's `max_concurrent_requests` is a positive integer, defaulting to `3`.
+  Responses, Chat Completions, and image generation/edit requests share this
+  limit across HTTP and WebSocket connections. Extra requests wait in arrival
+  order; other keys have independent limits. Streaming requests hold their slot
+  until completion or cancellation; idle WebSocket connections hold no slots.
+  Model discovery requests do not use generation slots. Queued text requests enter
+  the request ledger only after obtaining a slot, and quota is checked then.
 - Decimal prices and limits must be quoted strings and non-negative.
 - `model_prices` supplies deterministic billing rates and bounds the text models
   this relay may expose or forward. The models API additionally requires the

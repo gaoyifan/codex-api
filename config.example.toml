@@ -21,6 +21,9 @@ supports_websockets = true
 [[api_keys]]
 id = "client-a"
 secret = "sk-local-change-me"
+# Optional. Maximum active generation requests for this key; defaults to 3.
+# Additional requests wait in arrival order until a slot becomes available.
+max_concurrent_requests = 3
 weekly_limit_usd = "10.00"
 # Optional hard stop for limited keys. Defaults to "600.00".
 # hard_limit_usd = "600.00"

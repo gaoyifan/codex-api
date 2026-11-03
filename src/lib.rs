@@ -94,6 +94,16 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
     let pending_requests = TaskTracker::new();
     let websocket_tasks = TaskTracker::new();
     let state = Arc::new(state::AppState {
+        request_limits: config
+            .api_keys
+            .iter()
+            .map(|key| {
+                (
+                    key.id.clone(),
+                    Arc::new(tokio::sync::Semaphore::new(key.max_concurrent_requests)),
+                )
+            })
+            .collect(),
         config: Arc::clone(&config),
         store,
         credentials: Arc::clone(&credentials),

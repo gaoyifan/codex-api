@@ -26,7 +26,7 @@ use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
     process::{Child, Command},
-    sync::Mutex,
+    sync::{Mutex, mpsc},
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
@@ -41,6 +41,7 @@ struct SseChunk {
 
 enum UpstreamReply {
     Sse(Vec<SseChunk>),
+    ControlledSse(mpsc::UnboundedReceiver<Value>),
     Json(StatusCode, Value),
 }
 
@@ -140,6 +141,18 @@ async fn upstream_handler(
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(value.to_string()))
             .unwrap(),
+        UpstreamReply::ControlledSse(mut events) => {
+            let stream = async_stream::stream! {
+                while let Some(event) = events.recv().await {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(sse_event(&event)));
+                }
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
         UpstreamReply::Sse(chunks) => {
             let stream = async_stream::stream! {
                 for chunk in chunks {
@@ -168,6 +181,10 @@ struct TestRelay {
 
 impl TestRelay {
     async fn start(upstream: &ScriptedUpstream) -> Self {
+        Self::start_with_key_config(upstream, "").await
+    }
+
+    async fn start_with_key_config(upstream: &ScriptedUpstream, key_config: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let listen = unused_addr();
         let auth_path = directory.path().join("auth.json");
@@ -209,6 +226,7 @@ supports_websockets = false
 [[api_keys]]
 id = "chat-client"
 secret = "{API_KEY}"
+{key_config}
 
 [model_prices."{MODEL}"]
 input_usd_per_million = "1.00"
@@ -1709,4 +1727,165 @@ async fn rejects_every_unsupported_chat_category_before_accessing_upstream() {
             "{name} reached the upstream server"
         );
     }
+}
+
+#[tokio::test]
+async fn per_key_concurrency_limits_hold_streaming_slots_until_terminal_and_isolate_users() {
+    for configured_limit in [None, Some(1)] {
+        let limit = configured_limit.unwrap_or(3);
+        let mut replies = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..limit {
+            let (release, events) = mpsc::unbounded_channel();
+            release
+                .send(json!({
+                    "type": "response.created",
+                    "response": {"id": "resp_active", "created_at": 1_753_000_123, "model": MODEL}
+                }))
+                .unwrap();
+            releases.push(release);
+            replies.push(UpstreamReply::ControlledSse(events));
+        }
+        // A different API key must reach the upstream while the first is full.
+        replies.push(UpstreamReply::events(vec![completed_event(
+            "resp_other_user",
+            text_output("other user"),
+        )]));
+        replies.push(UpstreamReply::events(vec![completed_event(
+            "resp_queued",
+            text_output("queued"),
+        )]));
+        let upstream = ScriptedUpstream::start(replies).await;
+        let key_config = format!(
+            "{}\n[[api_keys]]\nid = \"other-client\"\nsecret = \"sk-other-client\"",
+            configured_limit
+                .map(|n| format!("max_concurrent_requests = {n}"))
+                .unwrap_or_default()
+        );
+        let relay = TestRelay::start_with_key_config(&upstream, &key_config).await;
+        let mut request = minimal_request();
+        request["stream"] = json!(true);
+        let mut active = Vec::new();
+        for _ in 0..limit {
+            let response = relay.post(&request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            active.push(response);
+        }
+        assert_eq!(upstream.request_count(), limit);
+
+        let queued_request = relay.request(&minimal_request()).send();
+        tokio::pin!(queued_request);
+        assert!(
+            timeout(Duration::from_millis(150), &mut queued_request)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            upstream.request_count(),
+            limit,
+            "over-limit request reached upstream"
+        );
+
+        let response = relay
+            .client
+            .post(format!("{}/v1/chat/completions", relay.base_url))
+            .bearer_auth("sk-other-client")
+            .json(&minimal_request())
+            .send()
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "other user");
+
+        releases[0]
+            .send(completed_event("resp_release", text_output("finished")))
+            .unwrap();
+        let response = timeout(Duration::from_secs(2), &mut queued_request)
+            .await
+            .expect("queued request did not resume after terminal")
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "queued");
+        assert_eq!(upstream.request_count(), limit + 2);
+    }
+}
+
+#[tokio::test]
+async fn canceling_a_stream_releases_the_slot_for_a_waiting_request() {
+    let (release, events) = mpsc::unbounded_channel();
+    release
+        .send(json!({
+            "type": "response.created",
+                    "response": {"id": "resp_active", "created_at": 1_753_000_123, "model": MODEL}
+        }))
+        .unwrap();
+    let upstream = ScriptedUpstream::start(vec![
+        UpstreamReply::ControlledSse(events),
+        UpstreamReply::events(vec![completed_event(
+            "resp_after_cancel",
+            text_output("resumed"),
+        )]),
+    ])
+    .await;
+    let relay = TestRelay::start_with_key_config(&upstream, "max_concurrent_requests = 1").await;
+    let mut request = minimal_request();
+    request["stream"] = json!(true);
+    let active = relay.post(&request).await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let queued = relay.request(&minimal_request()).send();
+    tokio::pin!(queued);
+    assert!(
+        timeout(Duration::from_millis(150), &mut queued)
+            .await
+            .is_err()
+    );
+    assert_eq!(upstream.request_count(), 1);
+    drop(active);
+    let response = timeout(Duration::from_secs(2), &mut queued)
+        .await
+        .expect("queued request did not resume after cancellation")
+        .unwrap();
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "resumed");
+    assert_eq!(upstream.request_count(), 2);
+}
+
+#[tokio::test]
+async fn canceling_a_queued_http_request_does_not_forward_it_after_a_slot_opens() {
+    let (release, events) = mpsc::unbounded_channel();
+    release
+        .send(json!({
+            "type": "response.created",
+            "response": {"id": "resp_active", "created_at": 1_753_000_123, "model": MODEL}
+        }))
+        .unwrap();
+    let upstream = ScriptedUpstream::start(vec![
+        UpstreamReply::ControlledSse(events),
+        UpstreamReply::events(vec![completed_event("resp_next", text_output("next"))]),
+    ])
+    .await;
+    let relay = TestRelay::start_with_key_config(&upstream, "max_concurrent_requests = 1").await;
+    let mut request = minimal_request();
+    request["stream"] = json!(true);
+    let active = relay.post(&request).await;
+    let mut queued = tokio::spawn(relay.request(&minimal_request()).send());
+    assert!(
+        timeout(Duration::from_millis(150), &mut queued)
+            .await
+            .is_err()
+    );
+    assert_eq!(upstream.request_count(), 1);
+    queued.abort();
+    let _ = queued.await;
+    release
+        .send(completed_event("resp_active", text_output("finished")))
+        .unwrap();
+    assert!(active.text().await.unwrap().contains("[DONE]"));
+    let (status, body) = response_json(relay.post(&minimal_request()).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "next");
+    assert_eq!(upstream.request_count(), 2);
 }

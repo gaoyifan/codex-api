@@ -690,6 +690,8 @@ supports_websockets = false
 [[api_keys]]
 id = "test-client"
 secret = "{CLIENT_KEY}"
+# Exercise OAuth single-flight with all 12 callers admitted together.
+max_concurrent_requests = 12
 
 [model_prices."{MODEL}"]
 input_usd_per_million = "1.00"
@@ -1149,7 +1151,8 @@ async fn concurrent_same_generation_callers_share_one_oauth_failure() {
     let now = OffsetDateTime::now_utc();
     fake.fail_oauth_with_delay(
         StatusCode::INTERNAL_SERVER_ERROR,
-        StdDuration::from_millis(100),
+        // Let all callers finish ledger admission before publishing the failure.
+        StdDuration::from_millis(500),
     );
     let fixture = RelayFixture::new(
         &fake,

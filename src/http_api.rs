@@ -173,6 +173,7 @@ pub(crate) async fn responses(
             return Err(error);
         }
     };
+    let permit = state.acquire_request_slot(&identity).await?;
     let (request_id, effective_model) = admit_request(
         &state,
         &identity,
@@ -187,6 +188,7 @@ pub(crate) async fn responses(
         Arc::clone(&state.store),
         request_id,
         state.pending_requests.token(),
+        permit,
     );
 
     let upstream_model = state
@@ -246,9 +248,10 @@ async fn images(
     body: Bytes,
     operation: &str,
 ) -> Result<Response, ApiError> {
-    authenticate(&headers, &state.config)?;
+    let identity = authenticate(&headers, &state.config)?;
     let parsed: Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::invalid("request", "request body must be valid JSON"))?;
+    let permit = state.acquire_request_slot(&identity).await?;
     let upstream = tokio::select! {
         biased;
         _ = state.shutdown.cancelled() => return Err(ApiError::shutdown()),
@@ -265,6 +268,9 @@ async fn images(
     let body = upstream
         .bytes_stream()
         .take_until(state.shutdown.clone().cancelled_owned());
+    let body = stream::unfold((Box::pin(body), permit), |(mut body, permit)| async move {
+        body.next().await.map(|chunk| (chunk, (body, permit)))
+    });
     Ok(response
         .body(Body::from_stream(body))
         .expect("upstream response headers are valid"))
@@ -327,6 +333,7 @@ pub(crate) async fn chat_completions(
         .config
         .model_candidates(&converted.model, converted.reasoning_effort.as_deref())
         .expect("model was admitted above");
+    let permit = state.acquire_request_slot(&identity).await?;
     let (request_id, effective_model) = admit_request(
         &state,
         &identity,
@@ -341,6 +348,7 @@ pub(crate) async fn chat_completions(
         Arc::clone(&state.store),
         request_id,
         state.pending_requests.token(),
+        permit,
     );
 
     let upstream =
