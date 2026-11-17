@@ -6,6 +6,7 @@ use anyhow::{Context, anyhow};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use rust_decimal::Decimal;
+use secrecy::ExposeSecret;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use time::{
@@ -38,6 +39,8 @@ enum Command {
     Logs(LogsArgs),
     /// Show usage statistics for every configured API key.
     Stat(StatArgs),
+    /// Show the Codex account's live quota usage (requires the running relay).
+    Usage,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -96,7 +99,98 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         Command::Serve => crate::run(&args.config).await,
         Command::Logs(logs) => print_logs(&args.config, logs).await,
         Command::Stat(stat) => print_stat(&args.config, stat).await,
+        Command::Usage => print_usage(&args.config).await,
     }
+}
+
+async fn print_usage(config_path: &Path) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let mut address = config.server.listen;
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()?
+        .get(format!("http://{address}/v1/usage"))
+        .bearer_auth(config.api_keys[0].secret.expose_secret())
+        .send()
+        .await
+        .context("failed to query the local relay; start codex-api serve first")?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("relay usage request failed (HTTP {status})"));
+    }
+    let usage: crate::usage::AccountUsage = response
+        .json()
+        .await
+        .context("relay returned an invalid usage response")?;
+    println!("Codex account usage — plan: {}", usage.plan_type);
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(["LIMIT", "WINDOW", "USED", "RESETS LOCAL", "STATUS"]);
+    let limits = std::iter::once(("Codex", usage.rate_limit.as_ref())).chain(
+        usage
+            .additional_rate_limits
+            .iter()
+            .flatten()
+            .map(|limit| (limit.limit_name.as_str(), limit.rate_limit.as_ref())),
+    );
+    for (name, limit) in limits {
+        let Some(limit) = limit else {
+            table.add_row([name, "—", "—", "—", "unavailable"]);
+            continue;
+        };
+        let status = if limit.limit_reached {
+            "limit reached"
+        } else if limit.allowed {
+            "available"
+        } else {
+            "blocked"
+        };
+        let windows = [
+            limit.primary_window.as_ref(),
+            limit.secondary_window.as_ref(),
+        ];
+        if windows.iter().all(Option::is_none) {
+            table.add_row([name, "—", "—", "—", status]);
+        }
+        for window in windows.into_iter().flatten() {
+            let seconds = window.limit_window_seconds;
+            let duration = if seconds % 86400 == 0 {
+                format!("{}d", seconds / 86400)
+            } else if seconds % 3600 == 0 {
+                format!("{}h", seconds / 3600)
+            } else {
+                format!("{}s", seconds)
+            };
+            let reset = OffsetDateTime::from_unix_timestamp(window.reset_at)?;
+            table.add_row([
+                name.to_owned(),
+                duration,
+                format!("{:.1}%", window.used_percent),
+                format_local_timestamp(reset)?,
+                status.to_owned(),
+            ]);
+        }
+    }
+    println!("{table}");
+    if let Some(credits) = usage.credits {
+        let balance = if credits.unlimited {
+            "unlimited".to_owned()
+        } else {
+            credits.balance.unwrap_or_else(|| "—".to_owned())
+        };
+        println!("Credits: {balance} (has credits: {})", credits.has_credits);
+    }
+    Ok(())
 }
 
 async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
@@ -160,7 +254,9 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
         ]);
     for row in rows {
         let requested_at = row.try_get::<String, _>("requested_at")?;
-        let requested_at = format_local_timestamp(&requested_at)?;
+        let requested_at = OffsetDateTime::parse(&requested_at, &Rfc3339)
+            .context("request_logs contains an invalid requested_at value")?;
+        let requested_at = format_local_timestamp(requested_at)?;
         let model = row.try_get::<String, _>("model")?;
         let reasoning = row.try_get::<Option<String>, _>("reasoning_effort")?;
         let model = match reasoning {
@@ -200,15 +296,13 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn format_local_timestamp(value: &str) -> anyhow::Result<String> {
-    let timestamp = OffsetDateTime::parse(value, &Rfc3339)
-        .context("request_logs contains an invalid requested_at value")?;
+fn format_local_timestamp(timestamp: OffsetDateTime) -> anyhow::Result<String> {
     let offset = UtcOffset::local_offset_at(timestamp)
         .context("failed to determine the local UTC offset")?;
     timestamp
         .to_offset(offset)
         .format(&Rfc3339)
-        .context("failed to format the local request time")
+        .context("failed to format the local timestamp")
 }
 
 async fn open_read_only(path: &Path) -> anyhow::Result<SqlitePool> {

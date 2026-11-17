@@ -25,6 +25,7 @@ mod store;
 mod upstream_headers;
 mod upstream_http;
 mod upstream_ws;
+mod usage;
 mod ws;
 
 /// Time boundary used by quota windows, token refresh, and request timing.
@@ -131,6 +132,7 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
             post(http_api::image_edits).layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/models", get(http_api::models))
+        .route("/v1/usage", get(http_api::usage))
         .route("/v1/models/{model}", get(http_api::model))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.server.listen)

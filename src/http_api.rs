@@ -34,6 +34,20 @@ use crate::{
     },
 };
 
+pub(crate) async fn usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<crate::usage::AccountUsage>, ApiError> {
+    authenticate(&headers, &state.config)?;
+    tokio::select! {
+        biased;
+        _ = state.shutdown.cancelled() => Err(ApiError::shutdown()),
+        result = state.upstream_http.usage() => {
+            result.map(Json).map_err(|_| ApiError::gateway("Upstream usage request failed"))
+        }
+    }
+}
+
 pub(crate) async fn models(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

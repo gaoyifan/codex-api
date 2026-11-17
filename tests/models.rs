@@ -95,6 +95,8 @@ impl FakeUpstream {
         };
         let app = Router::new()
             .route("/models", get(upstream_handler))
+            .route("/wham/usage", get(upstream_handler))
+            .route("/backend-api/wham/usage", get(upstream_handler))
             .route("/images/generations", post(upstream_handler))
             .route("/images/edits", post(upstream_handler))
             .route("/oauth/token", post(upstream_oauth))
@@ -358,6 +360,151 @@ fn client() -> reqwest::Client {
         .timeout(TEST_TIMEOUT)
         .build()
         .expect("build test client")
+}
+
+fn account_usage() -> Value {
+    json!({
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+                "used_percent": 23, "limit_window_seconds": 18000, "reset_at": 1786365296
+            },
+            "secondary_window": {
+                "used_percent": 67, "limit_window_seconds": 604800, "reset_at": 1786883696
+            }
+        },
+        "credits": {"has_credits": true, "unlimited": false, "balance": "12.50"},
+        "additional_rate_limits": [{
+            "limit_name": "Spark", "metered_feature": "spark",
+            "rate_limit": {"allowed": false, "limit_reached": true}
+        }],
+        "user_id": "private-user-id"
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_cli_queries_live_account_limits_through_the_authenticated_relay() {
+    let upstream = FakeUpstream::start(vec![ModelsReply::Json(account_usage())]).await;
+    let fixture = Fixture::new(&upstream);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    // Account limits remain inspectable even when the proxy key has exhausted its quota.
+    record_spend(&fixture.database_path, 3_000_000_000).await;
+    let unauthorized = get_models(&relay, "/v1/usage", "wrong-key").await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert!(upstream.requests().await.is_empty());
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_codex-api"))
+        .arg("--config")
+        .arg(&fixture.config_path)
+        .arg("usage")
+        .env("TZ", "SGT-8")
+        .output()
+        .await
+        .expect("run usage CLI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 usage output");
+    for expected in [
+        "pro",
+        "5h",
+        "7d",
+        "23.0%",
+        "67.0%",
+        "+08:00",
+        "12.50",
+        "Spark",
+        "limit reached",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+    for secret in [API_KEY, ACCESS_TOKEN, ACCOUNT_ID, "private-user-id"] {
+        assert!(!stdout.contains(secret), "usage disclosed {secret}");
+    }
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0.path(), "/wham/usage");
+    assert_eq!(
+        requests[0].1["authorization"],
+        format!("Bearer {ACCESS_TOKEN}")
+    );
+    assert_eq!(requests[0].1["chatgpt-account-id"], ACCOUNT_ID);
+    let mut db = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new().filename(&fixture.database_path),
+    )
+    .await
+    .expect("open state");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM request_ledger")
+        .fetch_one(&mut db)
+        .await
+        .expect("count ledger rows");
+    assert_eq!(count, 1, "usage must not create accounting entries");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_refreshes_credentials_and_fetches_each_snapshot_without_caching() {
+    let upstream = FakeUpstream::start(vec![
+        ModelsReply::Status(StatusCode::UNAUTHORIZED),
+        ModelsReply::Json(account_usage()),
+        ModelsReply::Json(json!({"plan_type": "free", "rate_limit": null})),
+    ])
+    .await;
+    let fixture = Fixture::new(&upstream);
+    let config = std::fs::read_to_string(&fixture.config_path).expect("read config");
+    std::fs::write(
+        &fixture.config_path,
+        config.replace(
+            &format!("base_url = \"{}\"", upstream.base_url()),
+            &format!("base_url = \"{}/backend-api/codex/\"", upstream.base_url()),
+        ),
+    )
+    .expect("set Codex upstream base path");
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    let first = get_models(&relay, "/v1/usage", API_KEY).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let body: Value = first.json().await.expect("usage JSON");
+    assert_eq!(body["plan_type"], "pro");
+    assert!(body.get("user_id").is_none());
+    assert_eq!(upstream.oauth_requests().await, 1);
+    let requests = upstream.requests().await;
+    assert_eq!(requests[0].0.path(), "/backend-api/wham/usage");
+    assert_eq!(
+        requests[1].1["authorization"],
+        format!("Bearer {ROTATED_ACCESS_TOKEN}")
+    );
+    let second: Value = get_models(&relay, "/v1/usage", API_KEY)
+        .await
+        .json()
+        .await
+        .expect("second snapshot");
+    assert_eq!(second["plan_type"], "free");
+    assert!(second["rate_limit"].is_null());
+    assert_eq!(upstream.requests().await.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_reports_upstream_failures_without_disclosing_response_bodies() {
+    let upstream = FakeUpstream::start(vec![
+        ModelsReply::Status(StatusCode::INTERNAL_SERVER_ERROR),
+        ModelsReply::Raw("private-upstream-error"),
+        ModelsReply::Json(json!({"unexpected": "payload"})),
+        ModelsReply::Status(StatusCode::UNAUTHORIZED),
+        ModelsReply::Status(StatusCode::UNAUTHORIZED),
+    ])
+    .await;
+    let fixture = Fixture::new(&upstream);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    for _ in 0..4 {
+        let response = get_models(&relay, "/v1/usage", API_KEY).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: Value = response.json().await.expect("error JSON");
+        assert_eq!(body["error"]["message"], "Upstream usage request failed");
+    }
+    assert_eq!(upstream.oauth_requests().await, 1);
 }
 
 async fn get_models(relay: &Relay, path: &str, api_key: &str) -> reqwest::Response {

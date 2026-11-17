@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use http::HeaderMap;
-use http::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
-use reqwest::{Response, StatusCode, header::HeaderValue};
+use http::header::{ACCEPT, USER_AGENT};
+use reqwest::{Response, StatusCode};
 use secrecy::ExposeSecret;
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
@@ -22,6 +22,7 @@ pub(crate) struct UpstreamHttpClient {
     responses_url: Url,
     images_url: Url,
     models_url: Url,
+    usage_url: Url,
     credentials: Arc<CredentialManager>,
     clock: Arc<dyn Clock>,
     models_cache: Mutex<Option<CachedModels>>,
@@ -55,11 +56,17 @@ impl UpstreamHttpClient {
         models_url
             .query_pairs_mut()
             .append_pair("client_version", CODEX_VERSION);
+        let mut usage_url = base_url.clone();
+        let backend_path = base_path.strip_suffix("/codex").unwrap_or(base_path);
+        usage_url.set_path(&format!("{backend_path}/wham/usage"));
+        usage_url.set_query(None);
+        usage_url.set_fragment(None);
         Self {
             client,
             responses_url,
             images_url,
             models_url,
+            usage_url,
             credentials,
             clock,
             models_cache: Mutex::new(None),
@@ -76,24 +83,9 @@ impl UpstreamHttpClient {
             return Ok(cached.models.clone());
         }
 
-        let credential = self
-            .credentials
-            .credentials()
-            .await
-            .map_err(UpstreamHttpError::Credentials)?;
-        let mut response = self.send_models_once(&credential).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            let credential = self
-                .credentials
-                .refresh_after_unauthorized(credential.generation)
-                .await
-                .map_err(UpstreamHttpError::CredentialRefresh)?;
-            response = self.send_models_once(&credential).await?;
-            if response.status() == StatusCode::UNAUTHORIZED {
-                return Err(UpstreamHttpError::AuthenticationRejected);
-            }
-        }
-        let payload: Value = response
+        let payload: Value = self
+            .get_authenticated(&self.models_url)
+            .await?
             .error_for_status()
             .map_err(UpstreamHttpError::Transport)?
             .json()
@@ -119,6 +111,37 @@ impl UpstreamHttpClient {
             models: models.clone(),
         });
         Ok(models)
+    }
+
+    pub(crate) async fn usage(&self) -> Result<crate::usage::AccountUsage, UpstreamHttpError> {
+        self.get_authenticated(&self.usage_url)
+            .await?
+            .error_for_status()
+            .map_err(UpstreamHttpError::Transport)?
+            .json()
+            .await
+            .map_err(UpstreamHttpError::Transport)
+    }
+
+    async fn get_authenticated(&self, url: &Url) -> Result<Response, UpstreamHttpError> {
+        let credential = self
+            .credentials
+            .credentials()
+            .await
+            .map_err(UpstreamHttpError::Credentials)?;
+        let mut response = self.send_get_once(url, &credential).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            let credential = self
+                .credentials
+                .refresh_after_unauthorized(credential.generation)
+                .await
+                .map_err(UpstreamHttpError::CredentialRefresh)?;
+            response = self.send_get_once(url, &credential).await?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return Err(UpstreamHttpError::AuthenticationRejected);
+            }
+        }
+        Ok(response)
     }
 
     pub(crate) async fn model(&self, slug: &str) -> Result<Option<Value>, UpstreamHttpError> {
@@ -197,15 +220,9 @@ impl UpstreamHttpClient {
         downstream_headers: &HeaderMap,
         credential: &CredentialSnapshot,
     ) -> Result<Response, UpstreamHttpError> {
-        let mut authorization = HeaderValue::from_str(&format!(
-            "Bearer {}",
-            credential.access_token.expose_secret()
-        ))
-        .map_err(|_| UpstreamHttpError::InvalidCredentialHeader)?;
-        authorization.set_sensitive(true);
         self.client
             .post(url.clone())
-            .header(AUTHORIZATION, authorization)
+            .bearer_auth(credential.access_token.expose_secret())
             .header("ChatGPT-Account-ID", &credential.account_id)
             .header("originator", CODEX_ORIGINATOR)
             .header("version", CODEX_VERSION)
@@ -218,19 +235,14 @@ impl UpstreamHttpClient {
             .map_err(UpstreamHttpError::Transport)
     }
 
-    async fn send_models_once(
+    async fn send_get_once(
         &self,
+        url: &Url,
         credential: &CredentialSnapshot,
     ) -> Result<Response, UpstreamHttpError> {
-        let mut authorization = HeaderValue::from_str(&format!(
-            "Bearer {}",
-            credential.access_token.expose_secret()
-        ))
-        .map_err(|_| UpstreamHttpError::InvalidCredentialHeader)?;
-        authorization.set_sensitive(true);
         self.client
-            .get(self.models_url.clone())
-            .header(AUTHORIZATION, authorization)
+            .get(url.clone())
+            .bearer_auth(credential.access_token.expose_secret())
             .header("ChatGPT-Account-ID", &credential.account_id)
             .header("originator", CODEX_ORIGINATOR)
             .header("version", CODEX_VERSION)
@@ -250,8 +262,6 @@ pub(crate) enum UpstreamHttpError {
     CredentialRefresh(#[source] CredentialError),
     #[error("upstream authentication was rejected")]
     AuthenticationRejected,
-    #[error("upstream credential cannot be represented as an HTTP header")]
-    InvalidCredentialHeader,
     #[error("upstream HTTP request failed")]
     Transport(#[source] reqwest::Error),
     #[error("upstream models response had an invalid shape")]

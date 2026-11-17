@@ -23,6 +23,9 @@ management UI, multi-account scheduling, or transport fallbacks.
 - `GET /v1/models` and `GET /v1/models/{model}` expose the currently usable
   Codex models in OpenAI-compatible shapes. Codex metadata such as
   `context_window` is retained on each model object.
+- `GET /v1/usage` returns the Codex account's live plan, quota windows, and
+  credits. Any configured API key can query it, including keys whose proxy
+  quota is exhausted. It does not create request accounting entries.
 - `POST /v1/images/generations` and `POST /v1/images/edits` forward native
   Codex image JSON requests, including inline images for edits. After the usual
   OAuth refresh handling, they preserve the upstream status, body, content type,
@@ -124,7 +127,22 @@ export CODEX_API_CONFIG="$PWD/config.toml"
 codex-api serve
 codex-api logs
 codex-api stat [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD]
+codex-api usage
 ```
+
+`usage` contacts the running relay at `server.listen` (using loopback for
+wildcard listen addresses) and authenticates with the first configured API key.
+It shows account quota usage percentages, window durations, reset times in the
+local timezone, additional limits, and credits when supplied by upstream.
+Unlike `stat`, which reports proxy API-key spending from SQLite, `usage` fetches
+a fresh account snapshot on each call. OAuth refresh stays in the service so
+the CLI does not compete for rotating refresh tokens. Start or upgrade the
+relay before using this command.
+
+The upstream usage URL is derived from `upstream.base_url`: a trailing `/codex`
+is removed and `/wham/usage` is appended (by default,
+`https://chatgpt.com/backend-api/wham/usage`). Custom upstreams must serve that
+endpoint too.
 
 `SIGINT` and `SIGTERM` stop new connections and cancel Responses, Chat, Images,
 and WebSocket operations that are still awaiting an upstream outcome. Text
