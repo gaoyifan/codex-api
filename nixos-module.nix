@@ -41,11 +41,29 @@ in
 
   config = lib.mkIf cfg.enable {
     # Standard short-context prices: https://developers.openai.com/api/docs/pricing
+    # GPT-6.2 Astra: https://developers.openai.com/api/docs/models/gpt-6.2-astra
+    # GPT-6.2 Sol: https://developers.openai.com/api/docs/models/gpt-6.2-sol
+    # GPT-6.1 Terra: https://developers.openai.com/api/docs/models/gpt-6.1-terra
     # GPT-6.1 Sol: https://developers.openai.com/api/docs/models/gpt-6.1-sol
     # GPT-6 Sol and Luna: https://developers.openai.com/api/docs/models/gpt-6-sol
     # https://developers.openai.com/api/docs/models/gpt-6-luna
     services.codex-api.settings.fallback_model = lib.mkDefault "gpt-5.6-luna";
     services.codex-api.settings.model_prices = {
+      "gpt-6.2-astra" = {
+        input_usd_per_million = lib.mkDefault "8.00";
+        cached_input_usd_per_million = lib.mkDefault "0.40";
+        output_usd_per_million = lib.mkDefault "40.00";
+      };
+      "gpt-6.2-sol" = {
+        input_usd_per_million = lib.mkDefault "2.00";
+        cached_input_usd_per_million = lib.mkDefault "0.10";
+        output_usd_per_million = lib.mkDefault "10.00";
+      };
+      "gpt-6.1-terra" = {
+        input_usd_per_million = lib.mkDefault "1.00";
+        cached_input_usd_per_million = lib.mkDefault "0.05";
+        output_usd_per_million = lib.mkDefault "5.00";
+      };
       "gpt-6.1-sol" = {
         input_usd_per_million = lib.mkDefault "2.00";
         cached_input_usd_per_million = lib.mkDefault "0.10";
