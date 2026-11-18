@@ -22,11 +22,11 @@ use request::PendingRequest;
 
 use crate::{
     auth::{ClientIdentity, authenticate},
-    chat::{self, ChatErrorKind, TerminalStatus},
+    chat,
     config::apply_effective_request,
     error::ApiError,
     responses_terminal::{TerminalEvent, TerminalKind, Usage, parse_terminal_payload},
-    sse::{SseRead, SseReader},
+    sse::{SseEvent, SseReader},
     state::AppState,
     store::{
         Admission, ApiProtocol, BillableUsage, EffectiveModel, FinalStatus, ModelAccess,
@@ -102,7 +102,9 @@ async fn available_models(
     Ok(upstream_models
         .into_iter()
         .filter_map(|model| {
-            let mut object = model.as_object()?.clone();
+            let Value::Object(mut object) = model else {
+                return None;
+            };
             let slug = object.get("slug")?.as_str()?.to_owned();
             if object.get("visibility").and_then(Value::as_str) != Some("list")
                 || !state.config.model_prices.contains_key(&slug)
@@ -141,40 +143,17 @@ pub(crate) async fn responses(
         .pointer("/reasoning/effort")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let candidates = match state
-        .config
-        .model_candidates(&model, reasoning_effort.as_deref())
-    {
-        Some(candidates) => candidates,
-        None => {
-            reject_request(
-                &state,
-                &identity,
-                &model,
-                reasoning_effort,
-                ApiProtocol::Responses,
-            )
-            .await?;
-            return Err(ApiError::invalid("model", "model is not configured"));
-        }
-    };
-
-    let mut upstream_body = match normalize_responses_request(parsed) {
-        Ok(body) => body,
-        Err(error) => {
-            reject_request(
-                &state,
-                &identity,
-                &model,
-                reasoning_effort,
-                ApiProtocol::Responses,
-            )
-            .await?;
-            return Err(error);
-        }
-    };
-    let key = match responses_session::SessionKey::from_headers(&identity.id, &headers) {
-        Ok(key) => key,
+    let validated = (|| {
+        let candidates = state
+            .config
+            .model_candidates(&model, reasoning_effort.as_deref())
+            .ok_or_else(|| ApiError::invalid("model", "model is not configured"))?;
+        let body = normalize_responses_request(parsed)?;
+        let key = responses_session::SessionKey::from_headers(&identity.id, &headers)?;
+        Ok((candidates, body, key))
+    })();
+    let (candidates, mut upstream_body, key) = match validated {
+        Ok(validated) => validated,
         Err(error) => {
             reject_request(
                 &state,
@@ -311,23 +290,21 @@ pub(crate) async fn chat_completions(
         .get("reasoning_effort")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if state
-        .config
-        .model_candidates(&tentative_model, tentative_reasoning_effort.as_deref())
-        .is_none()
-    {
-        reject_request(
-            &state,
-            &identity,
-            &tentative_model,
-            tentative_reasoning_effort.clone(),
-            ApiProtocol::ChatCompletions,
-        )
-        .await?;
-        return Err(ApiError::invalid("model", "model is not configured"));
-    }
-    let mut converted = match chat::convert_request(parsed) {
-        Ok(converted) => converted,
+    let validated = (|| {
+        let candidates = state
+            .config
+            .model_candidates(&tentative_model, tentative_reasoning_effort.as_deref())
+            .ok_or_else(|| ApiError::invalid("model", "model is not configured"))?;
+        let converted = chat::convert_request(parsed).map_err(|error| {
+            ApiError::invalid(
+                error.param.unwrap_or_else(|| "request".to_owned()),
+                error.message,
+            )
+        })?;
+        Ok((candidates, converted))
+    })();
+    let (candidates, mut converted) = match validated {
+        Ok(validated) => validated,
         Err(error) => {
             reject_request(
                 &state,
@@ -337,16 +314,9 @@ pub(crate) async fn chat_completions(
                 ApiProtocol::ChatCompletions,
             )
             .await?;
-            return Err(ApiError::invalid(
-                error.param.unwrap_or_else(|| "request".to_owned()),
-                error.message,
-            ));
+            return Err(error);
         }
     };
-    let candidates = state
-        .config
-        .model_candidates(&converted.model, converted.reasoning_effort.as_deref())
-        .expect("model was admitted above");
     let permit = state.acquire_request_slot(&identity).await?;
     let (request_id, effective_model) = admit_request(
         &state,
@@ -365,21 +335,26 @@ pub(crate) async fn chat_completions(
         permit,
     );
 
-    let upstream =
-        send_upstream(&state, &mut request, &converted.upstream_request, &headers).await?;
-    if !upstream.status().is_success() {
-        request
-            .finish(
-                FinalStatus::UpstreamError,
-                Some(StatusCode::BAD_GATEWAY),
-                None,
-            )
-            .await?;
-        return Err(ApiError::gateway("Upstream request failed"));
-    }
+    let result = tokio::select! {
+        biased;
+        _ = state.shutdown.cancelled() => {
+            request.finish(FinalStatus::Canceled, None).await?;
+            return Err(ApiError::shutdown());
+        }
+        result = state.upstream_http.send(&converted.upstream_request, &headers) => result,
+    };
+    let upstream = match result {
+        Ok(response) if response.status().is_success() => response,
+        _ => {
+            request
+                .finish(FinalStatus::UpstreamError, Some(StatusCode::BAD_GATEWAY))
+                .await?;
+            return Err(ApiError::gateway("Upstream request failed"));
+        }
+    };
 
     if converted.stream {
-        request.response_started(StatusCode::OK);
+        request.response_started();
         let (sender, receiver) = mpsc::channel::<Bytes>(16);
         state.pending_requests.spawn(forward_chat_stream(
             request,
@@ -402,55 +377,9 @@ pub(crate) async fn chat_completions(
             .expect("static streaming response is valid"));
     }
 
-    let converted_terminal = match read_chat_terminal(upstream, &state.shutdown).await {
-        Ok(terminal) => terminal,
-        Err(ChatStreamError::Shutdown) => {
-            request.finish(FinalStatus::Canceled, None, None).await?;
-            return Err(ApiError::shutdown());
-        }
-        Err(ChatStreamError::InvalidTerminal(usage, error)) => {
-            let _ = request
-                .finish_terminal(
-                    FinalStatus::UpstreamError,
-                    StatusCode::BAD_GATEWAY,
-                    StatusCode::BAD_GATEWAY,
-                    usage.map(|usage| billable_usage(usage, rates)),
-                )
-                .await;
-            return Err(error);
-        }
-        Err(ChatStreamError::MissingTerminal) => {
-            request
-                .finish(
-                    FinalStatus::UpstreamError,
-                    Some(StatusCode::BAD_GATEWAY),
-                    None,
-                )
-                .await?;
-            return Err(ApiError::gateway(
-                "Upstream response ended without a terminal",
-            ));
-        }
-    };
-    let status = match converted_terminal.status {
-        TerminalStatus::Completed => FinalStatus::Completed,
-        TerminalStatus::Incomplete => FinalStatus::Incomplete,
-    };
-    if request
-        .finish_terminal(
-            status,
-            StatusCode::OK,
-            StatusCode::BAD_GATEWAY,
-            Some(billable_usage(converted_terminal.usage, rates)),
-        )
+    read_chat_terminal(request, rates, upstream, &state.shutdown)
         .await
-        .is_err()
-    {
-        return Err(ApiError::gateway(
-            "Upstream terminal response could not be accounted",
-        ));
-    }
-    Ok(Json(converted_terminal.chat_completion).into_response())
+        .map(|value| Json(value).into_response())
 }
 
 async fn forward_chat_stream(
@@ -463,151 +392,117 @@ async fn forward_chat_stream(
 ) {
     let mut reader = SseReader::new(upstream.bytes_stream());
     let mut converter = chat::ChatStreamConverter::new(include_usage);
-    loop {
+    let status = loop {
         let next = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                let _ = request
-                    .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                    .await;
-                return;
+                break FinalStatus::Canceled;
             }
             _ = sender.closed() => {
-                let _ = request
-                    .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                    .await;
-                return;
+                break FinalStatus::Canceled;
             }
             next = reader.next() => next,
         };
         let event = match next {
-            Ok(SseRead::Event(event)) => event,
-            Ok(SseRead::Eof) | Err(_) => {
-                let _ = request
-                    .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                    .await;
-                return;
-            }
+            Some(event) => event,
+            None => break FinalStatus::UpstreamError,
         };
-        if let Some(terminal) = event.terminal() {
-            if let Some(error) = terminal.upstream_error() {
-                let error = ApiError::upstream(error);
-                let _ = request
+        let value = match event {
+            SseEvent::Terminal(terminal) => {
+                let converted = converter.convert_terminal(&terminal);
+                let status = match (terminal.kind, converted.is_ok()) {
+                    (TerminalKind::Completed, true) => FinalStatus::Completed,
+                    (TerminalKind::Incomplete, true) => FinalStatus::Incomplete,
+                    _ => FinalStatus::UpstreamError,
+                };
+                let accounted = request
                     .finish_terminal(
-                        FinalStatus::UpstreamError,
+                        status,
                         StatusCode::OK,
                         StatusCode::OK,
                         terminal.usage.map(|usage| billable_usage(usage, rates)),
                     )
-                    .await;
-                let _ = sender.send(chat_sse_bytes(&error.body())).await;
-                return;
-            }
-            let converted = match converter.convert_terminal(terminal) {
-                Ok(converted) => converted,
-                Err(_) => {
-                    let _ = request
-                        .finish_terminal(
-                            FinalStatus::UpstreamError,
-                            StatusCode::OK,
-                            StatusCode::OK,
-                            terminal.usage.map(|usage| billable_usage(usage, rates)),
-                        )
-                        .await;
+                    .await
+                    .is_ok();
+                if let Some(error) = terminal.upstream_error() {
+                    let error = ApiError::upstream(error);
+                    let _ = sender.send(chat_sse_bytes(&error.body())).await;
                     return;
                 }
-            };
-            let status = match converted.status {
-                TerminalStatus::Completed => FinalStatus::Completed,
-                TerminalStatus::Incomplete => FinalStatus::Incomplete,
-            };
-            if request
-                .finish_terminal(
-                    status,
-                    StatusCode::OK,
-                    StatusCode::OK,
-                    Some(billable_usage(converted.usage, rates)),
-                )
-                .await
-                .is_err()
-            {
-                return;
-            }
-            for chunk in converted.chunks {
-                if sender.send(chat_sse_bytes(&chunk)).await.is_err() {
+                let Ok(converted) = converted else { return };
+                if !accounted {
                     return;
                 }
+                for chunk in converted {
+                    if sender.send(chat_sse_bytes(&chunk)).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = sender.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
+                return;
             }
-            let _ = sender.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
-            return;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
-            continue;
+            SseEvent::Event(value) => value,
         };
         let chunk = match converter.convert_event(&value) {
             Ok(chunk) => chunk,
-            Err(_) => {
-                let _ = request
-                    .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                    .await;
-                return;
-            }
+            Err(_) => break FinalStatus::UpstreamError,
         };
         if let Some(chunk) = chunk
             && sender.send(chat_sse_bytes(&chunk)).await.is_err()
         {
-            let _ = request
-                .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                .await;
-            return;
+            break FinalStatus::Canceled;
         }
-    }
+    };
+    let _ = request.finish(status, Some(StatusCode::OK)).await;
 }
 
 fn chat_sse_bytes(value: &Value) -> Bytes {
     Bytes::from(format!("data: {value}\n\n"))
 }
 
-enum ChatStreamError {
-    Shutdown,
-    InvalidTerminal(Option<Usage>, ApiError),
-    MissingTerminal,
-}
-
 async fn read_chat_terminal(
+    mut request: PendingRequest,
+    rates: ModelRates,
     upstream: reqwest::Response,
     shutdown: &CancellationToken,
-) -> Result<chat::ConvertedTerminal, ChatStreamError> {
+) -> Result<Value, ApiError> {
     let mut reader = SseReader::new(upstream.bytes_stream());
     let mut completed_output_items = Vec::new();
-    loop {
+    let mut terminal = loop {
         let next = tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Err(ChatStreamError::Shutdown),
+            _ = shutdown.cancelled() => {
+                drop(reader);
+                request.finish(FinalStatus::Canceled, None).await?;
+                return Err(ApiError::shutdown());
+            }
             next = reader.next() => next,
         };
-        let event = match next {
-            Ok(SseRead::Event(event)) => event,
-            Ok(SseRead::Eof) | Err(_) => return Err(ChatStreamError::MissingTerminal),
-        };
-        if event.terminal().is_none() {
-            if let Ok(value) = serde_json::from_str::<Value>(&event.data)
-                && value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
-                && let Some(item) = value.get("item")
-            {
-                completed_output_items.push(item.clone());
+        match next {
+            Some(SseEvent::Terminal(terminal)) => break terminal,
+            Some(SseEvent::Event(value)) => {
+                if value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                    && let Some(item) = value.get("item")
+                {
+                    completed_output_items.push(item.clone());
+                }
             }
-            continue;
+            None => {
+                drop(reader);
+                request
+                    .finish(FinalStatus::UpstreamError, Some(StatusCode::BAD_GATEWAY))
+                    .await?;
+                return Err(ApiError::gateway(
+                    "Upstream response ended without a terminal",
+                ));
+            }
         }
-        let mut terminal = event.into_terminal().expect("checked above");
+    };
+    drop(reader);
 
-        let usage = terminal.usage;
-        if let Some(error) = terminal.upstream_error() {
-            return Err(ChatStreamError::InvalidTerminal(
-                usage,
-                ApiError::upstream(error),
-            ));
-        }
+    let converted = if let Some(error) = terminal.upstream_error() {
+        Err(ApiError::upstream(error))
+    } else {
         let output_is_empty = matches!(
             terminal.payload.pointer("/response/output"),
             Some(Value::Array(output)) if output.is_empty()
@@ -615,47 +510,38 @@ async fn read_chat_terminal(
         if output_is_empty && !completed_output_items.is_empty() {
             terminal.payload["response"]["output"] = Value::Array(completed_output_items);
         }
-        return match chat::convert_terminal_event(&terminal) {
-            Ok(converted) => Ok(converted),
-            Err(error) if error.kind == ChatErrorKind::UpstreamProtocol => {
-                tracing::warn!(%error, "Upstream Chat terminal conversion failed");
-                Err(ChatStreamError::InvalidTerminal(
-                    usage,
-                    ApiError::gateway("Upstream terminal response could not be converted"),
-                ))
-            }
-            Err(_) => unreachable!("terminal conversion cannot be a request error"),
-        };
-    }
-}
-
-async fn send_upstream(
-    state: &AppState,
-    request: &mut PendingRequest,
-    body: &Value,
-    downstream_headers: &HeaderMap,
-) -> Result<reqwest::Response, ApiError> {
-    let result = tokio::select! {
-        biased;
-        _ = state.shutdown.cancelled() => {
-            request.finish(FinalStatus::Canceled, None, None).await?;
-            return Err(ApiError::shutdown());
-        }
-        result = state.upstream_http.send(body, downstream_headers) => result,
+        chat::convert_terminal_event(&terminal).map_err(|error| {
+            tracing::warn!(%error, "Upstream Chat terminal conversion failed");
+            ApiError::gateway("Upstream terminal response could not be converted")
+        })
     };
-    match result {
-        Ok(response) => Ok(response),
-        Err(_) => {
-            request
-                .finish(
+    let usage = terminal.usage.map(|usage| billable_usage(usage, rates));
+    let completion = match converted {
+        Ok(completion) => completion,
+        Err(error) => {
+            drop(terminal);
+            let _ = request
+                .finish_terminal(
                     FinalStatus::UpstreamError,
-                    Some(StatusCode::BAD_GATEWAY),
-                    None,
+                    StatusCode::BAD_GATEWAY,
+                    StatusCode::BAD_GATEWAY,
+                    usage,
                 )
-                .await?;
-            Err(ApiError::gateway("Upstream request failed"))
+                .await;
+            return Err(error);
         }
-    }
+    };
+    let status = match terminal.kind {
+        TerminalKind::Completed => FinalStatus::Completed,
+        TerminalKind::Incomplete => FinalStatus::Incomplete,
+        TerminalKind::Failed | TerminalKind::Error => unreachable!("converted completion"),
+    };
+    drop(terminal);
+    request
+        .finish_terminal(status, StatusCode::OK, StatusCode::BAD_GATEWAY, usage)
+        .await
+        .map_err(|_| ApiError::gateway("Upstream terminal response could not be accounted"))?;
+    Ok(completion)
 }
 
 async fn forward_websocket_responses_stream(
@@ -663,40 +549,23 @@ async fn forward_websocket_responses_stream(
     rates: ModelRates,
     upstream: &mut crate::upstream_ws::UpstreamWebSocket,
     sender: &mpsc::Sender<Bytes>,
-    shutdown: CancellationToken,
 ) -> Option<(TerminalEvent, Bytes)> {
     let mut completed_output_items = Vec::new();
-    loop {
-        let next = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => None,
-            _ = sender.closed() => None,
-            next = upstream.next() => next,
-        };
+    let status = loop {
+        let next = upstream.next().await;
         let Some(Ok(message)) = next else {
-            let _ = request
-                .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                .await;
-            return None;
+            break FinalStatus::Canceled;
         };
         match message {
             UpstreamMessage::Text(text) => {
                 let event = match serde_json::from_str::<Value>(text.as_str()) {
                     Ok(event) => event,
-                    Err(_) => {
-                        let _ = request
-                            .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                            .await;
-                        return None;
-                    }
+                    Err(_) => break FinalStatus::UpstreamError,
                 };
                 let event_name = match event.get("type").and_then(Value::as_str) {
                     Some(event_name) => event_name.to_owned(),
                     None => {
-                        let _ = request
-                            .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                            .await;
-                        return None;
+                        break FinalStatus::UpstreamError;
                     }
                 };
                 if event_name == "response.output_item.done"
@@ -706,12 +575,7 @@ async fn forward_websocket_responses_stream(
                 }
                 let terminal = match parse_terminal_payload(event) {
                     Ok(terminal) => terminal,
-                    Err(_) => {
-                        let _ = request
-                            .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                            .await;
-                        return None;
-                    }
+                    Err(_) => break FinalStatus::UpstreamError,
                 };
                 let rewritten = terminal
                     .as_ref()
@@ -758,29 +622,22 @@ async fn forward_websocket_responses_stream(
                     return Some((terminal, bytes));
                 }
                 if sender.send(bytes).await.is_err() {
-                    let _ = request
-                        .finish(FinalStatus::Canceled, Some(StatusCode::OK), None)
-                        .await;
-                    return None;
+                    break FinalStatus::Canceled;
                 }
             }
             UpstreamMessage::Ping(payload) => {
                 if upstream.send(UpstreamMessage::Pong(payload)).await.is_err() {
-                    let _ = request
-                        .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                        .await;
-                    return None;
+                    break FinalStatus::UpstreamError;
                 }
             }
             UpstreamMessage::Pong(_) => {}
             UpstreamMessage::Close(_) | UpstreamMessage::Binary(_) | UpstreamMessage::Frame(_) => {
-                let _ = request
-                    .finish(FinalStatus::UpstreamError, Some(StatusCode::OK), None)
-                    .await;
-                return None;
+                break FinalStatus::UpstreamError;
             }
         }
-    }
+    };
+    let _ = request.finish(status, Some(StatusCode::OK)).await;
+    None
 }
 
 fn normalize_responses_request(value: Value) -> Result<Value, ApiError> {
@@ -848,7 +705,6 @@ fn normalize_responses_request(value: Value) -> Result<Value, ApiError> {
             }]),
         );
     }
-    object.insert("store".to_owned(), Value::Bool(false));
     Ok(Value::Object(object))
 }
 

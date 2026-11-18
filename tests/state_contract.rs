@@ -590,48 +590,88 @@ async fn abrupt_process_death_leaves_active_authenticated_request_started_after_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn controlled_clock_records_positive_request_duration_in_milliseconds() {
     let _test_guard = TEST_LOCK.lock().await;
-    let reached = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let upstream = FakeUpstream::start(UpstreamBehavior::GatedTerminal {
-        reached: Arc::clone(&reached),
-        release: Arc::clone(&release),
-    })
-    .await;
-    let fixture = Fixture::new(&upstream);
-    let clock = FixedClock::new(
-        OffsetDateTime::from_unix_timestamp(1_786_363_200).expect("valid fixed timestamp"),
-    );
-    let _relay = InProcessRelay::start(&fixture, clock.clone()).await;
-    let url = fixture.responses_url();
-    let request = tokio::spawn(async move {
-        let response = client()
-            .post(url)
-            .bearer_auth(API_KEY)
-            .json(&json!({"model": MODEL, "input": "duration", "stream": true}))
-            .send()
+    let now = OffsetDateTime::from_unix_timestamp(1_786_363_200).expect("valid fixed timestamp");
+    for (now, requested_at_override) in [
+        (now, None),
+        (now, Some(i64::MIN)),
+        (
+            OffsetDateTime::UNIX_EPOCH - TimeDuration::nanoseconds(1),
+            None,
+        ),
+    ] {
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let upstream = FakeUpstream::start(UpstreamBehavior::GatedTerminal {
+            reached: Arc::clone(&reached),
+            release: Arc::clone(&release),
+        })
+        .await;
+        let fixture = Fixture::new(&upstream);
+        let clock = FixedClock::new(now);
+        let _relay = InProcessRelay::start(&fixture, clock.clone()).await;
+        let url = fixture.responses_url();
+        let request = tokio::spawn(async move {
+            let response = client()
+                .post(url)
+                .bearer_auth(API_KEY)
+                .json(&json!({"model": MODEL, "input": "duration", "stream": true}))
+                .send()
+                .await
+                .expect("send duration request");
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .bytes()
+                .await
+                .expect("consume completed duration response");
+        });
+        timeout(TEST_TIMEOUT, reached.notified())
             .await
-            .expect("send duration request");
-        assert_eq!(response.status(), StatusCode::OK);
-        response
-            .bytes()
+            .expect("duration request did not reach gated upstream");
+        if let Some(requested_at_ms) = requested_at_override {
+            let mut database = open_database(&fixture.database_path, false).await;
+            sqlx::query("UPDATE request_ledger SET requested_at_ms = ? WHERE status = 'started'")
+                .bind(requested_at_ms)
+                .execute(&mut database)
+                .await
+                .expect("override request start timestamp");
+            database
+                .close()
+                .await
+                .expect("close timestamp override connection");
+        }
+        clock.advance(TimeDuration::milliseconds(123));
+        release.notify_one();
+        timeout(TEST_TIMEOUT, request)
             .await
-            .expect("consume completed duration response");
-    });
-    timeout(TEST_TIMEOUT, reached.notified())
-        .await
-        .expect("duration request did not reach gated upstream");
-    clock.advance(TimeDuration::milliseconds(123));
-    release.notify_one();
-    timeout(TEST_TIMEOUT, request)
-        .await
-        .expect("duration request did not complete")
-        .expect("duration request task failed");
+            .expect("duration request did not complete")
+            .expect("duration request task failed");
 
-    let mut database = open_database(&fixture.database_path, true).await;
-    let row = sqlx::query("SELECT status, duration_ms FROM request_logs")
+        let mut database = open_database(&fixture.database_path, true).await;
+        let row = sqlx::query(
+            "SELECT status, duration_ms, requested_at_ms, finished_at_ms FROM request_ledger",
+        )
         .fetch_one(&mut database)
         .await
         .expect("read duration request log");
-    assert_eq!(row.get::<String, _>("status"), "completed");
-    assert_eq!(row.get::<i64, _>("duration_ms"), 123);
+        assert_eq!(row.get::<String, _>("status"), "completed");
+        assert_eq!(
+            row.get::<i64, _>("requested_at_ms"),
+            requested_at_override
+                .unwrap_or(now.unix_timestamp_nanos().div_euclid(1_000_000) as i64)
+        );
+        assert_eq!(
+            row.get::<i64, _>("finished_at_ms"),
+            (now + TimeDuration::milliseconds(123))
+                .unix_timestamp_nanos()
+                .div_euclid(1_000_000) as i64
+        );
+        assert_eq!(
+            row.get::<i64, _>("duration_ms"),
+            if requested_at_override.is_some() {
+                i64::MAX
+            } else {
+                123
+            }
+        );
+    }
 }

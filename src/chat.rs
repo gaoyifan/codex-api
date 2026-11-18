@@ -5,24 +5,17 @@
 //! Completion. It does not perform model admission, I/O, retries, accounting,
 //! or persistence.
 
-use std::{error::Error, fmt};
-
 use serde_json::{Map, Value, json};
 
-use crate::responses_terminal::{TerminalEvent, TerminalKind, Usage};
-
-/// Identifies whether an error belongs to the downstream request or to the
-/// upstream Responses protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatErrorKind {
-    InvalidRequest,
-    UpstreamProtocol,
-}
+use crate::{
+    config::REASONING_EFFORTS,
+    responses_terminal::{TerminalEvent, TerminalKind, Usage},
+};
 
 /// A compact protocol error which the HTTP layer can map to either 400 or 502.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
 pub struct ChatError {
-    pub kind: ChatErrorKind,
     pub param: Option<String>,
     pub message: String,
 }
@@ -30,7 +23,6 @@ pub struct ChatError {
 impl ChatError {
     fn invalid(param: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            kind: ChatErrorKind::InvalidRequest,
             param: Some(param.into()),
             message: message.into(),
         }
@@ -38,56 +30,29 @@ impl ChatError {
 
     fn upstream(message: impl Into<String>) -> Self {
         Self {
-            kind: ChatErrorKind::UpstreamProtocol,
             param: None,
             message: message.into(),
         }
     }
 }
 
-impl fmt::Display for ChatError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl Error for ChatError {}
-
 /// A validated Chat request and its Responses wire representation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConvertedRequest {
     pub upstream_request: Value,
-    pub model: String,
-    pub reasoning_effort: Option<String>,
     pub stream: bool,
     pub include_usage: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalStatus {
-    Completed,
-    Incomplete,
-}
-
 pub struct ChatStreamConverter {
-    id: Option<String>,
-    created: Option<i64>,
-    model: Option<String>,
+    metadata: Option<(String, i64, String)>,
     include_usage: bool,
-}
-
-pub struct ConvertedStreamTerminal {
-    pub chunks: Vec<Value>,
-    pub usage: Usage,
-    pub status: TerminalStatus,
 }
 
 impl ChatStreamConverter {
     pub fn new(include_usage: bool) -> Self {
         Self {
-            id: None,
-            created: None,
-            model: None,
+            metadata: None,
             include_usage,
         }
     }
@@ -115,48 +80,38 @@ impl ChatStreamConverter {
         }
     }
 
-    pub fn convert_terminal(
-        &mut self,
-        terminal: &TerminalEvent,
-    ) -> Result<ConvertedStreamTerminal, ChatError> {
-        let status = match terminal.kind {
-            TerminalKind::Completed => TerminalStatus::Completed,
-            TerminalKind::Incomplete => TerminalStatus::Incomplete,
-            TerminalKind::Failed | TerminalKind::Error => {
-                return Err(ChatError::upstream(format!(
-                    "upstream emitted {} instead of a completion",
-                    terminal.kind.event_name()
-                )));
-            }
-        };
-        let response = terminal
-            .payload
-            .get("response")
-            .and_then(Value::as_object)
-            .ok_or_else(|| ChatError::upstream("terminal event is missing its response object"))?;
+    pub fn convert_terminal(&mut self, terminal: &TerminalEvent) -> Result<Vec<Value>, ChatError> {
+        if matches!(terminal.kind, TerminalKind::Failed | TerminalKind::Error) {
+            return Err(ChatError::upstream(format!(
+                "upstream emitted {} instead of a completion",
+                terminal.kind.event_name()
+            )));
+        }
+        let response = terminal.payload["response"]
+            .as_object()
+            .expect("response terminal payload was validated");
         self.capture_metadata(response)?;
         let usage = terminal
             .usage
-            .ok_or_else(|| ChatError::upstream("terminal response is missing usage"))?;
-        let finish_reason = match status {
-            TerminalStatus::Completed => "stop",
-            TerminalStatus::Incomplete => incomplete_finish_reason(response)?,
+            .expect("completion terminal usage was validated");
+        let finish_reason = if terminal.kind == TerminalKind::Completed {
+            "stop"
+        } else {
+            incomplete_finish_reason(response)?
         };
         let mut chunks = vec![self.chunk(json!({}), Some(finish_reason))?];
         if self.include_usage {
             chunks.push(self.usage_chunk(usage)?);
         }
-        Ok(ConvertedStreamTerminal {
-            chunks,
-            usage,
-            status,
-        })
+        Ok(chunks)
     }
 
     fn capture_metadata(&mut self, response: &Map<String, Value>) -> Result<(), ChatError> {
-        self.id = Some(upstream_string(response, "id", "response")?.to_owned());
-        self.created = Some(upstream_integer(response, "created_at", "response")?);
-        self.model = Some(upstream_string(response, "model", "response")?.to_owned());
+        self.metadata = Some((
+            upstream_string(response, "id", "response")?.to_owned(),
+            upstream_integer(response, "created_at", "response")?,
+            upstream_string(response, "model", "response")?.to_owned(),
+        ));
         Ok(())
     }
 
@@ -189,22 +144,13 @@ impl ChatStreamConverter {
     }
 
     fn metadata(&self) -> Result<(&str, i64, &str), ChatError> {
-        match (&self.id, self.created, &self.model) {
-            (Some(id), Some(created), Some(model)) => Ok((id, created, model)),
-            _ => Err(ChatError::upstream(
-                "upstream emitted Chat content before response metadata",
-            )),
-        }
+        self.metadata
+            .as_ref()
+            .map(|(id, created, model)| (id.as_str(), *created, model.as_str()))
+            .ok_or_else(|| {
+                ChatError::upstream("upstream emitted Chat content before response metadata")
+            })
     }
-}
-
-/// The public Chat Completion plus accounting metadata from the same terminal
-/// Responses event.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConvertedTerminal {
-    pub chat_completion: Value,
-    pub usage: Usage,
-    pub status: TerminalStatus,
 }
 
 /// Strictly validates the supported Chat Completions request subset and
@@ -278,7 +224,7 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
     let (instructions, input) = convert_messages(messages)?;
 
     let mut upstream = Map::new();
-    upstream.insert("model".into(), Value::String(model.clone()));
+    upstream.insert("model".into(), Value::String(model));
     upstream.insert("input".into(), Value::Array(input));
     upstream.insert("stream".into(), Value::Bool(true));
     upstream.insert("store".into(), Value::Bool(false));
@@ -297,7 +243,7 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
             Value::Bool(parallel_tool_calls),
         );
     }
-    if let Some(reasoning_effort) = reasoning_effort.as_ref() {
+    if let Some(reasoning_effort) = reasoning_effort {
         upstream.insert("reasoning".into(), json!({"effort": reasoning_effort}));
     }
     if let Some(text) = text {
@@ -306,8 +252,6 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
 
     Ok(ConvertedRequest {
         upstream_request: Value::Object(upstream),
-        model,
-        reasoning_effort,
         stream,
         include_usage,
     })
@@ -315,26 +259,16 @@ pub fn convert_request(request: Value) -> Result<ConvertedRequest, ChatError> {
 
 /// Converts a validated completed or incomplete Responses terminal into one
 /// non-streaming Chat Completion.
-pub fn convert_terminal_event(terminal: &TerminalEvent) -> Result<ConvertedTerminal, ChatError> {
-    let terminal_status = match terminal.kind {
-        TerminalKind::Completed => TerminalStatus::Completed,
-        TerminalKind::Incomplete => TerminalStatus::Incomplete,
-        TerminalKind::Failed | TerminalKind::Error => {
-            return Err(ChatError::upstream(format!(
-                "upstream emitted {} instead of a completion",
-                terminal.kind.event_name()
-            )));
-        }
-    };
-    let event = terminal
-        .payload
+pub fn convert_terminal_event(terminal: &TerminalEvent) -> Result<Value, ChatError> {
+    if matches!(terminal.kind, TerminalKind::Failed | TerminalKind::Error) {
+        return Err(ChatError::upstream(format!(
+            "upstream emitted {} instead of a completion",
+            terminal.kind.event_name()
+        )));
+    }
+    let response = terminal.payload["response"]
         .as_object()
-        .ok_or_else(|| ChatError::upstream("terminal Responses event must be an object"))?;
-
-    let response = event
-        .get("response")
-        .and_then(Value::as_object)
-        .ok_or_else(|| ChatError::upstream("terminal event is missing its response object"))?;
+        .expect("response terminal payload was validated");
     if upstream_string(response, "object", "terminal response")? != "response" {
         return Err(ChatError::upstream(
             "terminal response has an invalid object type",
@@ -356,37 +290,22 @@ pub fn convert_terminal_event(terminal: &TerminalEvent) -> Result<ConvertedTermi
     let created = upstream_integer(response, "created_at", "terminal response")?;
     let usage = terminal
         .usage
-        .ok_or_else(|| ChatError::upstream("terminal response is missing usage"))?;
+        .expect("completion terminal usage was validated");
     let output = response
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| ChatError::upstream("terminal response output must be an array"))?;
-    let converted_output = convert_output(output)?;
+    let message = convert_output(output)?;
 
-    let finish_reason = match terminal_status {
-        TerminalStatus::Completed if !converted_output.tool_calls.is_empty() => "tool_calls",
-        TerminalStatus::Completed => "stop",
-        TerminalStatus::Incomplete => incomplete_finish_reason(response)?,
+    let finish_reason = if terminal.kind == TerminalKind::Incomplete {
+        incomplete_finish_reason(response)?
+    } else if message.contains_key("tool_calls") {
+        "tool_calls"
+    } else {
+        "stop"
     };
 
-    let mut message = Map::new();
-    message.insert("role".into(), Value::String("assistant".into()));
-    message.insert(
-        "content".into(),
-        converted_output.text.map_or(Value::Null, Value::String),
-    );
-    message.insert(
-        "refusal".into(),
-        converted_output.refusal.map_or(Value::Null, Value::String),
-    );
-    if !converted_output.tool_calls.is_empty() {
-        message.insert(
-            "tool_calls".into(),
-            Value::Array(converted_output.tool_calls),
-        );
-    }
-
-    let chat_completion = json!({
+    Ok(json!({
         "id": id,
         "object": "chat.completion",
         "created": created,
@@ -398,13 +317,7 @@ pub fn convert_terminal_event(terminal: &TerminalEvent) -> Result<ConvertedTermi
             "finish_reason": finish_reason
         }],
         "usage": chat_usage(usage)
-    });
-
-    Ok(ConvertedTerminal {
-        chat_completion,
-        usage,
-        status: terminal_status,
-    })
+    }))
 }
 
 fn chat_usage(usage: Usage) -> Value {
@@ -422,10 +335,13 @@ fn chat_usage(usage: Usage) -> Value {
 }
 
 fn into_request_object(value: Value, param: &str) -> Result<Map<String, Value>, ChatError> {
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| ChatError::invalid(param, format!("{param} must be a JSON object")))
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(ChatError::invalid(
+            param,
+            format!("{param} must be a JSON object"),
+        )),
+    }
 }
 
 fn take_request_string(
@@ -433,10 +349,13 @@ fn take_request_string(
     field: &str,
     param: &str,
 ) -> Result<String, ChatError> {
-    object
-        .remove(field)
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or_else(|| ChatError::invalid(param, format!("{param} must be a string")))
+    match object.remove(field) {
+        Some(Value::String(text)) => Ok(text),
+        _ => Err(ChatError::invalid(
+            param,
+            format!("{param} must be a string"),
+        )),
+    }
 }
 
 fn request_bool(value: Value, param: &str) -> Result<bool, ChatError> {
@@ -530,27 +449,26 @@ fn convert_reasoning_effort(value: Value) -> Result<Option<String>, ChatError> {
     if value.is_null() {
         return Ok(None);
     }
-    let effort = value.as_str().ok_or_else(|| {
-        ChatError::invalid(
+    let Value::String(effort) = value else {
+        return Err(ChatError::invalid(
             "reasoning_effort",
             "reasoning_effort must be a string or null",
-        )
-    })?;
-    match effort {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => {
-            Ok(Some(effort.to_owned()))
-        }
-        _ => Err(ChatError::invalid(
+        ));
+    };
+    if REASONING_EFFORTS.contains(&effort.as_str()) {
+        Ok(Some(effort))
+    } else {
+        Err(ChatError::invalid(
             "reasoning_effort",
             "unsupported reasoning_effort",
-        )),
+        ))
     }
 }
 
 fn convert_messages(value: Value) -> Result<(Option<String>, Vec<Value>), ChatError> {
-    let messages = value
-        .as_array()
-        .ok_or_else(|| ChatError::invalid("messages", "messages must be an array"))?;
+    let Value::Array(messages) = value else {
+        return Err(ChatError::invalid("messages", "messages must be an array"));
+    };
     if messages.is_empty() {
         return Err(ChatError::invalid(
             "messages",
@@ -560,34 +478,32 @@ fn convert_messages(value: Value) -> Result<(Option<String>, Vec<Value>), ChatEr
 
     let mut system_messages = Vec::new();
     let mut input = Vec::new();
-    for (index, value) in messages.iter().enumerate() {
+    for (index, value) in messages.into_iter().enumerate() {
         let context = format!("messages[{index}]");
-        let mut message = value
-            .as_object()
-            .cloned()
-            .ok_or_else(|| ChatError::invalid(&context, format!("{context} must be an object")))?;
+        let Value::Object(mut message) = value else {
+            return Err(ChatError::invalid(
+                &context,
+                format!("{context} must be an object"),
+            ));
+        };
         let role = take_request_string(&mut message, "role", &format!("{context}.role"))?;
         match role.as_str() {
-            "system" => {
+            "system" | "developer" | "user" => {
                 let content_param = format!("{context}.content");
                 let content = message.remove("content").ok_or_else(|| {
                     ChatError::invalid(&content_param, format!("{content_param} is required"))
                 })?;
                 reject_unknown_request_fields(&message, &context)?;
-                system_messages.push(parse_text_parts(content, &content_param)?.join("\n"));
-            }
-            "developer" | "user" => {
-                let content_param = format!("{context}.content");
-                let content = message.remove("content").ok_or_else(|| {
-                    ChatError::invalid(&content_param, format!("{content_param} is required"))
-                })?;
-                reject_unknown_request_fields(&message, &context)?;
-                let parts = convert_text_content(content, &content_param, "input_text")?;
-                input.push(json!({
-                    "type": "message",
-                    "role": role,
-                    "content": parts
-                }));
+                if role == "system" {
+                    system_messages.push(parse_text_parts(content, &content_param)?.join("\n"));
+                } else {
+                    let parts = convert_text_content(content, &content_param, "input_text")?;
+                    input.push(json!({
+                        "type": "message",
+                        "role": role,
+                        "content": parts
+                    }));
+                }
             }
             "assistant" => convert_assistant_message(message, &context, &mut input)?,
             "tool" => convert_tool_message(message, &context, &mut input)?,
@@ -618,7 +534,7 @@ fn convert_assistant_message(
     let tool_calls = message.remove("tool_calls");
     reject_unknown_request_fields(&message, context)?;
 
-    let mut contributed_input = false;
+    let input_start = input.len();
     if let Some(content) = content.filter(|content| !content.is_null()) {
         let content_param = format!("{context}.content");
         let parts = convert_text_content(content, &content_param, "output_text")?;
@@ -627,32 +543,30 @@ fn convert_assistant_message(
             "role": "assistant",
             "content": parts
         }));
-        contributed_input = true;
     }
 
     if let Some(tool_calls) = tool_calls.filter(|tool_calls| !tool_calls.is_null()) {
-        let calls = tool_calls.as_array().ok_or_else(|| {
-            ChatError::invalid(
+        let Value::Array(calls) = tool_calls else {
+            return Err(ChatError::invalid(
                 format!("{context}.tool_calls"),
                 format!("{context}.tool_calls must be an array"),
-            )
-        })?;
+            ));
+        };
         if calls.is_empty() {
             return Err(ChatError::invalid(
                 format!("{context}.tool_calls"),
                 format!("{context}.tool_calls must not be empty"),
             ));
         }
-        for (index, call) in calls.iter().enumerate() {
+        for (index, call) in calls.into_iter().enumerate() {
             input.push(convert_assistant_tool_call(
                 call,
                 &format!("{context}.tool_calls[{index}]"),
             )?);
         }
-        contributed_input = true;
     }
 
-    if !contributed_input {
+    if input.len() == input_start {
         return Err(ChatError::invalid(
             format!("{context}.content"),
             "assistant message must contain text or function tool calls",
@@ -661,11 +575,13 @@ fn convert_assistant_message(
     Ok(())
 }
 
-fn convert_assistant_tool_call(value: &Value, context: &str) -> Result<Value, ChatError> {
-    let mut call = value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| ChatError::invalid(context, format!("{context} must be an object")))?;
+fn convert_assistant_tool_call(value: Value, context: &str) -> Result<Value, ChatError> {
+    let Value::Object(mut call) = value else {
+        return Err(ChatError::invalid(
+            context,
+            format!("{context} must be an object"),
+        ));
+    };
     let id = take_request_string(&mut call, "id", &format!("{context}.id"))?;
     let call_type = take_request_string(&mut call, "type", &format!("{context}.type"))?;
     if call_type != "function" {
@@ -773,22 +689,24 @@ fn parse_text_parts(value: Value, param: &str) -> Result<Vec<String>, ChatError>
 }
 
 fn convert_tools(value: Value) -> Result<Value, ChatError> {
-    let tools = value
-        .as_array()
-        .ok_or_else(|| ChatError::invalid("tools", "tools must be an array"))?;
+    let Value::Array(tools) = value else {
+        return Err(ChatError::invalid("tools", "tools must be an array"));
+    };
     let converted = tools
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(index, tool)| convert_tool(tool, &format!("tools[{index}]")))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Value::Array(converted))
 }
 
-fn convert_tool(value: &Value, context: &str) -> Result<Value, ChatError> {
-    let mut tool = value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| ChatError::invalid(context, format!("{context} must be an object")))?;
+fn convert_tool(value: Value, context: &str) -> Result<Value, ChatError> {
+    let Value::Object(mut tool) = value else {
+        return Err(ChatError::invalid(
+            context,
+            format!("{context} must be an object"),
+        ));
+    };
     let tool_type = take_request_string(&mut tool, "type", &format!("{context}.type"))?;
     if tool_type != "function" {
         return Err(ChatError::invalid(
@@ -819,13 +737,12 @@ fn convert_tool(value: &Value, context: &str) -> Result<Value, ChatError> {
     };
     let description = function
         .remove("description")
-        .map(|value| {
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                ChatError::invalid(
-                    format!("{function_context}.description"),
-                    format!("{function_context}.description must be a string"),
-                )
-            })
+        .map(|value| match value {
+            Value::String(description) => Ok(description),
+            _ => Err(ChatError::invalid(
+                format!("{function_context}.description"),
+                format!("{function_context}.description must be a string"),
+            )),
         })
         .transpose()?;
     let strict = match function.remove("strict") {
@@ -878,18 +795,10 @@ fn convert_tool_choice(value: Value) -> Result<Value, ChatError> {
     }
 }
 
-struct ConvertedOutput {
-    text: Option<String>,
-    refusal: Option<String>,
-    tool_calls: Vec<Value>,
-}
-
-fn convert_output(output: &[Value]) -> Result<ConvertedOutput, ChatError> {
-    let mut converted = ConvertedOutput {
-        text: None,
-        refusal: None,
-        tool_calls: Vec::new(),
-    };
+fn convert_output(output: &[Value]) -> Result<Map<String, Value>, ChatError> {
+    let mut text = None::<String>;
+    let mut refusal = None::<String>;
+    let mut tool_calls = Vec::new();
 
     for (index, item) in output.iter().enumerate() {
         let item = item.as_object().ok_or_else(|| {
@@ -898,12 +807,55 @@ fn convert_output(output: &[Value]) -> Result<ConvertedOutput, ChatError> {
         let item_type = upstream_string(item, "type", "response output item")?;
         match item_type {
             "reasoning" => {}
-            "message" => convert_output_message(item, index, &mut converted)?,
+            "message" => {
+                if upstream_string(item, "role", "message output item")? != "assistant" {
+                    return Err(ChatError::upstream(
+                        "Responses message output role must be assistant",
+                    ));
+                }
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        ChatError::upstream("Responses message content must be an array")
+                    })?;
+                for (content_index, part) in content.iter().enumerate() {
+                    let part = part.as_object().ok_or_else(|| {
+                        ChatError::upstream(format!(
+                            "response output[{index}].content[{content_index}] must be an object"
+                        ))
+                    })?;
+                    match upstream_string(part, "type", "message content part")? {
+                        "output_text" => {
+                            text.get_or_insert_with(String::new)
+                                .push_str(upstream_string(
+                                    part,
+                                    "text",
+                                    "output_text content part",
+                                )?);
+                        }
+                        "refusal" => {
+                            refusal
+                                .get_or_insert_with(String::new)
+                                .push_str(upstream_string(
+                                    part,
+                                    "refusal",
+                                    "refusal content part",
+                                )?);
+                        }
+                        unsupported => {
+                            return Err(ChatError::upstream(format!(
+                                "unsupported Responses message content type {unsupported}"
+                            )));
+                        }
+                    }
+                }
+            }
             "function_call" => {
                 let call_id = upstream_string(item, "call_id", "function call output item")?;
                 let name = upstream_string(item, "name", "function call output item")?;
                 let arguments = upstream_string(item, "arguments", "function call output item")?;
-                converted.tool_calls.push(json!({
+                tool_calls.push(json!({
                     "id": call_id,
                     "type": "function",
                     "function": {
@@ -919,50 +871,14 @@ fn convert_output(output: &[Value]) -> Result<ConvertedOutput, ChatError> {
             }
         }
     }
-    Ok(converted)
-}
-
-fn convert_output_message(
-    item: &Map<String, Value>,
-    item_index: usize,
-    converted: &mut ConvertedOutput,
-) -> Result<(), ChatError> {
-    if upstream_string(item, "role", "message output item")? != "assistant" {
-        return Err(ChatError::upstream(
-            "Responses message output role must be assistant",
-        ));
+    let mut message = Map::new();
+    message.insert("role".into(), Value::String("assistant".into()));
+    message.insert("content".into(), text.map_or(Value::Null, Value::String));
+    message.insert("refusal".into(), refusal.map_or(Value::Null, Value::String));
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".into(), Value::Array(tool_calls));
     }
-    let content = item
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ChatError::upstream("Responses message content must be an array"))?;
-    for (content_index, part) in content.iter().enumerate() {
-        let part = part.as_object().ok_or_else(|| {
-            ChatError::upstream(format!(
-                "response output[{item_index}].content[{content_index}] must be an object"
-            ))
-        })?;
-        match upstream_string(part, "type", "message content part")? {
-            "output_text" => {
-                converted
-                    .text
-                    .get_or_insert_with(String::new)
-                    .push_str(upstream_string(part, "text", "output_text content part")?);
-            }
-            "refusal" => {
-                converted
-                    .refusal
-                    .get_or_insert_with(String::new)
-                    .push_str(upstream_string(part, "refusal", "refusal content part")?);
-            }
-            unsupported => {
-                return Err(ChatError::upstream(format!(
-                    "unsupported Responses message content type {unsupported}"
-                )));
-            }
-        }
-    }
-    Ok(())
+    Ok(message)
 }
 
 fn incomplete_finish_reason(response: &Map<String, Value>) -> Result<&'static str, ChatError> {

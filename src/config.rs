@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -12,13 +11,13 @@ use serde::{Deserialize, Deserializer, de};
 use serde_json::Value;
 use url::Url;
 
-use crate::store::{EffectiveModel, ModelCandidates, ModelRates};
+use crate::store::{EffectiveModel, ModelCandidates, ModelRates, QuotaLimits};
 
 const DEFAULT_UPSTREAM_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEFAULT_HARD_LIMIT_USD: &str = "600.00";
 const DEFAULT_STATE_FILE_MODE: u32 = 0o600;
-const REASONING_EFFORTS: [&str; 8] = [
+pub(crate) const REASONING_EFFORTS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
@@ -71,14 +70,12 @@ pub(crate) struct UpstreamConfig {
     pub(crate) supports_websockets: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ApiKeyConfig {
     pub(crate) id: String,
     pub(crate) secret: SecretString,
     pub(crate) max_concurrent_requests: usize,
-    pub(crate) weekly_limit_usd: Option<Decimal>,
-    /// Present only when `weekly_limit_usd` is set. Defaults to 600.00.
-    pub(crate) hard_limit_usd: Option<Decimal>,
+    pub(crate) quota: Option<QuotaLimits>,
 }
 
 #[derive(Deserialize)]
@@ -117,53 +114,36 @@ impl<'de> Deserialize<'de> for ApiKeyConfig {
                 }
                 SecretString::from(secret)
             }
-            (Some(_), Some(_)) => {
-                return Err(de::Error::custom(
-                    "API key must set exactly one of secret or secret_file",
-                ));
-            }
-            (None, None) => {
+            (Some(_), Some(_)) | (None, None) => {
                 return Err(de::Error::custom(
                     "API key must set exactly one of secret or secret_file",
                 ));
             }
         };
 
-        let hard_limit_usd = match (input.weekly_limit_usd, input.hard_limit_usd) {
+        let quota = match (input.weekly_limit_usd, input.hard_limit_usd) {
             (None, Some(_)) => {
                 return Err(de::Error::custom(
                     "API key hard_limit_usd requires weekly_limit_usd",
                 ));
             }
             (None, None) => None,
-            (Some(_), Some(hard)) => Some(hard),
-            (Some(_), None) => Some(
-                DEFAULT_HARD_LIMIT_USD
-                    .parse()
-                    .expect("default hard limit is valid"),
-            ),
+            (Some(weekly_limit_usd), hard_limit_usd) => Some(QuotaLimits {
+                weekly_limit_usd,
+                hard_limit_usd: hard_limit_usd.unwrap_or_else(|| {
+                    DEFAULT_HARD_LIMIT_USD
+                        .parse()
+                        .expect("default hard limit is valid")
+                }),
+            }),
         };
 
         Ok(Self {
             id: input.id,
             secret,
             max_concurrent_requests: input.max_concurrent_requests,
-            weekly_limit_usd: input.weekly_limit_usd,
-            hard_limit_usd,
+            quota,
         })
-    }
-}
-
-impl fmt::Debug for ApiKeyConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ApiKeyConfig")
-            .field("id", &self.id)
-            .field("secret", &"[REDACTED]")
-            .field("max_concurrent_requests", &self.max_concurrent_requests)
-            .field("weekly_limit_usd", &self.weekly_limit_usd)
-            .field("hard_limit_usd", &self.hard_limit_usd)
-            .finish()
     }
 }
 
@@ -244,19 +224,17 @@ impl Config {
             if !secrets.insert(secret) {
                 bail!("configuration contains a duplicate API key secret");
             }
-            if api_key
-                .weekly_limit_usd
-                .is_some_and(|limit| limit < Decimal::ZERO)
+            if let Some(QuotaLimits {
+                weekly_limit_usd: soft,
+                hard_limit_usd: hard,
+            }) = api_key.quota
             {
-                bail!("configuration API key weekly_limit_usd must be non-negative");
-            }
-            if api_key
-                .hard_limit_usd
-                .is_some_and(|limit| limit < Decimal::ZERO)
-            {
-                bail!("configuration API key hard_limit_usd must be non-negative");
-            }
-            if let (Some(soft), Some(hard)) = (api_key.weekly_limit_usd, api_key.hard_limit_usd) {
+                if soft < Decimal::ZERO {
+                    bail!("configuration API key weekly_limit_usd must be non-negative");
+                }
+                if hard < Decimal::ZERO {
+                    bail!("configuration API key hard_limit_usd must be non-negative");
+                }
                 if self.fallback_model.is_some() && hard <= soft {
                     bail!(
                         "configuration API key hard_limit_usd must be greater than weekly_limit_usd when fallback_model is set"

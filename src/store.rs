@@ -6,25 +6,17 @@ use std::time::Duration as StdDuration;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use anyhow::{Context, ensure};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
-use sqlx::migrate::{MigrateError, Migrator};
+use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration, OffsetDateTime, UtcOffset};
 
 use crate::Clock;
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-
-#[derive(Clone)]
-pub(crate) struct CredentialSeed {
-    pub(crate) account_id: String,
-    pub(crate) access_token: String,
-    pub(crate) refresh_token: String,
-    pub(crate) access_expires_at: Option<OffsetDateTime>,
-    pub(crate) last_refresh: OffsetDateTime,
-}
 
 #[derive(Clone)]
 pub(crate) struct Credential {
@@ -33,18 +25,6 @@ pub(crate) struct Credential {
     pub(crate) refresh_token: String,
     pub(crate) access_expires_at: Option<OffsetDateTime>,
     pub(crate) last_refresh: OffsetDateTime,
-}
-
-impl From<&CredentialSeed> for Credential {
-    fn from(seed: &CredentialSeed) -> Self {
-        Self {
-            account_id: seed.account_id.clone(),
-            access_token: seed.access_token.clone(),
-            refresh_token: seed.refresh_token.clone(),
-            access_expires_at: seed.access_expires_at,
-            last_refresh: seed.last_refresh,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,8 +106,8 @@ impl FinalStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QuotaLimits {
-    pub(crate) weekly_limit_usd: Option<Decimal>,
-    pub(crate) hard_limit_usd: Option<Decimal>,
+    pub(crate) weekly_limit_usd: Decimal,
+    pub(crate) hard_limit_usd: Decimal,
 }
 
 #[derive(Clone, Copy)]
@@ -166,7 +146,7 @@ impl Store {
         path: &Path,
         file_mode: u32,
         clock: Arc<dyn Clock>,
-    ) -> Result<Self, StoreError> {
+    ) -> anyhow::Result<Self> {
         prepare_state_file(path, file_mode)?;
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -185,8 +165,8 @@ impl Store {
 
     pub(crate) async fn load_or_import_credentials(
         &self,
-        seed: &CredentialSeed,
-    ) -> Result<Credential, StoreError> {
+        seed: &Credential,
+    ) -> anyhow::Result<Credential> {
         let mut transaction = self.pool.begin().await?;
         let stored = sqlx::query(
             "SELECT account_id, access_token, refresh_token, access_expires_at_ns, \
@@ -198,13 +178,13 @@ impl Store {
         let credential = match stored {
             None => {
                 insert_credentials(&mut transaction, seed).await?;
-                Credential::from(seed)
+                seed.clone()
             }
             Some(row) => {
                 let current = credential_from_row(&row)?;
                 if seed.last_refresh > current.last_refresh {
                     update_credentials(&mut transaction, seed).await?;
-                    Credential::from(seed)
+                    seed.clone()
                 } else {
                     current
                 }
@@ -214,41 +194,24 @@ impl Store {
         Ok(credential)
     }
 
-    pub(crate) async fn save_credentials(&self, credential: &Credential) -> Result<(), StoreError> {
-        let mut transaction = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE credentials SET account_id = ?, access_token = ?, refresh_token = ?, \
-                    access_expires_at_ns = ?, last_refresh_ns = ? WHERE singleton = 1",
-        )
-        .bind(&credential.account_id)
-        .bind(&credential.access_token)
-        .bind(&credential.refresh_token)
-        .bind(optional_timestamp_ns(credential.access_expires_at)?)
-        .bind(timestamp_ns(credential.last_refresh)?)
-        .execute(&mut *transaction)
-        .await?;
-        if result.rows_affected() != 1 {
-            return Err(StoreError::CredentialsNotInitialized);
-        }
-        transaction.commit().await?;
-        Ok(())
+    pub(crate) async fn save_credentials(&self, credential: &Credential) -> anyhow::Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        update_credentials(&mut connection, credential).await
     }
 
     pub(crate) async fn begin_request(
         &self,
         context: &RequestContext,
-        quota: QuotaLimits,
+        quota: Option<QuotaLimits>,
         candidates: ModelCandidates,
-    ) -> Result<Admission, StoreError> {
+    ) -> anyhow::Result<Admission> {
         let now = self.clock.now().to_offset(UtcOffset::UTC);
-        let requested_at_ms = timestamp_ms(now)?;
+        let requested_at_ms = timestamp_ms(now);
         let spent = self
             .current_week_spend_nano_usd(&context.api_key_id, now)
             .await?;
-        let soft_exceeded = spend_meets_limit(spent, quota.weekly_limit_usd)?;
-        let hard_exceeded = spend_meets_limit(spent, quota.hard_limit_usd)?;
-        let rejected = hard_exceeded || (soft_exceeded && candidates.fallback.is_none());
-        let use_fallback = soft_exceeded && !rejected;
+        let access = quota_access(spent, quota, candidates.fallback.is_some())?;
+        let rejected = access == ModelAccess::Blocked;
         let (status, finished_at_ms, duration_ms, http_status) = if rejected {
             (
                 "rejected",
@@ -262,7 +225,7 @@ impl Store {
         } else {
             ("started", None, None, None)
         };
-        let effective_model = if use_fallback {
+        let effective_model = if access == ModelAccess::FallbackOnly {
             candidates
                 .fallback
                 .expect("fallback admission requires a fallback candidate")
@@ -300,38 +263,26 @@ impl Store {
     pub(crate) async fn model_access(
         &self,
         api_key_id: &str,
-        quota: QuotaLimits,
+        quota: Option<QuotaLimits>,
         has_fallback: bool,
-    ) -> Result<ModelAccess, StoreError> {
-        if quota.weekly_limit_usd.is_none() {
+    ) -> anyhow::Result<ModelAccess> {
+        if quota.is_none() {
             return Ok(ModelAccess::All);
         }
 
         let spent = self
             .current_week_spend_nano_usd(api_key_id, self.clock.now())
             .await?;
-        if spend_meets_limit(spent, quota.hard_limit_usd)? {
-            return Ok(ModelAccess::Blocked);
-        }
-        if spend_meets_limit(spent, quota.weekly_limit_usd)? {
-            return Ok(if has_fallback {
-                ModelAccess::FallbackOnly
-            } else {
-                ModelAccess::Blocked
-            });
-        }
-        Ok(ModelAccess::All)
+        quota_access(spent, quota, has_fallback)
     }
 
     async fn current_week_spend_nano_usd(
         &self,
         api_key_id: &str,
         now: OffsetDateTime,
-    ) -> Result<Decimal, StoreError> {
-        let week_start_ms = timestamp_ms(monday_start(now))?;
-        let next_week_ms = week_start_ms
-            .checked_add(604_800_000)
-            .ok_or(StoreError::TimestampOutOfRange)?;
+    ) -> anyhow::Result<Decimal> {
+        let week_start_ms = timestamp_ms(monday_start(now));
+        let next_week_ms = week_start_ms + 604_800_000;
         let spent_nano_usd: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(cost_nano_usd), 0) FROM request_ledger \
              WHERE api_key_id = ? AND cost_nano_usd IS NOT NULL \
@@ -351,8 +302,8 @@ impl Store {
         model: &str,
         reasoning_effort: Option<&str>,
         http_status: Option<u16>,
-    ) -> Result<(), StoreError> {
-        let requested_at_ms = timestamp_ms(self.clock.now().to_offset(UtcOffset::UTC))?;
+    ) -> anyhow::Result<()> {
+        let requested_at_ms = timestamp_ms(self.clock.now().to_offset(UtcOffset::UTC));
         sqlx::query(
             "INSERT INTO request_ledger (requested_at_ms, finished_at_ms, api_key_id, model, \
                     reasoning_effort, api_protocol, transport, duration_ms, status, http_status) \
@@ -377,16 +328,8 @@ impl Store {
         status: FinalStatus,
         http_status: Option<u16>,
         usage: Option<BillableUsage>,
-    ) -> Result<(), StoreError> {
-        let requested_at_ms: i64 = sqlx::query_scalar(
-            "SELECT requested_at_ms FROM request_ledger WHERE id = ? AND status = 'started'",
-        )
-        .bind(request_id.0)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::RequestNotStarted(request_id))?;
-        let finished_at_ms = timestamp_ms(self.clock.now().to_offset(UtcOffset::UTC))?;
-        let duration_ms = finished_at_ms.saturating_sub(requested_at_ms).max(0);
+    ) -> anyhow::Result<()> {
+        let finished_at_ms = timestamp_ms(self.clock.now().to_offset(UtcOffset::UTC));
 
         let (input_tokens, cached_input_tokens, output_tokens, cost_nano_usd) = match usage {
             None => (None, None, None, None),
@@ -397,10 +340,12 @@ impl Store {
                 Some(calculate_cost_nano_usd(usage)?),
             ),
         };
+        // CAST preserves i64 saturation when SQLite promotes an overflowing duration to REAL.
         let result = sqlx::query(
             "UPDATE request_ledger SET finished_at_ms = ?, input_tokens = ?, \
                     cached_input_tokens = ?, output_tokens = ?, cost_nano_usd = ?, \
-                    duration_ms = ?, status = ?, http_status = ? \
+                    duration_ms = CAST(MAX(0, ? - requested_at_ms) AS INTEGER), \
+                    status = ?, http_status = ? \
              WHERE id = ? AND status = 'started'",
         )
         .bind(finished_at_ms)
@@ -408,23 +353,24 @@ impl Store {
         .bind(cached_input_tokens)
         .bind(output_tokens)
         .bind(cost_nano_usd)
-        .bind(duration_ms)
+        .bind(finished_at_ms)
         .bind(status.as_str())
         .bind(http_status.map(i64::from))
         .bind(request_id.0)
         .execute(&self.pool)
         .await?;
-        if result.rows_affected() != 1 {
-            return Err(StoreError::RequestNotStarted(request_id));
-        }
+        ensure!(
+            result.rows_affected() == 1,
+            "request {request_id:?} is missing or is no longer started"
+        );
         Ok(())
     }
 }
 
 async fn insert_credentials(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    seed: &CredentialSeed,
-) -> Result<(), StoreError> {
+    seed: &Credential,
+) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO credentials (singleton, account_id, access_token, refresh_token, \
                 access_expires_at_ns, last_refresh_ns) VALUES (1, ?, ?, ?, ?, ?)",
@@ -440,37 +386,40 @@ async fn insert_credentials(
 }
 
 async fn update_credentials(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    seed: &CredentialSeed,
-) -> Result<(), StoreError> {
-    sqlx::query(
+    connection: &mut SqliteConnection,
+    credential: &Credential,
+) -> anyhow::Result<()> {
+    let result = sqlx::query(
         "UPDATE credentials SET account_id = ?, access_token = ?, refresh_token = ?, \
                 access_expires_at_ns = ?, last_refresh_ns = ? WHERE singleton = 1",
     )
-    .bind(&seed.account_id)
-    .bind(&seed.access_token)
-    .bind(&seed.refresh_token)
-    .bind(optional_timestamp_ns(seed.access_expires_at)?)
-    .bind(timestamp_ns(seed.last_refresh)?)
-    .execute(&mut **transaction)
+    .bind(&credential.account_id)
+    .bind(&credential.access_token)
+    .bind(&credential.refresh_token)
+    .bind(optional_timestamp_ns(credential.access_expires_at)?)
+    .bind(timestamp_ns(credential.last_refresh)?)
+    .execute(connection)
     .await?;
+    ensure!(
+        result.rows_affected() == 1,
+        "credential state has not been initialized"
+    );
     Ok(())
 }
 
-fn credential_from_row(row: &SqliteRow) -> Result<Credential, StoreError> {
+fn credential_from_row(row: &SqliteRow) -> anyhow::Result<Credential> {
     Ok(Credential {
         account_id: row.try_get("account_id")?,
         access_token: row.try_get("access_token")?,
         refresh_token: row.try_get("refresh_token")?,
         access_expires_at: row
             .try_get::<Option<i64>, _>("access_expires_at_ns")?
-            .map(offset_from_ns)
-            .transpose()?,
-        last_refresh: offset_from_ns(row.try_get("last_refresh_ns")?)?,
+            .map(offset_from_ns),
+        last_refresh: offset_from_ns(row.try_get("last_refresh_ns")?),
     })
 }
 
-fn prepare_state_file(path: &Path, file_mode: u32) -> Result<(), StoreError> {
+fn prepare_state_file(path: &Path, file_mode: u32) -> anyhow::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -498,18 +447,29 @@ fn prepare_state_file(path: &Path, file_mode: u32) -> Result<(), StoreError> {
     }
 }
 
-fn spend_meets_limit(
+fn quota_access(
     spent_nano_usd: Decimal,
-    limit_usd: Option<Decimal>,
-) -> Result<bool, StoreError> {
-    match limit_usd {
-        None => Ok(false),
-        Some(limit) => {
-            let limit_nano_usd = limit
-                .checked_mul(Decimal::from(1_000_000_000_u64))
-                .ok_or(StoreError::CostOutOfRange)?;
-            Ok(spent_nano_usd >= limit_nano_usd)
-        }
+    quota: Option<QuotaLimits>,
+    has_fallback: bool,
+) -> anyhow::Result<ModelAccess> {
+    let Some(quota) = quota else {
+        return Ok(ModelAccess::All);
+    };
+    let nano_usd = Decimal::from(1_000_000_000_u64);
+    let hard = quota
+        .hard_limit_usd
+        .checked_mul(nano_usd)
+        .context("calculated request cost is outside SQLite's supported range")?;
+    let soft = quota
+        .weekly_limit_usd
+        .checked_mul(nano_usd)
+        .context("calculated request cost is outside SQLite's supported range")?;
+    if spent_nano_usd >= hard || (spent_nano_usd >= soft && !has_fallback) {
+        Ok(ModelAccess::Blocked)
+    } else if spent_nano_usd >= soft {
+        Ok(ModelAccess::FallbackOnly)
+    } else {
+        Ok(ModelAccess::All)
     }
 }
 
@@ -521,10 +481,7 @@ fn monday_start(now: OffsetDateTime) -> OffsetDateTime {
         .assume_utc()
 }
 
-fn calculate_cost_nano_usd(usage: BillableUsage) -> Result<i64, StoreError> {
-    if usage.cached_input_tokens > usage.input_tokens {
-        return Err(StoreError::InvalidUsage);
-    }
+fn calculate_cost_nano_usd(usage: BillableUsage) -> anyhow::Result<i64> {
     let uncached = Decimal::from(usage.input_tokens - usage.cached_input_tokens);
     let cached = Decimal::from(usage.cached_input_tokens);
     let output = Decimal::from(usage.output_tokens);
@@ -541,53 +498,30 @@ fn calculate_cost_nano_usd(usage: BillableUsage) -> Result<i64, StoreError> {
                 .and_then(|output_cost| value.checked_add(output_cost))
         })
         .and_then(|value| value.checked_mul(Decimal::from(1_000_u64)))
-        .ok_or(StoreError::CostOutOfRange)?;
+        .context("calculated request cost is outside SQLite's supported range")?;
     weighted
         .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
         .to_i64()
-        .ok_or(StoreError::CostOutOfRange)
+        .context("calculated request cost is outside SQLite's supported range")
 }
 
-fn token_count(value: u64) -> Result<i64, StoreError> {
-    i64::try_from(value).map_err(|_| StoreError::UsageOutOfRange)
+fn token_count(value: u64) -> anyhow::Result<i64> {
+    i64::try_from(value).context("token usage is outside SQLite's supported range")
 }
 
-fn optional_timestamp_ns(value: Option<OffsetDateTime>) -> Result<Option<i64>, StoreError> {
+fn optional_timestamp_ns(value: Option<OffsetDateTime>) -> anyhow::Result<Option<i64>> {
     value.map(timestamp_ns).transpose()
 }
 
-fn timestamp_ns(value: OffsetDateTime) -> Result<i64, StoreError> {
-    i64::try_from(value.unix_timestamp_nanos()).map_err(|_| StoreError::TimestampOutOfRange)
+fn timestamp_ns(value: OffsetDateTime) -> anyhow::Result<i64> {
+    i64::try_from(value.unix_timestamp_nanos())
+        .context("timestamp is outside SQLite's supported range")
 }
 
-fn timestamp_ms(value: OffsetDateTime) -> Result<i64, StoreError> {
-    i64::try_from(value.unix_timestamp_nanos().div_euclid(1_000_000))
-        .map_err(|_| StoreError::TimestampOutOfRange)
+fn timestamp_ms(value: OffsetDateTime) -> i64 {
+    value.unix_timestamp() * 1_000 + i64::from(value.millisecond())
 }
 
-fn offset_from_ns(value: i64) -> Result<OffsetDateTime, StoreError> {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(value))
-        .map_err(|_| StoreError::TimestampOutOfRange)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum StoreError {
-    #[error("failed to access SQLite state file")]
-    Io(#[from] std::io::Error),
-    #[error("SQLite state operation failed")]
-    Database(#[from] sqlx::Error),
-    #[error("SQLite state migration failed")]
-    Migration(#[from] MigrateError),
-    #[error("credential state has not been initialized")]
-    CredentialsNotInitialized,
-    #[error("request {0:?} is missing or is no longer started")]
-    RequestNotStarted(RequestId),
-    #[error("token usage is invalid")]
-    InvalidUsage,
-    #[error("token usage is outside SQLite's supported range")]
-    UsageOutOfRange,
-    #[error("calculated request cost is outside SQLite's supported range")]
-    CostOutOfRange,
-    #[error("timestamp is outside SQLite's supported range")]
-    TimestampOutOfRange,
+fn offset_from_ns(value: i64) -> OffsetDateTime {
+    OffsetDateTime::UNIX_EPOCH + Duration::nanoseconds(value)
 }

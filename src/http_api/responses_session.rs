@@ -78,8 +78,7 @@ struct Cache {
 struct Entry {
     id: u64,
     sender: mpsc::Sender<Job>,
-    busy: bool,
-    last_used: Instant,
+    idle_since: Option<Instant>,
     bytes: usize,
 }
 
@@ -118,10 +117,10 @@ impl ResponsesSessions {
         let target = {
             let mut cache = self.0.lock().expect("Responses session cache poisoned");
             if let Some(entry) = key.as_ref().and_then(|key| cache.entries.get_mut(key)) {
-                if entry.busy {
+                if entry.idle_since.is_none() {
                     Err(ApiError::session_busy())
                 } else {
-                    entry.busy = true;
+                    entry.idle_since = None;
                     Ok(entry.sender.clone())
                 }
             } else {
@@ -134,8 +133,7 @@ impl ResponsesSessions {
                         Entry {
                             id,
                             sender: sender.clone(),
-                            busy: true,
-                            last_used: Instant::now(),
+                            idle_since: None,
                             bytes: 0,
                         },
                     );
@@ -149,7 +147,6 @@ impl ResponsesSessions {
                         request_key: job.turn.request_key.clone(),
                         upstream: None,
                         handshake_headers: HeaderMap::new(),
-                        upstream_response_id: None,
                         snapshot: None,
                         bytes: 0,
                     }
@@ -162,7 +159,7 @@ impl ResponsesSessions {
             Err(error) => {
                 job.turn
                     .pending
-                    .finish(FinalStatus::Rejected, Some(error.status), None)
+                    .finish(FinalStatus::Rejected, Some(error.status))
                     .await?;
                 return Err(error);
             }
@@ -171,11 +168,7 @@ impl ResponsesSessions {
                     job = error.into_inner();
                     job.turn
                         .pending
-                        .finish(
-                            FinalStatus::Canceled,
-                            Some(StatusCode::SERVICE_UNAVAILABLE),
-                            None,
-                        )
+                        .finish(FinalStatus::Canceled, Some(StatusCode::SERVICE_UNAVAILABLE))
                         .await?;
                     return Err(ApiError::shutdown());
                 }
@@ -191,13 +184,16 @@ impl ResponsesSessions {
             return;
         }
         if let Some(entry) = cache.entries.get_mut(key).filter(|entry| entry.id == id) {
-            entry.busy = false;
-            entry.last_used = Instant::now();
+            entry.idle_since = Some(Instant::now());
             entry.bytes = bytes;
         }
         // Active turns cannot be evicted. Once they finish, their snapshots join this budget.
         loop {
-            let idle = cache.entries.values().filter(|entry| !entry.busy).count();
+            let idle = cache
+                .entries
+                .values()
+                .filter(|entry| entry.idle_since.is_some())
+                .count();
             let bytes: usize = cache.entries.values().map(|entry| entry.bytes).sum();
             if idle <= MAX_IDLE_SESSIONS && bytes <= MAX_CONTEXT_BYTES {
                 break;
@@ -205,8 +201,8 @@ impl ResponsesSessions {
             let oldest = cache
                 .entries
                 .iter()
-                .filter(|(_, entry)| !entry.busy)
-                .min_by_key(|(_, entry)| entry.last_used)
+                .filter_map(|(key, entry)| entry.idle_since.map(|since| (key, since)))
+                .min_by_key(|(_, since)| *since)
                 .map(|(key, _)| key.clone());
             let Some(oldest) = oldest else { break };
             cache.entries.remove(&oldest);
@@ -216,7 +212,7 @@ impl ResponsesSessions {
     fn remove_idle(&self, key: &SessionKey, id: u64) -> bool {
         let mut cache = self.0.lock().expect("Responses session cache poisoned");
         match cache.entries.get(key) {
-            Some(entry) if entry.id == id && entry.busy => false,
+            Some(entry) if entry.id == id && entry.idle_since.is_none() => false,
             Some(entry) if entry.id == id => {
                 cache.entries.remove(key);
                 true
@@ -242,7 +238,6 @@ struct Session {
     request_key: String,
     upstream: Option<UpstreamWebSocket>,
     handshake_headers: HeaderMap,
-    upstream_response_id: Option<String>,
     snapshot: Option<Snapshot>,
     bytes: usize,
 }
@@ -334,11 +329,7 @@ impl Session {
                 } else {
                     FinalStatus::UpstreamError
                 };
-                let _ = job
-                    .turn
-                    .pending
-                    .finish(status, Some(error.status), None)
-                    .await;
+                let _ = job.turn.pending.finish(status, Some(error.status)).await;
                 return TurnEnd::Error {
                     reply: job.reply,
                     error,
@@ -346,7 +337,7 @@ impl Session {
             }
         };
         let (sender, receiver) = mpsc::channel(16);
-        job.turn.pending.response_started(StatusCode::OK);
+        job.turn.pending.response_started();
         if job.reply.send(Ok(receiver)).is_err() {
             self.upstream = None;
             return TurnEnd::Canceled;
@@ -360,7 +351,6 @@ impl Session {
             job.turn.rates,
             self.upstream.as_mut().expect("prepared connection"),
             &sender,
-            shutdown.clone(),
             ) => terminal,
         };
         let Some((terminal, bytes)) = terminal else {
@@ -398,7 +388,6 @@ impl Session {
             self.bytes = serde_json::to_vec(&snapshot)
                 .expect("JSON snapshot serializes")
                 .len();
-            self.upstream_response_id = Some(snapshot.response_id.clone());
             self.snapshot = Some(snapshot);
         } else {
             self.upstream = None;
@@ -407,9 +396,14 @@ impl Session {
     }
 
     async fn prepare(&mut self, turn: &mut Turn) -> Result<(Vec<Value>, Value), ApiError> {
-        let previous_id = match turn.body.get("previous_response_id") {
+        let previous_id = match turn
+            .body
+            .as_object_mut()
+            .expect("normalized object")
+            .remove("previous_response_id")
+        {
             None | Some(Value::Null) => None,
-            Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+            Some(Value::String(id)) if !id.is_empty() => Some(id),
             _ => {
                 return Err(ApiError::invalid(
                     "previous_response_id",
@@ -440,10 +434,6 @@ impl Session {
             history.append(&mut input);
             input = history;
         }
-        turn.body
-            .as_object_mut()
-            .expect("normalized object")
-            .remove("previous_response_id");
         let mut headers = codex_request_headers(&turn.headers, &turn.body);
         let metadata = turn
             .body
@@ -475,11 +465,16 @@ impl Session {
                 }
             }
         }
-        let mut prewarm = responses_lite_prewarm(&mut turn.body, &turn.model, &self.request_key)
+        let prewarm = responses_lite_prewarm(&mut turn.body, &turn.model, &self.request_key)
             .map_err(|_| ApiError::gateway("Failed to prepare the upstream Responses session"))?;
-        let mut properties = turn.body.as_object().expect("normalized object").clone();
-        properties.remove("input");
-        properties.remove("client_metadata");
+        let properties: serde_json::Map<String, Value> = turn
+            .body
+            .as_object()
+            .expect("normalized object")
+            .iter()
+            .filter(|(name, _)| !matches!(name.as_str(), "input" | "client_metadata"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
         let parameters = json!([properties, prewarm["input"]]);
         let connection_reused = self.upstream.is_some() && self.handshake_headers == headers;
         if !connection_reused {
@@ -493,10 +488,9 @@ impl Session {
                 .map_err(|_| ApiError::gateway("Failed to connect to the upstream WebSocket"))?,
             );
             self.handshake_headers = headers;
-            self.upstream_response_id = None;
         }
         let incremental = self.snapshot.as_ref().filter(|snapshot| {
-            self.upstream_response_id.as_ref() == Some(&snapshot.response_id)
+            connection_reused
                 && snapshot.parameters == parameters
                 && input.starts_with(&snapshot.input)
         });
@@ -506,11 +500,6 @@ impl Session {
             turn.body["input"] = Value::Array(input[snapshot.input.len()..].to_vec());
         } else {
             // A fresh warmup starts a new context even if the transport is still healthy.
-            prewarm
-                .as_object_mut()
-                .expect("prewarm object")
-                .remove("previous_response_id");
-            self.upstream_response_id = None;
             let response_id =
                 send_responses_prewarm(self.upstream.as_mut().expect("connected socket"), &prewarm)
                     .await
@@ -555,8 +544,8 @@ mod tests {
                     Entry {
                         id: id as u64,
                         sender: mpsc::channel(1).0,
-                        busy: id != 1,
-                        last_used: Instant::now() - Duration::from_secs(3 - id as u64),
+                        idle_since: (id == 1)
+                            .then(|| Instant::now() - Duration::from_secs(3 - id as u64)),
                         bytes: MAX_CONTEXT_BYTES / 2,
                     },
                 );
@@ -565,9 +554,9 @@ mod tests {
         sessions.ready(&keys[2], 2, MAX_CONTEXT_BYTES / 2);
         let cache = sessions.0.lock().unwrap();
         assert_eq!(cache.entries.len(), 2);
-        assert!(cache.entries[&keys[0]].busy);
+        assert!(cache.entries[&keys[0]].idle_since.is_none());
         assert!(!cache.entries.contains_key(&keys[1]));
-        assert!(!cache.entries[&keys[2]].busy);
+        assert!(cache.entries[&keys[2]].idle_since.is_some());
     }
 
     #[test]
@@ -589,8 +578,7 @@ mod tests {
                     Entry {
                         id: id as u64,
                         sender: mpsc::channel(1).0,
-                        busy: id == 1,
-                        last_used: Instant::now(),
+                        idle_since: (id != 1).then(Instant::now),
                         bytes: 1,
                     },
                 );
@@ -607,10 +595,14 @@ mod tests {
             .entries
             .get_mut(&keys[0])
             .unwrap()
-            .busy = true;
+            .idle_since = None;
         sessions.ready(&keys[0], 99, MAX_CONTEXT_BYTES + 1);
         assert!(sessions.remove_idle(&keys[0], 99));
-        assert!(sessions.0.lock().unwrap().entries[&keys[0]].busy);
+        assert!(
+            sessions.0.lock().unwrap().entries[&keys[0]]
+                .idle_since
+                .is_none()
+        );
         assert!(!sessions.remove_idle(&keys[0], 0));
     }
 }

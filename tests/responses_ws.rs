@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -55,6 +55,7 @@ enum UpstreamCommand {
 struct UpstreamConnection {
     id: usize,
     commands: mpsc::UnboundedSender<UpstreamCommand>,
+    fail_next_prewarm: Arc<AtomicBool>,
 }
 
 impl UpstreamConnection {
@@ -291,11 +292,13 @@ async fn fake_responses_websocket(
 
 async fn run_fake_upstream(mut socket: WebSocket, state: FakeUpstreamState, connection_id: usize) {
     let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+    let fail_next_prewarm = Arc::new(AtomicBool::new(false));
     if state
         .events
         .send(UpstreamEvent::Connected(UpstreamConnection {
             id: connection_id,
             commands: commands_tx,
+            fail_next_prewarm: Arc::clone(&fail_next_prewarm),
         }))
         .is_err()
     {
@@ -312,7 +315,7 @@ async fn run_fake_upstream(mut socket: WebSocket, state: FakeUpstreamState, conn
                             .and_then(|value| value.get("generate").and_then(Value::as_bool))
                             == Some(false)
                         {
-                            let prewarm = json!({
+                            let mut prewarm = json!({
                                 "type": "response.completed",
                                 "response": {
                                     "id": "resp-prewarm",
@@ -327,6 +330,9 @@ async fn run_fake_upstream(mut socket: WebSocket, state: FakeUpstreamState, conn
                                     }
                                 }
                             });
+                            if fail_next_prewarm.swap(false, Ordering::SeqCst) {
+                                prewarm = json!({"type": "error", "error": {"code": "prewarm_failed"}});
+                            }
                             if socket
                                 .send(AxumMessage::Text(prewarm.to_string().into()))
                                 .await
@@ -1469,6 +1475,56 @@ async fn cached_tokens_above_input_tokens_fail_before_accounting_and_finalize_up
         vec![("upstream_error".to_string(), "websocket".to_string(), true)]
     );
     assert_only_request_log_has_no_usage_or_cost(&relay.database_path).await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prewarm_failure_finalizes_the_request_and_releases_its_concurrency_slot() {
+    let mut upstream = FakeUpstream::start(None, "unused-refresh-token").await;
+    let relay = RelayProcess::start(
+        &upstream,
+        RelayOptions {
+            max_concurrent_requests: Some(1),
+            ..RelayOptions::enabled()
+        },
+    )
+    .await;
+    let authorization = format!("Bearer {CLIENT_KEY}");
+    let mut first = connect_downstream(&relay.websocket_url(), Some(&authorization))
+        .await
+        .expect("upgrade failing downstream socket");
+    let _ = upstream.expect_handshake().await;
+    let first_connection = upstream.expect_connection().await;
+    let mut second = connect_downstream(&relay.websocket_url(), Some(&authorization))
+        .await
+        .expect("upgrade next downstream socket");
+    let _ = upstream.expect_handshake().await;
+    let second_connection = upstream.expect_connection().await;
+
+    first_connection
+        .fail_next_prewarm
+        .store(true, Ordering::SeqCst);
+    send_json(&mut first, &response_create("fail during prewarm", None)).await;
+    assert_eq!(receive_close(&mut first).await.code, CloseCode::Error);
+    assert_eq!(
+        request_log_rows(&relay.database_path, 1).await,
+        vec![("upstream_error".to_owned(), "websocket".to_owned(), true)]
+    );
+    assert_only_request_log_has_no_usage_or_cost(&relay.database_path).await;
+
+    send_json(&mut second, &response_create("slot released", None)).await;
+    let request = upstream.expect_text(second_connection.id).await;
+    assert_eq!(request["input"][0]["content"][0]["text"], "slot released");
+    let terminal = response_completed("resp-after-prewarm-failure", 1, 0, 1);
+    second_connection.send_json(terminal.clone());
+    assert_eq!(receive_json(&mut second).await, terminal);
+    assert_eq!(
+        request_log_rows(&relay.database_path, 2).await,
+        vec![
+            ("upstream_error".to_owned(), "websocket".to_owned(), true),
+            ("completed".to_owned(), "websocket".to_owned(), true),
+        ]
+    );
     relay.stop().await;
 }
 

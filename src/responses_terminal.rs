@@ -1,7 +1,6 @@
 //! Terminal Responses validation and client-facing capacity retry advice.
 
 use serde_json::Value;
-use thiserror::Error;
 
 /// Terminal Responses event types understood by the relay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,21 +94,20 @@ impl TerminalEvent {
             })
             .unwrap_or_else(|| Value::String("30".to_owned()));
 
-        let mut error = error.clone();
-        let mut headers = error["headers"].as_object().cloned().unwrap_or_default();
-        headers.retain(|name, _| !name.eq_ignore_ascii_case("retry-after"));
-        headers.insert("Retry-After".to_owned(), retry_after);
-        error["headers"] = Value::Object(headers);
-
         let mut payload = self.payload.clone();
         if self.kind == TerminalKind::Error {
             // A bare `error` without an HTTP status is otherwise ignored by Codex.
-            payload.as_object_mut()?.remove("error");
+            let error = payload.as_object_mut()?.remove("error")?;
             payload["type"] = Value::String("response.failed".to_owned());
             payload["response"] = serde_json::json!({"status": "failed", "error": error});
-        } else {
-            payload["response"]["error"] = error;
         }
+        let headers = &mut payload["response"]["error"]["headers"];
+        if !headers.is_object() {
+            *headers = serde_json::json!({});
+        }
+        let headers = headers.as_object_mut()?;
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("retry-after"));
+        headers.insert("Retry-After".to_owned(), retry_after);
         Some(payload)
     }
 }
@@ -124,35 +122,8 @@ pub(crate) struct Usage {
     pub(crate) total_tokens: u64,
 }
 
-/// A terminal Responses payload violated the upstream wire contract.
-#[derive(Debug, Error)]
-pub(crate) enum ProtocolError {
-    #[error("terminal Responses event `{event}` has invalid `{field}`; expected {expected}")]
-    InvalidTerminalField {
-        event: &'static str,
-        field: &'static str,
-        expected: &'static str,
-    },
-    #[error(
-        "terminal Responses event `{event}` has response status `{actual}`; expected `{expected}`"
-    )]
-    TerminalStatusMismatch {
-        event: &'static str,
-        actual: String,
-        expected: &'static str,
-    },
-    #[error(
-        "terminal Responses event `{event}` reports more cached input tokens than input tokens"
-    )]
-    CachedInputExceedsInput { event: &'static str },
-    #[error("terminal Responses event `{event}` reports more reasoning tokens than output tokens")]
-    ReasoningExceedsOutput { event: &'static str },
-}
-
 /// Classifies and validates one already-decoded Responses event payload.
-pub(crate) fn parse_terminal_payload(
-    payload: Value,
-) -> Result<Option<TerminalEvent>, ProtocolError> {
+pub(crate) fn parse_terminal_payload(payload: Value) -> Result<Option<TerminalEvent>, ()> {
     let Some(kind) = payload
         .get("type")
         .and_then(Value::as_str)
@@ -188,30 +159,12 @@ pub(crate) fn parse_terminal_payload(
         }));
     }
 
-    let response = payload
-        .get("response")
-        .filter(|value| value.is_object())
-        .ok_or(ProtocolError::InvalidTerminalField {
-            event: kind.event_name(),
-            field: "response",
-            expected: "an object",
-        })?;
+    let response = payload.get("response").ok_or(())?;
     let expected_status = kind
         .response_status()
         .expect("only response terminal kinds reach status validation");
-    let status = response.get("status").and_then(Value::as_str).ok_or(
-        ProtocolError::InvalidTerminalField {
-            event: kind.event_name(),
-            field: "response.status",
-            expected: "a string",
-        },
-    )?;
-    if status != expected_status {
-        return Err(ProtocolError::TerminalStatusMismatch {
-            event: kind.event_name(),
-            actual: status.to_owned(),
-            expected: expected_status,
-        });
+    if response.get("status").and_then(Value::as_str) != Some(expected_status) {
+        return Err(());
     }
 
     let usage = parse_usage(response, kind)?;
@@ -222,57 +175,26 @@ pub(crate) fn parse_terminal_payload(
     }))
 }
 
-fn parse_usage(response: &Value, kind: TerminalKind) -> Result<Option<Usage>, ProtocolError> {
+fn parse_usage(response: &Value, kind: TerminalKind) -> Result<Option<Usage>, ()> {
     let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) else {
         return match kind {
             TerminalKind::Failed => Ok(None),
-            TerminalKind::Completed | TerminalKind::Incomplete => {
-                Err(ProtocolError::InvalidTerminalField {
-                    event: kind.event_name(),
-                    field: "response.usage",
-                    expected: "an object",
-                })
-            }
+            TerminalKind::Completed | TerminalKind::Incomplete => Err(()),
             TerminalKind::Error => unreachable!("error events do not contain response usage"),
         };
     };
-    if !usage.is_object() {
-        return Err(ProtocolError::InvalidTerminalField {
-            event: kind.event_name(),
-            field: "response.usage",
-            expected: "an object or null",
-        });
-    }
 
-    let input_tokens = required_u64(usage, "input_tokens", "response.usage.input_tokens", kind)?;
-    let output_tokens = required_u64(usage, "output_tokens", "response.usage.output_tokens", kind)?;
-    let total_tokens = required_u64(usage, "total_tokens", "response.usage.total_tokens", kind)?;
-    let cached_input_tokens = optional_detail_u64(
-        usage,
-        "input_tokens_details",
-        "response.usage.input_tokens_details",
-        "cached_tokens",
-        "response.usage.input_tokens_details.cached_tokens",
-        kind,
-    )?;
-    let reasoning_tokens = optional_detail_u64(
-        usage,
-        "output_tokens_details",
-        "response.usage.output_tokens_details",
-        "reasoning_tokens",
-        "response.usage.output_tokens_details.reasoning_tokens",
-        kind,
-    )?;
+    let input_tokens = required_u64(usage, "input_tokens")?;
+    let output_tokens = required_u64(usage, "output_tokens")?;
+    let total_tokens = required_u64(usage, "total_tokens")?;
+    let cached_input_tokens = optional_detail_u64(usage, "input_tokens_details", "cached_tokens")?;
+    let reasoning_tokens = optional_detail_u64(usage, "output_tokens_details", "reasoning_tokens")?;
 
     if cached_input_tokens > input_tokens {
-        return Err(ProtocolError::CachedInputExceedsInput {
-            event: kind.event_name(),
-        });
+        return Err(());
     }
     if reasoning_tokens > output_tokens {
-        return Err(ProtocolError::ReasoningExceedsOutput {
-            event: kind.event_name(),
-        });
+        return Err(());
     }
     Ok(Some(Usage {
         input_tokens,
@@ -283,51 +205,22 @@ fn parse_usage(response: &Value, kind: TerminalKind) -> Result<Option<Usage>, Pr
     }))
 }
 
-fn required_u64(
-    object: &Value,
-    field: &'static str,
-    field_path: &'static str,
-    kind: TerminalKind,
-) -> Result<u64, ProtocolError> {
-    object
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or(ProtocolError::InvalidTerminalField {
-            event: kind.event_name(),
-            field: field_path,
-            expected: "a non-negative integer",
-        })
+fn required_u64(object: &Value, field: &str) -> Result<u64, ()> {
+    object.get(field).and_then(Value::as_u64).ok_or(())
 }
 
-fn optional_detail_u64(
-    usage: &Value,
-    details_field: &'static str,
-    details_path: &'static str,
-    token_field: &'static str,
-    token_path: &'static str,
-    kind: TerminalKind,
-) -> Result<u64, ProtocolError> {
+fn optional_detail_u64(usage: &Value, details_field: &str, token_field: &str) -> Result<u64, ()> {
     let Some(details) = usage
         .get(details_field)
         .filter(|details| !details.is_null())
     else {
         return Ok(0);
     };
-    let details = details
-        .as_object()
-        .ok_or(ProtocolError::InvalidTerminalField {
-            event: kind.event_name(),
-            field: details_path,
-            expected: "an object",
-        })?;
+    let details = details.as_object().ok_or(())?;
     let Some(value) = details.get(token_field) else {
         return Ok(0);
     };
-    value.as_u64().ok_or(ProtocolError::InvalidTerminalField {
-        event: kind.event_name(),
-        field: token_path,
-        expected: "a non-negative integer",
-    })
+    value.as_u64().ok_or(())
 }
 
 #[cfg(test)]

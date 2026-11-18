@@ -533,9 +533,12 @@ async fn chat_completions_forwards_the_codex_header_allowlist() {
 
 #[tokio::test]
 async fn reasoning_effort_accepts_null_and_caps_high_levels() {
+    let efforts = [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ];
     let upstream = ScriptedUpstream::start(
-        ["null", "medium", "xhigh", "max", "ultra"]
-            .into_iter()
+        std::iter::once("null")
+            .chain(efforts)
             .map(|effort| {
                 UpstreamReply::events(vec![completed_event(
                     &format!("resp_{effort}_reasoning"),
@@ -552,7 +555,7 @@ async fn reasoning_effort_accepts_null_and_caps_high_levels() {
     let (status, body) = response_json(relay.post(&omitted).await).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    for effort in ["medium", "xhigh", "max", "ultra"] {
+    for effort in efforts {
         let mut request = minimal_request();
         request["reasoning_effort"] = json!(effort);
         let (status, body) = response_json(relay.post(&request).await).await;
@@ -560,11 +563,14 @@ async fn reasoning_effort_accepts_null_and_caps_high_levels() {
     }
 
     let sent = upstream.requests().await;
-    assert_eq!(sent.len(), 5);
+    assert_eq!(sent.len(), 9);
     assert!(sent[0].get("reasoning").is_none());
-    assert_eq!(sent[1]["reasoning"], json!({"effort": "medium"}));
-    for request in &sent[2..] {
-        assert_eq!(request["reasoning"], json!({"effort": "high"}));
+    for (request, effort) in sent[1..].iter().zip(efforts) {
+        let effective = match effort {
+            "xhigh" | "max" | "ultra" => "high",
+            effort => effort,
+        };
+        assert_eq!(request["reasoning"], json!({"effort": effective}));
     }
 
     let mut database = relay.database().await;
@@ -574,6 +580,15 @@ async fn reasoning_effort_accepts_null_and_caps_high_levels() {
             .await
             .unwrap();
     assert_eq!(logged, "high");
+
+    for invalid in [json!("extreme"), json!(7)] {
+        let mut request = minimal_request();
+        request["reasoning_effort"] = invalid;
+        let (status, body) = response_json(relay.post(&request).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["error"]["param"], "reasoning_effort");
+    }
+    assert_eq!(upstream.request_count(), 9);
 }
 
 #[tokio::test]
@@ -1034,26 +1049,53 @@ async fn maps_responses_function_calls_to_ordered_chat_tool_calls() {
 
 #[tokio::test]
 async fn maps_supported_incomplete_reasons_to_chat_finish_reasons() {
-    let upstream = ScriptedUpstream::start(vec![
-        UpstreamReply::events(vec![incomplete_event(
-            "resp_length",
-            "max_output_tokens",
-            text_output("truncated"),
-        )]),
-        UpstreamReply::events(vec![incomplete_event(
-            "resp_filter",
-            "content_filter",
-            text_output("filtered"),
-        )]),
-    ])
-    .await;
+    let replies = ["max_output_tokens", "content_filter"]
+        .into_iter()
+        .flat_map(|reason| {
+            (0..2).map(move |_| {
+                UpstreamReply::events(vec![incomplete_event(
+                    "resp_incomplete",
+                    reason,
+                    text_output("partial"),
+                )])
+            })
+        })
+        .collect();
+    let upstream = ScriptedUpstream::start(replies).await;
     let relay = TestRelay::start(&upstream).await;
 
     for expected in ["length", "content_filter"] {
-        let (status, body) = response_json(relay.post(&minimal_request()).await).await;
-        assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert_eq!(body["choices"][0]["finish_reason"], expected);
-        assert_eq!(body["usage"]["total_tokens"], 21);
+        for stream in [false, true] {
+            let mut request = minimal_request();
+            request["stream"] = json!(stream);
+            if stream {
+                request["stream_options"] = json!({"include_usage": true});
+            }
+            let response = relay.post(&request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let body = response.text().await.unwrap();
+                assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+                let chunks: Vec<Value> = body
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                assert_eq!(chunks[0]["choices"][0]["finish_reason"], expected);
+                assert_eq!(chunks[1]["usage"]["total_tokens"], 21);
+            } else {
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["choices"][0]["finish_reason"], expected);
+                assert_eq!(body["usage"]["total_tokens"], 21);
+            }
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM request_logs ORDER BY id DESC LIMIT 1")
+                    .fetch_one(&mut relay.database().await)
+                    .await
+                    .unwrap();
+            assert_eq!(status, "incomplete");
+        }
     }
 }
 
@@ -1319,7 +1361,7 @@ async fn downstream_disconnect_after_chat_eof_preserves_upstream_error() {
 }
 
 #[tokio::test]
-async fn unaccountable_chat_terminal_returns_and_records_bad_gateway() {
+async fn unaccountable_chat_terminal_withholds_completion_and_records_upstream_error() {
     let unaccountable_tokens = i64::MAX as u64 + 1;
     let mut terminal = completed_event("resp_unaccountable", text_output("complete"));
     terminal["response"]["usage"] = json!({
@@ -1329,26 +1371,43 @@ async fn unaccountable_chat_terminal_returns_and_records_bad_gateway() {
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": unaccountable_tokens
     });
-    let upstream = ScriptedUpstream::start(vec![UpstreamReply::events(vec![terminal])]).await;
+    let upstream = ScriptedUpstream::start(vec![
+        UpstreamReply::events(vec![terminal.clone()]),
+        UpstreamReply::events(vec![terminal]),
+    ])
+    .await;
     let relay = TestRelay::start(&upstream).await;
 
-    let (status, body) = response_json(relay.post(&minimal_request()).await).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+    for stream in [false, true] {
+        let mut request = minimal_request();
+        request["stream"] = json!(stream);
+        let response = relay.post(&request).await;
+        if stream {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.text().await.unwrap().is_empty());
+        } else {
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+        }
 
-    let mut database = relay.database().await;
-    let row = sqlx::query(
-        "SELECT status, http_status, input_tokens, cached_input_tokens, output_tokens, cost_usd \
-         FROM request_logs ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_one(&mut database)
-    .await
-    .expect("read unaccountable Chat request log");
-    assert_eq!(row.get::<String, _>("status"), "upstream_error");
-    assert_eq!(row.get::<i64, _>("http_status"), 502);
-    assert_eq!(row.get::<Option<i64>, _>("input_tokens"), None);
-    assert_eq!(row.get::<Option<i64>, _>("cached_input_tokens"), None);
-    assert_eq!(row.get::<Option<i64>, _>("output_tokens"), None);
-    assert_eq!(row.get::<Option<String>, _>("cost_usd"), None);
+        let mut database = relay.database().await;
+        let row = sqlx::query(
+            "SELECT status, http_status, input_tokens, cached_input_tokens, output_tokens, cost_usd \
+             FROM request_logs ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&mut database)
+        .await
+        .expect("read unaccountable Chat request log");
+        assert_eq!(row.get::<String, _>("status"), "upstream_error");
+        assert_eq!(
+            row.get::<i64, _>("http_status"),
+            if stream { 200 } else { 502 }
+        );
+        assert_eq!(row.get::<Option<i64>, _>("input_tokens"), None);
+        assert_eq!(row.get::<Option<i64>, _>("cached_input_tokens"), None);
+        assert_eq!(row.get::<Option<i64>, _>("output_tokens"), None);
+        assert_eq!(row.get::<Option<String>, _>("cost_usd"), None);
+    }
 }
 
 #[tokio::test]
@@ -1365,12 +1424,18 @@ async fn preserves_upstream_capacity_errors_in_json_and_streaming_chat() {
             "type": "response.failed",
             "response": {"id": "resp_capacity", "status": "failed", "error": error}
         }),
+        json!({
+            "type": "response.failed",
+            "response": {"id": "resp_capacity_unaccountable", "status": "failed", "error": error,
+                "usage": {"input_tokens": i64::MAX as u64 + 1, "output_tokens": 0,
+                    "total_tokens": i64::MAX as u64 + 1}}
+        }),
     ];
     let upstream = ScriptedUpstream::start(
         events
             .iter()
             .cycle()
-            .take(4)
+            .take(events.len() * 2)
             .map(|event| UpstreamReply::events(vec![event.clone()]))
             .collect(),
     )
@@ -1406,17 +1471,20 @@ async fn preserves_upstream_capacity_errors_in_json_and_streaming_chat() {
         .fetch_all(&mut database)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), events.len() * 2);
     for (index, row) in rows.iter().enumerate() {
         assert_eq!(row.get::<String, _>("status"), "upstream_error");
         assert_eq!(
             row.get::<i64, _>("http_status"),
-            if index < 2 { 502 } else { 200 }
+            if index < events.len() { 502 } else { 200 }
         );
         assert_eq!(row.get::<Option<String>, _>("cost_usd"), None);
     }
     let log = std::fs::read_to_string(relay._directory.path().join("relay.log")).unwrap();
-    assert_eq!(log.matches("Upstream Responses request failed").count(), 4);
+    assert_eq!(
+        log.matches("Upstream Responses request failed").count(),
+        events.len() * 2
+    );
     assert!(log.contains("server_is_overloaded"));
     assert!(log.contains("Our servers are currently overloaded"));
     assert!(!log.contains(API_KEY));
@@ -1501,6 +1569,90 @@ async fn rejects_missing_malformed_or_unusable_terminal_responses() {
         assert_gateway_error(relay.post(&minimal_request()).await).await;
     }
     assert_eq!(upstream.request_count(), 5);
+}
+
+#[tokio::test]
+async fn validates_sse_terminal_names_and_types_in_both_chat_modes() {
+    let terminal = completed_event("resp_sse", text_output("done"));
+    let multiline = serde_json::to_string_pretty(&terminal)
+        .unwrap()
+        .replace('\n', "\r\ndata: ");
+    let cases = [
+        (format!("data: {terminal}\n\n"), true),
+        (
+            format!(
+                "event: progress\ndata: not-json\n\n{}",
+                sse_event(&terminal)
+            ),
+            true,
+        ),
+        (
+            format!(": comment\r\nid: 7\r\nretry: 100\r\ndata: {multiline}\r\n\r\n"),
+            true,
+        ),
+        (
+            format!("event: response.failed\ndata: {terminal}\n\n"),
+            false,
+        ),
+        (
+            format!(
+                "event: response.completed\ndata: {{}}\n\n{}",
+                sse_event(&terminal)
+            ),
+            false,
+        ),
+        (
+            format!(
+                "event: response.completed\ndata: not-json\n\n{}",
+                sse_event(&terminal)
+            ),
+            false,
+        ),
+    ];
+    let upstream = ScriptedUpstream::start(
+        cases
+            .iter()
+            .flat_map(|(data, _)| {
+                (0..2).map(move |_| {
+                    UpstreamReply::Sse(
+                        data.as_bytes()
+                            .chunks(11)
+                            .map(|chunk| SseChunk {
+                                delay: Duration::ZERO,
+                                data: String::from_utf8(chunk.to_vec()).unwrap(),
+                            })
+                            .collect(),
+                    )
+                })
+            })
+            .collect(),
+    )
+    .await;
+    let relay = TestRelay::start(&upstream).await;
+    for (_, valid) in cases {
+        for stream in [false, true] {
+            let mut request = minimal_request();
+            request["stream"] = json!(stream);
+            let response = relay.post(&request).await;
+            if stream {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.text().await.unwrap();
+                assert_eq!(body.ends_with("data: [DONE]\n\n"), valid, "{body}");
+            } else if valid {
+                let (status, body) = response_json(response).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body["choices"][0]["message"]["content"], "done");
+            } else {
+                assert_gateway_error(response).await;
+            }
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM request_logs ORDER BY id DESC LIMIT 1")
+                    .fetch_one(&mut relay.database().await)
+                    .await
+                    .unwrap();
+            assert_eq!(status, if valid { "completed" } else { "upstream_error" });
+        }
+    }
 }
 
 #[tokio::test]

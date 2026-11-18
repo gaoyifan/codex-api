@@ -39,18 +39,17 @@ impl PendingRequest {
         }
     }
 
-    pub(super) fn response_started(&mut self, status: StatusCode) {
+    pub(super) fn response_started(&mut self) {
         self.open
             .as_mut()
             .expect("a finalized request is no longer open")
-            .drop_http_status = Some(status.as_u16());
+            .drop_http_status = Some(StatusCode::OK.as_u16());
     }
 
     pub(super) async fn finish(
         &mut self,
         status: FinalStatus,
         http_status: Option<StatusCode>,
-        usage: Option<BillableUsage>,
     ) -> Result<(), ApiError> {
         let open = self.take_open();
         let store = Arc::clone(&self.store);
@@ -62,7 +61,7 @@ impl PendingRequest {
                     open.request_id,
                     status,
                     http_status.map(|status| status.as_u16()),
-                    usage,
+                    None,
                 )
                 .await
         })

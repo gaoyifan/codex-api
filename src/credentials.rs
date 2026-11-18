@@ -8,12 +8,12 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, watch};
 use tokio_util::task::TaskTracker;
 use url::Url;
 
 use crate::Clock;
-use crate::store::{Credential, CredentialSeed, Store, StoreError};
+use crate::store::{Credential, Store};
 
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const PROACTIVE_REFRESH_WINDOW: Duration = Duration::minutes(5);
@@ -27,27 +27,18 @@ pub(crate) struct CredentialSnapshot {
 }
 
 pub(crate) struct CredentialManager {
-    inner: Arc<CredentialManagerInner>,
-}
-
-struct CredentialManagerInner {
     store: Arc<Store>,
     http: reqwest::Client,
     oauth_token_url: Url,
     clock: Arc<dyn Clock>,
-    state: RwLock<CredentialState>,
-    refresh_flight: Mutex<Option<RefreshFlight>>,
+    state: Mutex<CredentialState>,
     refresh_tasks: TaskTracker,
 }
 
 struct CredentialState {
     credential: Credential,
     generation: u64,
-}
-
-struct RefreshFlight {
-    generation: u64,
-    outcome: watch::Receiver<Option<SharedRefreshOutcome>>,
+    refresh_flight: Option<watch::Receiver<Option<SharedRefreshOutcome>>>,
 }
 
 type SharedRefreshOutcome = Result<CredentialSnapshot, Arc<CredentialError>>;
@@ -64,95 +55,64 @@ impl CredentialManager {
         let credential = store.load_or_import_credentials(&seed).await?;
 
         Ok(Self {
-            inner: Arc::new(CredentialManagerInner {
-                store,
-                http,
-                oauth_token_url,
-                clock,
-                state: RwLock::new(CredentialState {
-                    credential,
-                    generation: 0,
-                }),
-                refresh_flight: Mutex::new(None),
-                refresh_tasks: TaskTracker::new(),
+            store,
+            http,
+            oauth_token_url,
+            clock,
+            state: Mutex::new(CredentialState {
+                credential,
+                generation: 0,
+                refresh_flight: None,
             }),
+            refresh_tasks: TaskTracker::new(),
         })
     }
 
     /// Returns credentials ready for an upstream request, refreshing first when
     /// the access JWT is within the five-minute window or an opaque token has
     /// not been refreshed for more than eight days.
-    pub(crate) async fn credentials(&self) -> Result<CredentialSnapshot, CredentialError> {
-        let (generation, needs_refresh) = {
-            let state = self.inner.state.read().await;
-            (
-                state.generation,
-                credential_needs_refresh(&state.credential, self.inner.clock.now()),
-            )
-        };
-
-        if needs_refresh {
-            self.refresh_generation(generation, RefreshReason::Proactive)
-                .await
-        } else {
-            Ok(self.snapshot().await)
-        }
+    pub(crate) async fn credentials(
+        self: &Arc<Self>,
+    ) -> Result<CredentialSnapshot, CredentialError> {
+        self.refresh_generation(None).await
     }
 
     /// Recovers from a pre-stream upstream 401. If another request has already
     /// refreshed the generation used by the failed request, this returns that
     /// newer generation without exchanging the rotating refresh token again.
     pub(crate) async fn refresh_after_unauthorized(
-        &self,
+        self: &Arc<Self>,
         failed_generation: u64,
     ) -> Result<CredentialSnapshot, CredentialError> {
-        self.refresh_generation(failed_generation, RefreshReason::Unauthorized)
-            .await
+        self.refresh_generation(Some(failed_generation)).await
     }
 
     pub(crate) async fn finish_refreshes(&self) {
-        self.inner.refresh_tasks.close();
-        self.inner.refresh_tasks.wait().await;
-    }
-
-    async fn snapshot(&self) -> CredentialSnapshot {
-        let state = self.inner.state.read().await;
-        snapshot_from_state(&state)
+        self.refresh_tasks.close();
+        self.refresh_tasks.wait().await;
     }
 
     async fn refresh_generation(
-        &self,
-        expected_generation: u64,
-        reason: RefreshReason,
+        self: &Arc<Self>,
+        failed_generation: Option<u64>,
     ) -> Result<CredentialSnapshot, CredentialError> {
         let mut outcome = {
-            let mut flight = self.inner.refresh_flight.lock().await;
-            let state = self.inner.state.read().await;
-            if state.generation != expected_generation {
+            let mut state = self.state.lock().await;
+            let ready = match failed_generation {
+                Some(generation) => state.generation != generation,
+                None => !credential_needs_refresh(&state.credential, self.clock.now()),
+            };
+            if ready {
                 return Ok(snapshot_from_state(&state));
             }
-            if reason == RefreshReason::Proactive
-                && !credential_needs_refresh(&state.credential, self.inner.clock.now())
-            {
-                return Ok(snapshot_from_state(&state));
-            }
-            if let Some(existing) = flight
-                .as_ref()
-                .filter(|existing| existing.generation == expected_generation)
-            {
-                existing.outcome.clone()
+            if let Some(outcome) = &state.refresh_flight {
+                outcome.clone()
             } else {
                 let (sender, receiver) = watch::channel(None);
-                *flight = Some(RefreshFlight {
-                    generation: expected_generation,
-                    outcome: receiver.clone(),
-                });
-                let inner = Arc::clone(&self.inner);
-                self.inner.refresh_tasks.spawn(async move {
-                    let outcome = inner
-                        .perform_refresh(expected_generation)
-                        .await
-                        .map_err(Arc::new);
+                state.refresh_flight = Some(receiver.clone());
+                let manager = Arc::clone(self);
+                self.refresh_tasks.spawn(async move {
+                    let outcome = manager.perform_refresh().await.map_err(Arc::new);
                     let retryable_server_error = matches!(
                         &outcome,
                         Err(error)
@@ -162,13 +122,7 @@ impl CredentialManager {
                             )
                     );
                     if retryable_server_error {
-                        let mut flight = inner.refresh_flight.lock().await;
-                        if flight
-                            .as_ref()
-                            .is_some_and(|flight| flight.generation == expected_generation)
-                        {
-                            *flight = None;
-                        }
+                        manager.state.lock().await.refresh_flight = None;
                     }
                     sender.send_replace(Some(outcome));
                 });
@@ -186,20 +140,9 @@ impl CredentialManager {
                 .map_err(|_| CredentialError::RefreshTaskStopped)?;
         }
     }
-}
 
-impl CredentialManagerInner {
-    async fn perform_refresh(
-        &self,
-        expected_generation: u64,
-    ) -> Result<CredentialSnapshot, CredentialError> {
-        let refresh_token = {
-            let state = self.state.read().await;
-            if state.generation != expected_generation {
-                return Ok(snapshot_from_state(&state));
-            }
-            state.credential.refresh_token.clone()
-        };
+    async fn perform_refresh(&self) -> Result<CredentialSnapshot, CredentialError> {
+        let refresh_token = self.state.lock().await.credential.refresh_token.clone();
 
         let response = self
             .http
@@ -221,11 +164,7 @@ impl CredentialManagerInner {
             .await
             .map_err(CredentialError::OauthResponse)?;
 
-        let mut state = self.state.write().await;
-        if state.generation != expected_generation {
-            return Ok(snapshot_from_state(&state));
-        }
-
+        let mut state = self.state.lock().await;
         let account_id = refreshed
             .id_token
             .as_deref()
@@ -249,14 +188,9 @@ impl CredentialManagerInner {
         self.store.save_credentials(&updated).await?;
         state.credential = updated;
         state.generation += 1;
+        state.refresh_flight = None;
         Ok(snapshot_from_state(&state))
     }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum RefreshReason {
-    Proactive,
-    Unauthorized,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -268,7 +202,7 @@ pub(crate) enum CredentialError {
     #[error("invalid authentication seed")]
     InvalidSeedStructure,
     #[error("failed to load or save credential state")]
-    Store(#[from] StoreError),
+    Store(#[from] anyhow::Error),
     #[error("OAuth token refresh request failed")]
     OauthRequest(#[source] reqwest::Error),
     #[error("OAuth token endpoint returned HTTP {0}")]
@@ -328,7 +262,7 @@ struct AccountClaim {
     chatgpt_account_id: Option<String>,
 }
 
-fn read_auth_seed(path: &Path) -> Result<CredentialSeed, CredentialError> {
+fn read_auth_seed(path: &Path) -> Result<Credential, CredentialError> {
     let contents = std::fs::read(path).map_err(CredentialError::ReadSeed)?;
     let auth: AuthFile = serde_json::from_slice(&contents).map_err(CredentialError::InvalidSeed)?;
 
@@ -351,7 +285,7 @@ fn read_auth_seed(path: &Path) -> Result<CredentialSeed, CredentialError> {
     let last_refresh = OffsetDateTime::parse(&auth.last_refresh, &Rfc3339)
         .map_err(|_| CredentialError::InvalidSeedStructure)?;
 
-    Ok(CredentialSeed {
+    Ok(Credential {
         account_id,
         access_expires_at: access_expiry(&auth.tokens.access_token),
         access_token: auth.tokens.access_token,

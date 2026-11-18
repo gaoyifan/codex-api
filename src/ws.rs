@@ -19,9 +19,11 @@ use crate::responses_terminal::{TerminalEvent, TerminalKind, parse_terminal_payl
 use crate::state::AppState;
 use crate::store::{
     Admission, ApiProtocol, BillableUsage, FinalStatus, ModelCandidates, ModelRates,
-    RequestContext, RequestId, StoreError, Transport,
+    RequestContext, RequestId, Transport,
 };
-use crate::upstream_ws::{UpstreamWebSocket, connect_upstream_websocket, prepare_responses_lite};
+use crate::upstream_ws::{
+    UpstreamWebSocket, connect_upstream_websocket, responses_lite_prewarm, send_responses_prewarm,
+};
 
 struct InFlight {
     request_id: RequestId,
@@ -30,15 +32,10 @@ struct InFlight {
 }
 
 struct WaitingRequest {
-    prepared: PreparedRequest,
+    payload: Value,
+    candidates: ModelCandidates,
     // Preserve FIFO position while the session handles ping, close, and other frames.
     permit: PollSemaphore,
-}
-
-struct PreparedRequest {
-    payload: Value,
-    context: RequestContext,
-    candidates: ModelCandidates,
 }
 
 struct ValidationError {
@@ -99,15 +96,6 @@ struct WsSession {
     waiting: Option<WaitingRequest>,
 }
 
-enum ConnectionEvent {
-    Admitted(OwnedSemaphorePermit),
-    Shutdown,
-    ClientGone,
-    Downstream(DownstreamMessage),
-    UpstreamGone,
-    Upstream(UpstreamMessage),
-}
-
 enum ConnectionEnd {
     Shutdown,
     ClientDisconnect(Option<UpstreamCloseFrame>),
@@ -121,38 +109,29 @@ enum ConnectionEnd {
 impl WsSession {
     async fn run(mut self) {
         loop {
-            let event = tokio::select! {
+            let end = tokio::select! {
                 biased;
-                _ = self.state.shutdown.cancelled() => ConnectionEvent::Shutdown,
+                _ = self.state.shutdown.cancelled() => Some(ConnectionEnd::Shutdown),
                 message = self.downstream.recv() => match message {
-                    Some(Ok(message)) => ConnectionEvent::Downstream(message),
-                    Some(Err(_)) | None => ConnectionEvent::ClientGone,
+                    Some(Ok(message)) => self.handle_downstream(message).await,
+                    Some(Err(_)) | None => Some(ConnectionEnd::ClientDisconnect(None)),
                 },
                 message = self.upstream.next() => match message {
-                    Some(Ok(message)) => ConnectionEvent::Upstream(message),
-                    Some(Err(_)) | None => ConnectionEvent::UpstreamGone,
+                    Some(Ok(message)) => self.handle_upstream(message).await,
+                    Some(Err(_)) | None => Some(ConnectionEnd::UpstreamFailure),
                 },
                 permit = async {
                     match self.waiting.as_mut() {
                         Some(waiting) => waiting.permit.next().await.expect("request semaphores are never closed"),
                         None => std::future::pending().await,
                     }
-                } => ConnectionEvent::Admitted(permit),
-            };
-
-            let end = match event {
-                ConnectionEvent::Admitted(permit) => {
+                } => {
                     let waiting = self
                         .waiting
                         .take()
                         .expect("admission requires a waiting request");
-                    self.start_request(waiting.prepared, Some(permit)).await
-                }
-                ConnectionEvent::Shutdown => Some(ConnectionEnd::Shutdown),
-                ConnectionEvent::ClientGone => Some(ConnectionEnd::ClientDisconnect(None)),
-                ConnectionEvent::Downstream(message) => self.handle_downstream(message).await,
-                ConnectionEvent::UpstreamGone => Some(ConnectionEnd::UpstreamFailure),
-                ConnectionEvent::Upstream(message) => self.handle_upstream(message).await,
+                    self.start_request(waiting.payload, waiting.candidates, Some(permit)).await
+                },
             };
             if let Some(end) = end {
                 self.finish(end).await;
@@ -187,7 +166,7 @@ impl WsSession {
     }
 
     async fn handle_create(&mut self, text: &str) -> Option<ConnectionEnd> {
-        let value = match serde_json::from_str::<Value>(text) {
+        let mut value = match serde_json::from_str::<Value>(text) {
             Ok(value) => value,
             Err(_) => {
                 return self
@@ -202,9 +181,9 @@ impl WsSession {
                     .await;
             }
         };
-        let prepared = match prepare_request(value, &self.state, &self.identity) {
-            Ok(prepared) => prepared,
-            Err((value, validation)) => {
+        let candidates = match prepare_request(&mut value, &self.state) {
+            Ok(candidates) => candidates,
+            Err(validation) => {
                 return self
                     .reject(
                         &value,
@@ -219,10 +198,11 @@ impl WsSession {
         };
 
         if self.active.is_some() || self.waiting.is_some() {
-            return self.start_request(prepared, None).await;
+            return self.start_request(value, candidates, None).await;
         }
         self.waiting = Some(WaitingRequest {
-            prepared,
+            payload: value,
+            candidates,
             permit: PollSemaphore::new(Arc::clone(&self.state.request_limits[&self.identity.id])),
         });
         None
@@ -230,13 +210,19 @@ impl WsSession {
 
     async fn start_request(
         &mut self,
-        mut prepared: PreparedRequest,
+        mut payload: Value,
+        candidates: ModelCandidates,
         permit: Option<OwnedSemaphorePermit>,
     ) -> Option<ConnectionEnd> {
+        let context = RequestContext {
+            api_key_id: self.identity.id.clone(),
+            api_protocol: ApiProtocol::Responses,
+            transport: Transport::WebSocket,
+        };
         let admission = match self
             .state
             .store
-            .begin_request(&prepared.context, self.identity.quota, prepared.candidates)
+            .begin_request(&context, self.identity.quota, candidates)
             .await
         {
             Ok(admission) => admission,
@@ -258,7 +244,7 @@ impl WsSession {
             }
         };
 
-        if self.active.is_some() || self.waiting.is_some() {
+        let Some(permit) = permit else {
             if self
                 .state
                 .store
@@ -275,9 +261,14 @@ impl WsSession {
                     "A response is already in progress on this connection",
                 ))
                 .await;
-        }
+        };
 
-        apply_effective_request(&mut prepared.payload, &effective_model);
+        self.active = Some(InFlight {
+            request_id,
+            rates: effective_model.rates,
+            _permit: permit,
+        });
+        apply_effective_request(&mut payload, &effective_model);
         let model = match self.state.upstream_http.model(&effective_model.model).await {
             Ok(Some(model))
                 if model.get("use_responses_lite").and_then(Value::as_bool) == Some(true) =>
@@ -285,53 +276,51 @@ impl WsSession {
                 model
             }
             Ok(_) | Err(_) => {
-                let _ = self
-                    .state
-                    .store
-                    .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
-                    .await;
                 return Some(ConnectionEnd::UpstreamFailure);
             }
         };
-        if prepare_responses_lite(
-            &mut self.upstream,
-            &mut prepared.payload,
+        let prewarm = match responses_lite_prewarm(
+            &mut payload,
             &model,
             &format!("codex-api-{}", request_id.0),
-        )
-        .await
-        .is_err()
-        {
-            let _ = self
-                .state
-                .store
-                .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
-                .await;
-            return Some(ConnectionEnd::UpstreamFailure);
-        }
+        ) {
+            Ok(prewarm) => prewarm,
+            Err(_) => return Some(ConnectionEnd::UpstreamFailure),
+        };
+        let response_id = match send_responses_prewarm(&mut self.upstream, &prewarm).await {
+            Ok(response_id) => response_id,
+            Err(_) => return Some(ConnectionEnd::UpstreamFailure),
+        };
+        payload["previous_response_id"] = Value::String(response_id);
         if self
             .upstream
-            .send(UpstreamMessage::Text(prepared.payload.to_string().into()))
+            .send(UpstreamMessage::Text(payload.to_string().into()))
             .await
             .is_err()
         {
-            let _ = self
-                .state
-                .store
-                .finalize_request(request_id, FinalStatus::UpstreamError, None, None)
-                .await;
             return Some(ConnectionEnd::UpstreamFailure);
         }
-        self.active = Some(InFlight {
-            request_id,
-            rates: effective_model.rates,
-            _permit: permit.expect("a new response requires a concurrency permit"),
-        });
         None
     }
 
     async fn reject(&mut self, value: &Value, error: Value) -> Option<ConnectionEnd> {
-        if record_rejection(&self.state, &self.identity, value)
+        let context = RequestContext {
+            api_key_id: self.identity.id.clone(),
+            api_protocol: ApiProtocol::Responses,
+            transport: Transport::WebSocket,
+        };
+        if self
+            .state
+            .store
+            .record_rejection(
+                &context,
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                value.pointer("/reasoning/effort").and_then(Value::as_str),
+                None,
+            )
             .await
             .is_err()
         {
@@ -386,7 +375,7 @@ impl WsSession {
             .as_ref()
             .and_then(TerminalEvent::retryable_capacity_payload);
         if let Some(terminal) = terminal {
-            let Some(active) = self.active.take() else {
+            let Some(active) = self.active.as_ref() else {
                 return Some(ConnectionEnd::UpstreamFailure);
             };
             let status = match terminal.kind {
@@ -407,13 +396,9 @@ impl WsSession {
                 .await
                 .is_err()
             {
-                let _ = self
-                    .state
-                    .store
-                    .finalize_request(active.request_id, FinalStatus::UpstreamError, None, None)
-                    .await;
                 return Some(ConnectionEnd::AccountingFailure);
             }
+            self.active = None;
         }
         self.downstream
             .send(DownstreamMessage::Text(
@@ -485,6 +470,7 @@ impl WsSession {
                     .await;
             }
             ConnectionEnd::AccountingFailure => {
+                self.finalize_active(FinalStatus::UpstreamError).await;
                 self.close_downstream(1011, "Internal WebSocket accounting failure")
                     .await;
                 let _ = self.upstream.send(UpstreamMessage::Close(None)).await;
@@ -514,125 +500,79 @@ impl WsSession {
 }
 
 fn prepare_request(
-    mut value: Value,
+    value: &mut Value,
     state: &AppState,
-    identity: &ClientIdentity,
-) -> Result<PreparedRequest, (Value, ValidationError)> {
-    let validation = (|| {
-        let object = value.as_object_mut().ok_or(ValidationError {
+) -> Result<ModelCandidates, ValidationError> {
+    let object = value.as_object_mut().ok_or(ValidationError {
+        param: "type",
+        message: "WebSocket messages must be response.create objects",
+    })?;
+    if object.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Err(ValidationError {
             param: "type",
-            message: "WebSocket messages must be response.create objects",
-        })?;
-        if object.get("type").and_then(Value::as_str) != Some("response.create") {
-            return Err(ValidationError {
-                param: "type",
-                message: "Only response.create messages are supported",
-            });
-        }
-        let model = object
-            .get("model")
-            .and_then(Value::as_str)
-            .ok_or(ValidationError {
-                param: "model",
-                message: "response.create requires a model",
-            })?
-            .to_owned();
-        let reasoning_effort = object
-            .get("reasoning")
-            .and_then(|reasoning| reasoning.get("effort"))
-            .and_then(Value::as_str);
-        let candidates = state
-            .config
-            .model_candidates(&model, reasoning_effort)
-            .ok_or(ValidationError {
-                param: "model",
-                message: "The requested model is not configured",
-            })?;
-        if object
-            .get("stream")
-            .is_some_and(|stream| stream.as_bool() != Some(true))
-        {
-            return Err(ValidationError {
-                param: "stream",
-                message: "stream must be true in WebSocket mode",
-            });
-        }
-        if object.contains_key("background") {
-            return Err(ValidationError {
-                param: "background",
-                message: "background is not used in WebSocket mode",
-            });
-        }
-        if object.contains_key("max_output_tokens") {
-            return Err(ValidationError {
-                param: "max_output_tokens",
-                message: "max_output_tokens is not supported by the ChatGPT Codex upstream",
-            });
-        }
-        if object
-            .get("store")
-            .is_some_and(|store| !store.is_null() && store.as_bool() != Some(false))
-        {
-            return Err(ValidationError {
-                param: "store",
-                message: "store must be false in WebSocket mode",
-            });
-        }
-
-        if let Some(Value::String(input)) = object.get("input") {
-            object.insert(
-                "input".to_owned(),
-                serde_json::json!([{
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": input}]
-                }]),
-            );
-        }
-        object.insert("store".to_owned(), Value::Bool(false));
-        object.insert("stream".to_owned(), Value::Bool(true));
-        Ok(candidates)
-    })();
-
-    match validation {
-        Ok(candidates) => Ok(PreparedRequest {
-            payload: value,
-            context: RequestContext {
-                api_key_id: identity.id.clone(),
-                api_protocol: ApiProtocol::Responses,
-                transport: Transport::WebSocket,
-            },
-            candidates,
-        }),
-        Err(error) => Err((value, error)),
+            message: "Only response.create messages are supported",
+        });
     }
-}
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(ValidationError {
+            param: "model",
+            message: "response.create requires a model",
+        })?;
+    let reasoning_effort = object
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str);
+    let candidates = state
+        .config
+        .model_candidates(model, reasoning_effort)
+        .ok_or(ValidationError {
+            param: "model",
+            message: "The requested model is not configured",
+        })?;
+    if object
+        .get("stream")
+        .is_some_and(|stream| stream.as_bool() != Some(true))
+    {
+        return Err(ValidationError {
+            param: "stream",
+            message: "stream must be true in WebSocket mode",
+        });
+    }
+    if object.contains_key("background") {
+        return Err(ValidationError {
+            param: "background",
+            message: "background is not used in WebSocket mode",
+        });
+    }
+    if object.contains_key("max_output_tokens") {
+        return Err(ValidationError {
+            param: "max_output_tokens",
+            message: "max_output_tokens is not supported by the ChatGPT Codex upstream",
+        });
+    }
+    if object
+        .get("store")
+        .is_some_and(|store| !store.is_null() && store.as_bool() != Some(false))
+    {
+        return Err(ValidationError {
+            param: "store",
+            message: "store must be false in WebSocket mode",
+        });
+    }
 
-async fn record_rejection(
-    state: &AppState,
-    identity: &ClientIdentity,
-    value: &Value,
-) -> Result<(), StoreError> {
-    let context = RequestContext {
-        api_key_id: identity.id.clone(),
-        api_protocol: ApiProtocol::Responses,
-        transport: Transport::WebSocket,
-    };
-    state
-        .store
-        .record_rejection(
-            &context,
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            value
-                .get("reasoning")
-                .and_then(|reasoning| reasoning.get("effort"))
-                .and_then(Value::as_str),
-            None,
-        )
-        .await
+    if let Some(Value::String(input)) = object.get("input") {
+        object.insert(
+            "input".to_owned(),
+            serde_json::json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": input}]
+            }]),
+        );
+    }
+    Ok(candidates)
 }
 
 fn downstream_close_to_upstream(frame: DownstreamCloseFrame) -> UpstreamCloseFrame {

@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use rust_decimal::Decimal;
 use secrecy::ExposeSecret;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqliteConnection};
 use time::{
     Date, Duration as TimeDuration, OffsetDateTime, UtcOffset,
     format_description::{self, well_known::Rfc3339},
@@ -51,8 +51,8 @@ struct LogsArgs {
     api_key_id: Option<String>,
     #[arg(long)]
     model: Option<String>,
-    #[arg(long)]
-    status: Option<LogStatus>,
+    #[arg(long, value_parser = ["started", "completed", "incomplete", "rejected", "upstream_error", "canceled", "internal_error"])]
+    status: Option<String>,
     #[arg(long, value_parser = parse_rfc3339)]
     since: Option<OffsetDateTime>,
     #[arg(long, value_parser = parse_rfc3339)]
@@ -65,32 +65,6 @@ struct StatArgs {
     start_date: Option<Date>,
     #[arg(long, value_parser = parse_date)]
     end_date: Option<Date>,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-#[value(rename_all = "snake_case")]
-enum LogStatus {
-    Started,
-    Completed,
-    Incomplete,
-    Rejected,
-    UpstreamError,
-    Canceled,
-    InternalError,
-}
-
-impl LogStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Completed => "completed",
-            Self::Incomplete => "incomplete",
-            Self::Rejected => "rejected",
-            Self::UpstreamError => "upstream_error",
-            Self::Canceled => "canceled",
-            Self::InternalError => "internal_error",
-        }
-    }
 }
 
 pub(crate) async fn run() -> anyhow::Result<()> {
@@ -202,7 +176,7 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
         return Err(anyhow!("--since must be earlier than --until"));
     }
     let config = Config::load(config_path)?;
-    let pool = open_read_only(&config.state.path).await?;
+    let mut connection = open_read_only(&config.state.path).await?;
     let mut query = QueryBuilder::<Sqlite>::new(
         "SELECT requested_at, api_key_id, model, reasoning_effort, api_protocol, transport, \
                 input_tokens, cached_input_tokens, output_tokens, cost_usd, duration_ms, status \
@@ -215,7 +189,7 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
         query.push(" AND model = ").push_bind(model);
     }
     if let Some(status) = args.status {
-        query.push(" AND status = ").push_bind(status.as_str());
+        query.push(" AND status = ").push_bind(status);
     }
     if let Some(since) = args.since {
         query
@@ -234,7 +208,7 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
         .push_bind(i64::from(args.limit));
     let rows = query
         .build()
-        .fetch_all(&pool)
+        .fetch_all(&mut connection)
         .await
         .context("failed to query request logs")?;
 
@@ -305,15 +279,13 @@ fn format_local_timestamp(timestamp: OffsetDateTime) -> anyhow::Result<String> {
         .context("failed to format the local timestamp")
 }
 
-async fn open_read_only(path: &Path) -> anyhow::Result<SqlitePool> {
+async fn open_read_only(path: &Path) -> anyhow::Result<SqliteConnection> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .read_only(true)
         .create_if_missing(false)
         .busy_timeout(Duration::from_secs(5));
-    SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
+    SqliteConnection::connect_with(&options)
         .await
         .with_context(|| format!("failed to open SQLite state {}", path.display()))
 }
@@ -336,7 +308,7 @@ async fn print_stat(config_path: &Path, args: StatArgs) -> anyhow::Result<()> {
         .midnight()
         .assume_utc();
     let config = Config::load(config_path)?;
-    let pool = open_read_only(&config.state.path).await?;
+    let mut connection = open_read_only(&config.state.path).await?;
     let rows = sqlx::query(
         "SELECT api_key_id, input_tokens, cached_input_tokens, cost_usd FROM request_logs \
          WHERE julianday(requested_at) >= julianday(?) \
@@ -344,18 +316,17 @@ async fn print_stat(config_path: &Path, args: StatArgs) -> anyhow::Result<()> {
     )
     .bind(range_start.format(&Rfc3339)?)
     .bind(range_end.format(&Rfc3339)?)
-    .fetch_all(&pool)
+    .fetch_all(&mut connection)
     .await
     .context("failed to query usage statistics")?;
-    let mut spent_by_key = BTreeMap::<String, Decimal>::new();
-    let mut tokens_by_key = BTreeMap::<String, (i64, i64)>::new();
+    let mut totals_by_key = BTreeMap::<String, (Decimal, i64, i64)>::new();
     for row in rows {
         let api_key_id = row.try_get::<String, _>("api_key_id")?;
+        let (spent, input, cached) = totals_by_key.entry(api_key_id).or_default();
         if let Some(cost) = row.try_get::<Option<String>, _>("cost_usd")? {
             let cost = cost
                 .parse::<Decimal>()
                 .context("request_logs contains an invalid cost_usd value")?;
-            let spent = spent_by_key.entry(api_key_id.clone()).or_default();
             *spent = spent
                 .checked_add(cost)
                 .ok_or_else(|| anyhow!("usage spend is out of range"))?;
@@ -364,13 +335,10 @@ async fn print_stat(config_path: &Path, args: StatArgs) -> anyhow::Result<()> {
             let cached_input_tokens = row
                 .try_get::<Option<i64>, _>("cached_input_tokens")?
                 .unwrap_or(0);
-            let tokens = tokens_by_key.entry(api_key_id).or_default();
-            tokens.0 = tokens
-                .0
+            *input = input
                 .checked_add(input_tokens)
                 .ok_or_else(|| anyhow!("input token count is out of range"))?;
-            tokens.1 = tokens
-                .1
+            *cached = cached
                 .checked_add(cached_input_tokens)
                 .ok_or_else(|| anyhow!("cached input token count is out of range"))?;
         }
@@ -384,30 +352,30 @@ async fn print_stat(config_path: &Path, args: StatArgs) -> anyhow::Result<()> {
         .set_header(["API KEY", "SPENT USD", "CACHE RATE", "STATUS"]);
     let fallback_configured = config.fallback_model.is_some();
     for api_key in &config.api_keys {
-        let spent = spent_by_key
-            .get(&api_key.id)
-            .copied()
-            .unwrap_or(Decimal::ZERO);
-        let cache_rate = match tokens_by_key.get(&api_key.id) {
-            Some((input_tokens, cached_input_tokens)) if *input_tokens > 0 => format!(
+        let (spent, input_tokens, cached_input_tokens) =
+            totals_by_key.get(&api_key.id).copied().unwrap_or_default();
+        let cache_rate = if input_tokens > 0 {
+            format!(
                 "{:.2}%",
-                Decimal::from(*cached_input_tokens) * Decimal::ONE_HUNDRED
-                    / Decimal::from(*input_tokens)
-            ),
-            _ => "—".to_owned(),
+                Decimal::from(cached_input_tokens) * Decimal::ONE_HUNDRED
+                    / Decimal::from(input_tokens)
+            )
+        } else {
+            "—".to_owned()
         };
-        let status = match (api_key.weekly_limit_usd, api_key.hard_limit_usd) {
-            (None, _) => "unlimited",
-            (Some(soft), Some(hard_limit)) => {
-                if spent >= hard_limit || (spent >= soft && !fallback_configured) {
+        let status = match api_key.quota {
+            None => "unlimited",
+            Some(quota) => {
+                if spent >= quota.hard_limit_usd
+                    || (spent >= quota.weekly_limit_usd && !fallback_configured)
+                {
                     "blocked"
-                } else if spent >= soft {
+                } else if spent >= quota.weekly_limit_usd {
                     "fallback"
                 } else {
                     "available"
                 }
             }
-            (Some(_), None) => unreachable!("limited keys always have a hard limit"),
         };
         table.add_row([
             api_key.id.clone(),
