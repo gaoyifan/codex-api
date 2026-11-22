@@ -344,8 +344,10 @@ async fn http_responses_use_websocket_lite_prewarm_and_return_sse() {
     assert!(data.iter().any(|event| event.contains("\"text\":\"OK\"")));
     assert!(data.last().unwrap().contains("response.completed"));
     assert_eq!(prewarm["generate"], false);
+    assert_eq!(prewarm["tool_choice"], "auto");
     assert_eq!(prewarm["input"][0]["type"], "additional_tools");
     assert_eq!(turn["previous_response_id"], "resp-prewarm");
+    assert_eq!(turn["tool_choice"], "auto");
     assert_eq!(turn["reasoning"]["context"], "all_turns");
     assert_eq!(turn["input"][0]["content"][0]["text"], "Reply with OK.");
 }

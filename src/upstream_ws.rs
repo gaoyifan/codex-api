@@ -58,25 +58,13 @@ pub(crate) fn responses_lite_prewarm(
     let tools = object
         .remove("tools")
         .filter(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()));
-    let has_inline_tools = object
-        .get("input")
-        .and_then(Value::as_array)
-        .is_some_and(|input| {
-            input.iter().any(|item| {
-                item["type"] == "additional_tools"
-                    && item["tools"]
-                        .as_array()
-                        .is_some_and(|tools| !tools.is_empty())
-            })
-        });
-    let disable_tools = tools.is_none() && !has_inline_tools;
     let client_instructions = object.remove("instructions");
     let base_instructions = model
         .get("base_instructions")
         .and_then(Value::as_str)
         .context("invalid upstream Responses request")?;
 
-    normalize_responses_lite_fields(object, request_key, disable_tools);
+    normalize_responses_lite_fields(object, request_key);
     let mut prewarm: Map<_, _> = object
         .iter()
         .filter(|(key, _)| key.as_str() != "input")
@@ -95,7 +83,6 @@ pub(crate) fn responses_lite_prewarm(
     }
     prewarm.insert("input".to_owned(), Value::Array(input));
     prewarm.insert("generate".to_owned(), Value::Bool(false));
-    prewarm.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
     Ok(Value::Object(prewarm))
 }
 
@@ -134,11 +121,7 @@ pub(crate) async fn send_responses_prewarm(
     }
 }
 
-fn normalize_responses_lite_fields(
-    object: &mut Map<String, Value>,
-    request_key: &str,
-    disable_tools: bool,
-) {
+fn normalize_responses_lite_fields(object: &mut Map<String, Value>, request_key: &str) {
     object.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
     object.insert(
         "type".to_owned(),
@@ -146,9 +129,9 @@ fn normalize_responses_lite_fields(
     );
     object.insert("store".to_owned(), Value::Bool(false));
     object.insert("stream".to_owned(), Value::Bool(true));
-    if disable_tools {
-        object.insert("tool_choice".to_owned(), Value::String("none".to_owned()));
-    }
+    object
+        .entry("tool_choice")
+        .or_insert_with(|| Value::String("auto".to_owned()));
     object
         .entry("include")
         .or_insert_with(|| serde_json::json!(["reasoning.encrypted_content"]));
