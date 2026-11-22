@@ -689,12 +689,11 @@ fn normalize_responses_request(value: Value) -> Result<Value, ApiError> {
             ));
         }
     }
-    if object.contains_key("max_output_tokens") {
-        return Err(ApiError::invalid(
-            "max_output_tokens",
-            "max_output_tokens is not supported by the ChatGPT Codex upstream",
-        ));
-    }
+    // The public Responses client includes this field for ordinary OpenAI models,
+    // while the Codex subscription endpoint does not accept it. Keep the relay
+    // compatible with those clients and let the subscription endpoint choose its
+    // own output limit.
+    object.remove("max_output_tokens");
     if let Some(Value::String(input)) = object.get("input") {
         object.insert(
             "input".to_owned(),
