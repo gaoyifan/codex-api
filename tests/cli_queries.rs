@@ -607,7 +607,7 @@ async fn logs_rejects_invalid_filters_with_actionable_errors() {
 async fn query_commands_are_read_only_and_never_print_configured_secrets() {
     let fixture = Fixture::new().await;
     let before = std::fs::read(&fixture.database_path).expect("read database before queries");
-    for command in ["logs", "stat"] {
+    for command in ["logs", "audio-logs", "stat"] {
         let output = fixture
             .command(command)
             .output()

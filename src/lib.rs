@@ -5,12 +5,14 @@ use anyhow::Context;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
+    middleware,
     routing::{get, post},
 };
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing_subscriber::EnvFilter;
 
+mod audio;
 mod auth;
 mod chat;
 mod cli;
@@ -120,6 +122,16 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
     } else {
         post(http_api::responses)
     };
+    let audio_routes = Router::new()
+        .route("/v1/audio/speech", post(audio::speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(audio::transcriptions).layer(DefaultBodyLimit::max(audio::MAX_TRANSCRIPTION_BODY)),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            audio::authenticate_and_log,
+        ));
     let router = Router::new()
         .route("/v1/responses", responses)
         .route("/v1/chat/completions", post(http_api::chat_completions))
@@ -134,6 +146,8 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
         .route("/v1/models", get(http_api::models))
         .route("/v1/usage", get(http_api::usage))
         .route("/v1/models/{model}", get(http_api::model))
+        .route("/v1/audio/voices", get(audio::voices))
+        .merge(audio_routes)
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await

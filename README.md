@@ -32,6 +32,20 @@ management UI, multi-account scheduling, or transport fallbacks.
   and `x-codex-imagegen-request-id`.
   Image requests use the configured API keys but do not check or record quota
   and do not require a `model_prices` entry.
+- `POST /v1/audio/speech` sends `input` (up to 4096 characters) to ChatGPT Read
+  Aloud and returns MP3. `GET /v1/audio/voices` mirrors the upstream voice catalog,
+  including voice IDs, names, descriptions, accents, preview URLs, and the selected
+  voice.
+- `POST /v1/audio/transcriptions` accepts one multipart `file` (WAV, MP3, MP4/M4A,
+  WebM, or Ogg) and returns `{"text":"…"}`. The multipart request is limited to 25 MiB,
+  including the form headers. The relay accepts Rakazo's model, voice, and language
+  fields for compatibility and uses ChatGPT's defaults.
+
+In Rakazo, select **Self-hosted** (OpenAI-compatible), enter the relay base URL
+ending in `/v1` and its static API key, and keep the default models. Audio uses
+internal ChatGPT endpoints with the relay's ChatGPT OAuth session. Each audio
+operation has 55 seconds after request parsing, including credential refresh.
+ChatGPT applies its own availability and usage limits.
 
 All endpoints require:
 
@@ -311,9 +325,8 @@ surrounding request or response payload. These details are not stored in SQLite.
 
 ## Accounting and weekly limits
 
-Every authenticated text generation operation gets a ledger row. Image requests,
-model queries, and invalid API keys do not. The limits below apply only to text
-generation.
+The request ledger and weekly limits apply to authenticated text generation.
+Speech synthesis and transcription have their own SQLite logs.
 Prices are calculated with decimal arithmetic, then rounded half-up once per
 request to one nano-USD:
 
@@ -399,6 +412,25 @@ For scripts and custom queries, use the stable `request_logs` view directly:
 ```bash
 sqlite3 ./codex-api.sqlite3 \
   'SELECT requested_at, api_key_id, model, cost_usd, status FROM request_logs ORDER BY id DESC LIMIT 20;'
+```
+
+Authenticated speech synthesis and transcription requests that produce an HTTP
+response get one row in the `audio_request_logs` table. Each row records the request
+time, API key ID, endpoint, duration, and HTTP status. The table stores metadata
+only, with no text, recordings, or credentials. Audio usage is outside the text
+ledger and weekly limits.
+
+For scripts and custom queries, use the table directly:
+
+```bash
+sqlite3 ./codex-api.sqlite3 \
+  'SELECT requested_at_ms, api_key_id, endpoint, duration_ms, http_status FROM audio_request_logs ORDER BY id DESC LIMIT 20;'
+```
+
+For interactive inspection, use:
+
+```bash
+codex-api audio-logs --limit 50
 ```
 
 ## Verification

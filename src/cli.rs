@@ -37,6 +37,11 @@ enum Command {
     Serve,
     /// Show recent request logs.
     Logs(LogsArgs),
+    /// Show recent speech and transcription request logs.
+    AudioLogs {
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
     /// Show usage statistics for every configured API key.
     Stat(StatArgs),
     /// Show the Codex account's live quota usage (requires the running relay).
@@ -72,6 +77,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     match args.command {
         Command::Serve => crate::run(&args.config).await,
         Command::Logs(logs) => print_logs(&args.config, logs).await,
+        Command::AudioLogs { limit } => print_audio_logs(&args.config, limit).await,
         Command::Stat(stat) => print_stat(&args.config, stat).await,
         Command::Usage => print_usage(&args.config).await,
     }
@@ -264,6 +270,44 @@ async fn print_logs(config_path: &Path, args: LogsArgs) -> anyhow::Result<()> {
             cost,
             duration,
             row.try_get::<String, _>("status")?,
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+async fn print_audio_logs(config_path: &Path, limit: u32) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let mut connection = open_read_only(&config.state.path).await?;
+    let rows = sqlx::query(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', requested_at_ms / 1000.0, 'unixepoch') AS requested_at, \
+                api_key_id, endpoint, duration_ms, http_status \
+         FROM audio_request_logs ORDER BY id DESC LIMIT ?",
+    )
+    .bind(i64::from(limit))
+    .fetch_all(&mut connection)
+    .await
+    .context("failed to query audio request logs")?;
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header([
+            "API KEY",
+            "TIME LOCAL",
+            "ENDPOINT",
+            "DURATION",
+            "HTTP STATUS",
+        ]);
+    for row in rows {
+        let timestamp =
+            OffsetDateTime::parse(&row.try_get::<String, _>("requested_at")?, &Rfc3339)?;
+        table.add_row([
+            row.try_get::<String, _>("api_key_id")?,
+            format_local_timestamp(timestamp)?,
+            row.try_get::<String, _>("endpoint")?,
+            format!("{} ms", row.try_get::<i64, _>("duration_ms")?),
+            row.try_get::<i64, _>("http_status")?.to_string(),
         ]);
     }
     println!("{table}");

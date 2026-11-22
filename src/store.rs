@@ -322,6 +322,29 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) async fn record_audio_request(
+        &self,
+        api_key_id: &str,
+        endpoint: &str,
+        duration: StdDuration,
+        http_status: u16,
+    ) -> anyhow::Result<()> {
+        let duration_ms =
+            i64::try_from(duration.as_millis()).context("audio duration is out of range")?;
+        sqlx::query(
+            "INSERT INTO audio_request_logs \
+             (requested_at_ms, api_key_id, endpoint, duration_ms, http_status) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(timestamp_ms(self.clock.now()))
+        .bind(api_key_id)
+        .bind(endpoint)
+        .bind(duration_ms)
+        .bind(i64::from(http_status))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn finalize_request(
         &self,
         request_id: RequestId,

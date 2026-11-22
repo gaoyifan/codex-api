@@ -75,6 +75,11 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn with_status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
+    }
+
     pub(crate) fn upstream(error: &Value) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,

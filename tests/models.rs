@@ -62,6 +62,7 @@ impl Clock for FixedClock {
 enum ModelsReply {
     Json(Value),
     Image(StatusCode, Value),
+    Audio(&'static [u8]),
     Status(StatusCode),
     Raw(&'static str),
 }
@@ -97,8 +98,14 @@ impl FakeUpstream {
             .route("/models", get(upstream_handler))
             .route("/wham/usage", get(upstream_handler))
             .route("/backend-api/wham/usage", get(upstream_handler))
+            .route("/backend-api/settings/voices", get(upstream_handler))
             .route("/images/generations", post(upstream_handler))
             .route("/images/edits", post(upstream_handler))
+            .route(
+                "/backend-api/pronunciation/synthesize",
+                post(upstream_handler),
+            )
+            .route("/backend-api/transcribe", post(upstream_handler))
             .route("/oauth/token", post(upstream_oauth))
             .layer(DefaultBodyLimit::disable())
             .with_state(state);
@@ -163,6 +170,9 @@ async fn upstream_handler(
             .header("x-codex-imagegen-request-id", "image-request-test")
             .body(Body::from(value.to_string()))
             .expect("build image upstream response"),
+        ModelsReply::Audio(bytes) => {
+            ([(http::header::CONTENT_TYPE, "audio/mpeg")], bytes).into_response()
+        }
         ModelsReply::Status(status) => status.into_response(),
         ModelsReply::Raw(body) => Response::builder()
             .header("content-type", "application/json")
@@ -179,14 +189,18 @@ struct Fixture {
 
 impl Fixture {
     fn new(upstream: &FakeUpstream) -> Self {
-        Self::with_fallback(upstream, true)
+        Self::with_fallback(upstream, true, "")
     }
 
     fn without_fallback(upstream: &FakeUpstream) -> Self {
-        Self::with_fallback(upstream, false)
+        Self::with_fallback(upstream, false, "")
     }
 
-    fn with_fallback(upstream: &FakeUpstream, fallback_configured: bool) -> Self {
+    fn for_audio(upstream: &FakeUpstream) -> Self {
+        Self::with_fallback(upstream, true, "/backend-api/codex")
+    }
+
+    fn with_fallback(upstream: &FakeUpstream, fallback_configured: bool, base_path: &str) -> Self {
         let directory = tempfile::tempdir().expect("create models fixture");
         let config_path = directory.path().join("config.toml");
         let auth_path = directory.path().join("auth.json");
@@ -224,7 +238,7 @@ enable_websockets = false
 path = "{}"
 
 [upstream]
-base_url = "{}"
+base_url = "{}{base_path}"
 oauth_token_url = "{}/oauth/token"
 auth_file = "{}"
 supports_websockets = false
@@ -809,4 +823,218 @@ async fn native_images_retry_with_refreshed_credentials_after_upstream_401() {
         format!("Bearer {ROTATED_ACCESS_TOKEN}")
     );
     assert_eq!(upstream.oauth_requests().await, 1);
+}
+
+#[tokio::test]
+async fn speech_serves_raw_and_encoded_mp3_and_mirrors_the_voice_catalog() {
+    let mp3 = b"ID3 test MP3 data";
+    let upstream = FakeUpstream::start(vec![
+        ModelsReply::Json(json!({
+            "selected": "voice-a",
+            "voices": [
+                {
+                    "voice": "voice-a",
+                    "name": "Test voice"
+                }
+            ]
+        })),
+        ModelsReply::Audio(mp3),
+        ModelsReply::Json(
+            json!({"base64": "SUQzIHRlc3QgTVAzIGRhdGE=", "contentType": "audio/mpeg"}),
+        ),
+    ])
+    .await;
+    let fixture = Fixture::for_audio(&upstream);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    let voices = client()
+        .get(relay.url("/v1/audio/voices?model=mlx-community%2FKokoro-82M-bf16"))
+        .bearer_auth(API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(voices.status(), StatusCode::OK);
+    let voices: Value = voices.json().await.unwrap();
+    assert_eq!(voices["object"], "list");
+    assert_eq!(voices["selected"], "voice-a");
+    assert_eq!(voices["data"][0]["id"], "voice-a");
+    assert_eq!(voices["data"][0]["voice"], "voice-a");
+    assert_eq!(voices["data"][0]["name"], "Test voice");
+    let url = relay.url("/v1/audio/speech");
+    assert_eq!(
+        client().post(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let request = json!({
+        "model": "mlx-community/Kokoro-82M-bf16", "voice": "default",
+        "input": "你好", "response_format": "mp3",
+    });
+    for _ in 0..2 {
+        let response = client()
+            .post(&url)
+            .bearer_auth(API_KEY)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "audio/mpeg");
+        assert_eq!(response.bytes().await.unwrap().as_ref(), mp3);
+    }
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].0.path(), "/backend-api/settings/voices");
+    assert_eq!(requests[0].0.query(), None);
+    for (uri, headers, body) in requests.into_iter().skip(1) {
+        assert_eq!(
+            uri.path_and_query().unwrap(),
+            "/backend-api/pronunciation/synthesize?format=mp3"
+        );
+        assert_eq!(headers["authorization"], format!("Bearer {ACCESS_TOKEN}"));
+        assert_eq!(headers["chatgpt-account-id"], ACCOUNT_ID);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"text": "你好", "speed": 1})
+        );
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_codex-api"))
+        .arg("--config")
+        .arg(&fixture.config_path)
+        .arg("audio-logs")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let logs = String::from_utf8(output.stdout).unwrap();
+    assert!(logs.contains("/v1/audio/speech"), "{logs}");
+    assert!(!logs.contains("/v1/audio/voices"), "{logs}");
+}
+
+#[tokio::test]
+async fn transcription_rebuilds_multipart_after_refresh_and_only_returns_text() {
+    let audio = b"\x1a\x45\xdf\xa3 clip";
+    let upstream = FakeUpstream::start(vec![
+        ModelsReply::Status(StatusCode::UNAUTHORIZED),
+        ModelsReply::Json(json!({"text": "你好", "asset_pointer": "internal asset"})),
+        ModelsReply::Status(StatusCode::TOO_MANY_REQUESTS),
+        ModelsReply::Status(StatusCode::FORBIDDEN),
+    ])
+    .await;
+    let fixture = Fixture::for_audio(&upstream);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    let send = |format: Option<&'static str>, filename, mime| {
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", "mlx-community/whisper-large-v3-turbo-asr-fp16")
+            .text("language", "zh")
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(audio.as_slice())
+                    .file_name(filename)
+                    .mime_str(mime)
+                    .unwrap(),
+            );
+        if let Some(format) = format {
+            form = form.text("response_format", format);
+        }
+        client()
+            .post(relay.url("/v1/audio/transcriptions"))
+            .bearer_auth(API_KEY)
+            .multipart(form)
+            .send()
+    };
+    let webm = |format| send(Some(format), "speech.webm", "audio/webm; codecs=opus");
+    assert_eq!(
+        webm("text").await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let response = webm("json").await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"text": "你好"})
+    );
+    assert_eq!(
+        send(None, "speech.m4a", "audio/m4a")
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let forbidden = webm("json").await.unwrap();
+    assert_eq!(forbidden.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        forbidden.json::<Value>().await.unwrap()["error"]["code"],
+        "upstream_error"
+    );
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 4);
+    for ((uri, headers, body), token) in
+        requests
+            .into_iter()
+            .zip([ACCESS_TOKEN, ROTATED_ACCESS_TOKEN, ROTATED_ACCESS_TOKEN])
+    {
+        assert_eq!(uri.path(), "/backend-api/transcribe");
+        assert_eq!(headers["authorization"], format!("Bearer {token}"));
+        assert_eq!(headers["chatgpt-account-id"], ACCOUNT_ID);
+        assert!(
+            body.windows(audio.len()).any(|chunk| chunk == audio),
+            "upstream request did not contain the uploaded audio"
+        );
+    }
+    assert_eq!(upstream.oauth_requests().await, 1);
+
+    let mut database = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&fixture.database_path)
+            .read_only(true),
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT api_key_id, endpoint, http_status FROM audio_request_logs ORDER BY id",
+    )
+    .fetch_all(&mut database)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [400, 200, 429, 502].map(|status| {
+            (
+                API_KEY_ID.to_owned(),
+                "/v1/audio/transcriptions".to_owned(),
+                status,
+            )
+        })
+    );
+    let text_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+        .fetch_one(&mut database)
+        .await
+        .unwrap();
+    assert_eq!(text_requests, 0);
+}
+
+#[tokio::test]
+async fn transcription_limits_the_multipart_body_before_sending_upstream() {
+    let upstream = FakeUpstream::start(vec![]).await;
+    let fixture = Fixture::for_audio(&upstream);
+    let relay = fixture.start(FixedClock::at("2026-08-10T12:00:00Z")).await;
+    let response = client()
+        .post(relay.url("/v1/audio/transcriptions"))
+        .bearer_auth(API_KEY)
+        .multipart(
+            reqwest::multipart::Form::new().part(
+                "file",
+                reqwest::multipart::Part::bytes(vec![0; 25 * 1024 * 1024])
+                    .file_name("speech.webm")
+                    .mime_str("audio/webm")
+                    .unwrap(),
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(upstream.requests().await.is_empty());
 }

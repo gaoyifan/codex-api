@@ -3,7 +3,10 @@ use std::sync::Arc;
 use anyhow::{Context, ensure};
 use http::HeaderMap;
 use http::header::{ACCEPT, USER_AGENT};
-use reqwest::{Response, StatusCode};
+use reqwest::{
+    Response, StatusCode,
+    multipart::{Form, Part},
+};
 use secrecy::ExposeSecret;
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
@@ -24,6 +27,9 @@ pub(crate) struct UpstreamHttpClient {
     images_url: Url,
     models_url: Url,
     usage_url: Url,
+    voices_url: Url,
+    transcribe_url: Url,
+    speech_url: Url,
     credentials: Arc<CredentialManager>,
     clock: Arc<dyn Clock>,
     models_cache: Mutex<Option<CachedModels>>,
@@ -58,12 +64,22 @@ impl UpstreamHttpClient {
         let mut usage_url = responses_url.clone();
         let backend_path = base_path.strip_suffix("/codex").unwrap_or(base_path);
         usage_url.set_path(&format!("{backend_path}/wham/usage"));
+        let mut voices_url = responses_url.clone();
+        voices_url.set_path(&format!("{backend_path}/settings/voices"));
+        let mut transcribe_url = responses_url.clone();
+        transcribe_url.set_path(&format!("{backend_path}/transcribe"));
+        let mut speech_url = responses_url.clone();
+        speech_url.set_path(&format!("{backend_path}/pronunciation/synthesize"));
+        speech_url.set_query(Some("format=mp3"));
         Self {
             client,
             responses_url,
             images_url,
             models_url,
             usage_url,
+            voices_url,
+            transcribe_url,
+            speech_url,
             credentials,
             clock,
             models_cache: Mutex::new(None),
@@ -115,6 +131,15 @@ impl UpstreamHttpClient {
             .context("upstream usage request failed")
     }
 
+    pub(crate) async fn voices(&self) -> anyhow::Result<Value> {
+        self.send_authenticated(&self.voices_url, "application/json", None)
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("upstream voices request failed")
+    }
+
     pub(crate) async fn model(&self, slug: &str) -> anyhow::Result<Option<Value>> {
         Ok(self
             .models()
@@ -146,6 +171,55 @@ impl UpstreamHttpClient {
         url.set_path(&format!("{}/{operation}", self.images_url.path()));
         self.send_authenticated(&url, "application/json", Some((body, downstream_headers)))
             .await
+    }
+
+    pub(crate) async fn speech(&self, text: &str) -> anyhow::Result<Response> {
+        let body = serde_json::json!({"text": text, "speed": 1});
+        self.send_authenticated(
+            &self.speech_url,
+            "audio/mpeg, application/json",
+            Some((&body, &HeaderMap::new())),
+        )
+        .await
+    }
+
+    pub(crate) async fn transcribe(
+        &self,
+        audio: bytes::Bytes,
+        filename: &'static str,
+        mime: &str,
+    ) -> anyhow::Result<Response> {
+        let send_once = |credential: &CredentialSnapshot| {
+            let mut request = self
+                .client
+                .post(self.transcribe_url.clone())
+                .bearer_auth(credential.access_token.expose_secret())
+                .header("ChatGPT-Account-ID", &credential.account_id)
+                .header("originator", CODEX_ORIGINATOR)
+                .header("version", CODEX_VERSION)
+                .header(USER_AGENT, CODEX_USER_AGENT)
+                .header(ACCEPT, "application/json");
+            let file = Part::stream(audio.clone())
+                .file_name(filename)
+                .mime_str(mime)?;
+            request = request.multipart(Form::new().part("file", file));
+            Ok::<_, reqwest::Error>(request.send())
+        };
+        let credential = self.credentials.credentials().await?;
+        let response = send_once(&credential)?.await?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        let credential = self
+            .credentials
+            .refresh_after_unauthorized(credential.generation)
+            .await?;
+        let response = send_once(&credential)?.await?;
+        ensure!(
+            response.status() != StatusCode::UNAUTHORIZED,
+            "upstream authentication was rejected"
+        );
+        Ok(response)
     }
 
     async fn send_authenticated(
