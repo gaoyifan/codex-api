@@ -58,6 +58,23 @@ pub(crate) fn responses_lite_prewarm(
     let tools = object
         .remove("tools")
         .filter(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()));
+    let native_tools: Option<Vec<Value>> = tools.as_ref().and_then(|tools| {
+        let native: Vec<Value> = tools
+            .as_array()?
+            .iter()
+            .filter(|tool| {
+                matches!(
+                    tool.get("type").and_then(Value::as_str),
+                    Some("web_search" | "web_search_preview")
+                )
+            })
+            .cloned()
+            .collect();
+        (!native.is_empty()).then_some(native)
+    });
+    if let Some(native_tools) = &native_tools {
+        object.insert("tools".to_owned(), Value::Array(native_tools.clone()));
+    }
     let client_instructions = object.remove("instructions");
     let base_instructions = model
         .get("base_instructions")

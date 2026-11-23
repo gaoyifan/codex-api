@@ -133,7 +133,8 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
             audio::authenticate_and_log,
         ));
     let router = Router::new()
-        .route("/v1/responses", responses)
+        .route("/v1/responses", responses.clone())
+        .route("/backend-api/codex/responses", responses)
         .route("/v1/chat/completions", post(http_api::chat_completions))
         .route(
             "/v1/images/generations",
@@ -144,8 +145,11 @@ pub async fn run_with_clock(config_path: &Path, clock: Arc<dyn Clock>) -> anyhow
             post(http_api::image_edits).layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/models", get(http_api::models))
+        .route("/backend-api/codex/models", get(http_api::models))
         .route("/v1/usage", get(http_api::usage))
+        .route("/backend-api/codex/usage", get(http_api::usage))
         .route("/v1/models/{model}", get(http_api::model))
+        .route("/backend-api/codex/models/{model}", get(http_api::model))
         .route("/v1/audio/voices", get(audio::voices))
         .merge(audio_routes)
         .with_state(state);
