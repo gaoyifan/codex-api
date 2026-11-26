@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     body::Bytes,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::USER_AGENT},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -342,15 +342,22 @@ impl Session {
             self.upstream = None;
             return TurnEnd::Canceled;
         }
+        let retry_after_in_body = job
+            .turn
+            .headers
+            .get(USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|user_agent| user_agent.to_ascii_lowercase().contains("hermes"));
         let terminal = tokio::select! {
             biased;
             _ = shutdown.cancelled() => None,
             _ = sender.closed() => None,
             terminal = forward_websocket_responses_stream(
-            &mut job.turn.pending,
-            job.turn.rates,
-            self.upstream.as_mut().expect("prepared connection"),
-            &sender,
+                &mut job.turn.pending,
+                job.turn.rates,
+                self.upstream.as_mut().expect("prepared connection"),
+                &sender,
+                retry_after_in_body,
             ) => terminal,
         };
         let Some((terminal, bytes)) = terminal else {

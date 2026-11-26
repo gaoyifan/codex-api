@@ -60,7 +60,7 @@ impl TerminalEvent {
     }
 
     /// Makes capacity failures actionable by Responses clients without changing accounting.
-    pub(crate) fn retryable_capacity_payload(&self) -> Option<Value> {
+    pub(crate) fn retryable_capacity_payload(&self, retry_after_in_body: bool) -> Option<Value> {
         let error = self.upstream_error()?;
         if !matches!(
             error["code"].as_str(),
@@ -94,14 +94,26 @@ impl TerminalEvent {
             })
             .unwrap_or_else(|| Value::String("30".to_owned()));
 
-        let mut payload = self.payload.clone();
-        if self.kind == TerminalKind::Error {
-            // A bare `error` without an HTTP status is otherwise ignored by Codex.
-            let error = payload.as_object_mut()?.remove("error")?;
-            payload["type"] = Value::String("response.failed".to_owned());
-            payload["response"] = serde_json::json!({"status": "failed", "error": error});
-        }
-        let headers = &mut payload["response"]["error"]["headers"];
+        let mut payload = if retry_after_in_body {
+            serde_json::json!({"type": TerminalKind::Error.event_name(), "error": error})
+        } else {
+            let mut payload = self.payload.clone();
+            if self.kind == TerminalKind::Error {
+                // A bare `error` without an HTTP status is otherwise ignored by Codex.
+                let error = payload.as_object_mut()?.remove("error")?;
+                payload["type"] = Value::String(TerminalKind::Failed.event_name().to_owned());
+                payload["response"] = serde_json::json!({"status": "failed", "error": error});
+            }
+            payload
+        };
+        let error = if retry_after_in_body {
+            let error = &mut payload["error"];
+            error["retry_after"] = retry_after.clone();
+            error
+        } else {
+            &mut payload["response"]["error"]
+        };
+        let headers = &mut error["headers"];
         if !headers.is_object() {
             *headers = serde_json::json!({});
         }
@@ -256,7 +268,7 @@ mod tests {
                 "Retry-After": expected, "x-request-id": "upstream-request"
             });
             assert_eq!(
-                terminal.retryable_capacity_payload(),
+                terminal.retryable_capacity_payload(false),
                 Some(expected_payload)
             );
             assert_eq!(terminal.payload, original);
@@ -275,7 +287,7 @@ mod tests {
             let mut expected_error = error;
             expected_error["headers"] = json!({"Retry-After": "12"});
             assert_eq!(
-                terminal.retryable_capacity_payload(),
+                terminal.retryable_capacity_payload(false),
                 Some(json!({
                     "type": "response.failed", "status": 429,
                     "headers": {"retry-after": "12"}, "sequence_number": 3,
@@ -292,6 +304,6 @@ mod tests {
         }}))
         .unwrap()
         .unwrap();
-        assert_eq!(terminal.retryable_capacity_payload(), None);
+        assert_eq!(terminal.retryable_capacity_payload(false), None);
     }
 }

@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, fmt::Display, sync::Arc};
 
 use axum::{
     Json,
@@ -549,6 +549,7 @@ async fn forward_websocket_responses_stream(
     rates: ModelRates,
     upstream: &mut crate::upstream_ws::UpstreamWebSocket,
     sender: &mpsc::Sender<Bytes>,
+    retry_after_in_body: bool,
 ) -> Option<(TerminalEvent, Bytes)> {
     let mut completed_output_items = Vec::new();
     let status = loop {
@@ -577,19 +578,23 @@ async fn forward_websocket_responses_stream(
                     Ok(terminal) => terminal,
                     Err(_) => break FinalStatus::UpstreamError,
                 };
-                let rewritten = terminal
-                    .as_ref()
-                    .and_then(TerminalEvent::retryable_capacity_payload)
-                    .map(|payload| payload.to_string());
-                let event_name = if rewritten.is_some() {
-                    "response.failed"
-                } else {
-                    &event_name
+                let bytes = {
+                    let rewritten = terminal
+                        .as_ref()
+                        .and_then(|event| event.retryable_capacity_payload(retry_after_in_body));
+                    let (event_name, downstream_text): (&str, &dyn Display) = match &rewritten {
+                        Some(payload) => (
+                            payload["type"]
+                                .as_str()
+                                .expect("capacity payload has an event type"),
+                            payload,
+                        ),
+                        None => (&event_name, &text),
+                    };
+                    Bytes::from(format!(
+                        "id: \nevent: {event_name}\ndata: {downstream_text}\n\n"
+                    ))
                 };
-                let downstream_text = rewritten.as_deref().unwrap_or(text.as_str());
-                let bytes = Bytes::from(format!(
-                    "id: \nevent: {event_name}\ndata: {downstream_text}\n\n"
-                ));
                 if let Some(mut terminal) = terminal {
                     // Private Responses can omit the final output array. Keep SSE bytes unchanged;
                     // the session snapshot still needs the completed items to rebuild its context.

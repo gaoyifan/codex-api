@@ -15,7 +15,7 @@ use tokio_util::sync::PollSemaphore;
 use crate::auth::{ClientIdentity, authenticate};
 use crate::config::apply_effective_request;
 use crate::error::{ApiError, websocket_error};
-use crate::responses_terminal::{TerminalEvent, TerminalKind, parse_terminal_payload};
+use crate::responses_terminal::{TerminalKind, parse_terminal_payload};
 use crate::state::AppState;
 use crate::store::{
     Admission, ApiProtocol, BillableUsage, FinalStatus, ModelCandidates, ModelRates,
@@ -373,7 +373,7 @@ impl WsSession {
         };
         let rewritten = terminal
             .as_ref()
-            .and_then(TerminalEvent::retryable_capacity_payload);
+            .and_then(|event| event.retryable_capacity_payload(false));
         if let Some(terminal) = terminal {
             let Some(active) = self.active.as_ref() else {
                 return Some(ConnectionEnd::UpstreamFailure);

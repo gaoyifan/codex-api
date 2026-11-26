@@ -311,13 +311,18 @@ close the socket with code 1003.
 Upstream `error` and `response.failed` events retain their error code, type,
 message, and parameter in Chat Completions responses. Non-streaming requests
 return HTTP 502; streams that have already started emit a final `data:` record
-containing the error instead of silently closing. Responses endpoints normalize
-upstream `server_is_overloaded` and `slow_down` failures into `response.failed`
-events with nested `error.headers["Retry-After"]` advice. Valid upstream advice is
-preserved; otherwise the delay is 30 seconds. This lets Codex retry capacity
-failures, including bare `error` events without an HTTP status. Error codes and
-messages are preserved; other upstream events are forwarded unchanged. The
-client still controls its retry budget; the relay does not replay requests.
+containing the error instead of silently closing. By default, Responses
+endpoints normalize upstream `server_is_overloaded` and `slow_down` failures
+into `response.failed` events with nested `error.headers["Retry-After"]` advice.
+The relay preserves valid upstream advice and uses 30 seconds when none is
+available. This lets Codex retry capacity failures, including bare `error`
+events without an HTTP status. The relay preserves error codes and messages
+and forwards other upstream events unchanged. The client controls its retry
+budget and decides whether to replay requests.
+
+HTTP Responses requests whose `User-Agent` contains `Hermes` (case-insensitively)
+receive these capacity failures as SSE `error` events with a retry delay in
+`error.retry_after`.
 
 The service also writes terminal failure metadata (event type, error code, type,
 message, and response ID when present) to its standard log. It does not log the

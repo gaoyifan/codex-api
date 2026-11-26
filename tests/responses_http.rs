@@ -15,7 +15,7 @@ use axum::{
         State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::HeaderMap,
+    http::{HeaderMap, header::USER_AGENT},
     routing::get,
 };
 use bytes::Bytes;
@@ -367,7 +367,13 @@ async fn capacity_errors_are_normalized_with_retry_advice_in_sse() {
                 json!({"type": "response.failed", "response": {
                     "status": "failed", "id": "resp-capacity", "error": error}})
             };
-            let response = spawn_response(relay.post(None, body(json!([user("retry")]))).send());
+            let request = relay.post(None, body(json!([user("retry")])));
+            let request = if bare {
+                request.header(USER_AGENT, "codex_cli_rs/0.172.0")
+            } else {
+                request
+            };
+            let response = spawn_response(request.send());
             let mut connection = upstream.accept().await;
             connection.prewarm().await;
             connection.request().await;
@@ -403,6 +409,47 @@ async fn capacity_errors_are_normalized_with_retry_advice_in_sse() {
             .await
             .unwrap();
     assert_eq!(rows, vec![("upstream_error".to_owned(), None); 4]);
+}
+
+#[tokio::test]
+async fn capacity_errors_include_retry_advice_in_the_sse_error_body_for_hermes() {
+    let mut upstream = Upstream::start().await;
+    let relay = Relay::start(&upstream).await;
+    for user_agent in ["codex_cli_rs/0.0.0 (Hermes Agent)", "hermesagent/0.24.0"] {
+        let response = spawn_response(
+            relay
+                .post(None, body(json!([user("retry")])))
+                .header(USER_AGENT, user_agent)
+                .send(),
+        );
+        let mut connection = upstream.accept().await;
+        connection.prewarm().await;
+        connection.request().await;
+        let created = json!({"type": "response.created", "response": {
+            "id": "resp-capacity", "status": "in_progress"}});
+        connection.send(created.clone());
+        let mut error = json!({
+            "code": "server_is_overloaded",
+            "type": "service_unavailable_error",
+            "message": "Our servers are currently overloaded. Please try again later.",
+            "headers": {"Retry-After": "358"}
+        });
+        connection.send(json!({"type": "error", "error": error}));
+
+        let response = response.await.unwrap().unwrap();
+        let mut events = Box::pin(response.bytes_stream().eventsource());
+        let event = events.next().await.unwrap().unwrap();
+        assert_eq!(event.event, "response.created");
+        assert_eq!(serde_json::from_str::<Value>(&event.data).unwrap(), created);
+        let event = events.next().await.unwrap().unwrap();
+        assert_eq!(event.event, "error");
+        error["retry_after"] = json!("358");
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.data).unwrap(),
+            json!({"type": "error", "error": error})
+        );
+        assert!(events.next().await.is_none());
+    }
 }
 
 #[tokio::test]
